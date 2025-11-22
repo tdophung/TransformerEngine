@@ -83,8 +83,6 @@ def _argsort(x, indices, n_dims: tl.constexpr):
 def _row_id_map_pass_1_kernel(
     # pointers
     routing_map_ptr,
-    row_id_map_ptr,
-    workspace_ptr,
     # sizes
     num_tokens,
     # strides
@@ -92,6 +90,9 @@ def _row_id_map_pass_1_kernel(
     stride_routing_map_expert,
     stride_row_id_map_token,
     stride_row_id_map_expert,
+    # output pointers
+    row_id_map_ptr,
+    workspace_ptr,
     # metas
     BLOCK_SIZE: tl.constexpr,
 ):
@@ -156,24 +157,29 @@ def _row_id_map_pass_3_kernel(
     # pointers
     row_id_map_ptr,
     # sizes
-    num_experts: tl.constexpr,
+    num_experts,
     # strides
     stride_row_id_map_token,
     stride_row_id_map_expert,
     # metas
     LOAD_SIZE: tl.constexpr,
 ):
+
     pid = tl.program_id(0)
+
     n_dims: tl.constexpr = _log2(LOAD_SIZE)
     off = tl.arange(0, LOAD_SIZE)
+
     row_id_map = tl.load(
-        row_id_map_ptr + pid * stride_row_id_map_token + stride_row_id_map_expert * off,
+        row_id_map_ptr + pid * stride_row_id_map_token + off * stride_row_id_map_expert,
         mask=off < num_experts,
         other=-1,
     )
+
     n_routed = tl.sum(tl.where(row_id_map != -1, 1, 0))
     indices = off
     sorted_map, indices = _argsort(row_id_map, indices, n_dims=n_dims)
+    
     tl.store(
         row_id_map_ptr + pid * stride_row_id_map_token + off * stride_row_id_map_expert,
         sorted_map,
@@ -194,17 +200,13 @@ def _row_id_map_pass_3_kernel(
 
 @triton.jit
 def _permute_kernel(
-    # pointers
+    # input pointers only
     input_ptr,
-    output_ptr,
     row_id_map_ptr,
     probs_ptr,
     scale_ptr,
-    permuted_probs_ptr,
     permuted_scale_ptr,
-    # sizes
-    num_experts: tl.constexpr,
-    hidden_size: tl.constexpr,
+    # scalar sizes (before output pointers)
     scale_hidden_dim,
     # strides
     stride_row_id_map_token,
@@ -220,7 +222,12 @@ def _permute_kernel(
     stride_permuted_probs_token,
     stride_permuted_scale_token,
     stride_permuted_scale_hidden,
-    # metas
+    # output pointers (jax-triton inserts after positional args, before constexprs)
+    output_ptr,
+    permuted_probs_ptr,
+    # metas (constexprs come last)
+    num_experts: tl.constexpr,
+    hidden_size: tl.constexpr,
     PERMUTE_PROBS: tl.constexpr,
     PERMUTE_SCALE: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
@@ -291,16 +298,11 @@ except RuntimeError:
 
 @triton.jit
 def _unpermute_kernel(
-    # pointers
+    # input pointers only
     input_ptr,
-    output_ptr,
     row_id_map_ptr,
     merging_probs_ptr,
     permuted_probs_ptr,
-    unpermuted_probs_ptr,
-    # sizes
-    num_experts: tl.constexpr,
-    hidden_size: tl.constexpr,
     # strides
     stride_row_id_map_token,
     stride_row_id_map_expert,
@@ -313,7 +315,12 @@ def _unpermute_kernel(
     stride_permuted_probs_token,
     stride_unpermuted_probs_token,
     stride_unpermuted_probs_expert,
-    # metas
+    # output pointers (jax-triton inserts after positional args, before constexprs)
+    output_ptr,
+    unpermuted_probs_ptr,
+    # metas (constexprs come last)
+    num_experts: tl.constexpr,
+    hidden_size: tl.constexpr,
     PROBS_LOAD_WIDTH: tl.constexpr,
     WITH_MERGING_PROBS: tl.constexpr,
     PERMUTE_PROBS: tl.constexpr,
@@ -546,14 +553,10 @@ def _make_chunk_sort_map_kernel(
 
 @triton.jit
 def _sort_chunks_by_map_kernel(
-    # pointers
+    # input pointers
     input_ptr,
-    output_ptr,
     row_id_map_ptr,
     probs_ptr,
-    permuted_probs_ptr,
-    # sizes
-    hidden_size: tl.constexpr,
     # strides
     stride_input_token,
     stride_input_hidden,
@@ -561,7 +564,11 @@ def _sort_chunks_by_map_kernel(
     stride_output_hidden,
     stride_probs_token,
     stride_permuted_probs_token,
-    # metas
+    # output pointers (jax-triton inserts these after positional args, before keyword constexprs)
+    output_ptr,
+    permuted_probs_ptr,
+    # metas (constexprs come after all positional args including outputs)
+    hidden_size: tl.constexpr,
     PERMUTE_PROBS: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     FORWARD: tl.constexpr,

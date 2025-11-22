@@ -5,7 +5,7 @@
 """Tests for cross entropy Triton kernels"""
 
 # Patch jax-triton for Triton 3.5.1 compatibility - MUST BE FIRST!
-import jax_triton_patch  # Apply compatibility patch before importing JAX/Triton
+# import jax_triton_patch  # Apply compatibility patch before importing JAX/Triton
 
 import jax
 import jax.numpy as jnp
