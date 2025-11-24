@@ -127,12 +127,12 @@ def make_row_id_map(
     load_size = triton.next_power_of_2(num_experts)
     row_id_map = jt.triton_call(
         row_id_map,               # Input 0 (ptr): row_id_map_ptr (from Pass 2, with -1 initialized)
-        num_experts,              # Scalar 0: num_experts
         row_id_stride_token,      # Scalar 1: stride_row_id_map_token
         row_id_stride_expert,     # Scalar 2: stride_row_id_map_expert
         kernel=_row_id_map_pass_3_kernel,
         out_shape=[ShapeDtypeStruct(row_id_map.shape, row_id_map.dtype)],
         input_output_aliases={0: 0},  # row_id_map input→output
+        num_experts=num_experts,
         grid=grid,
         LOAD_SIZE=load_size,  # Constexpr
     )[0]
