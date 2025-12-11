@@ -311,7 +311,11 @@ def unpermute_with_mask_map_bwd_with_merging_probs(
     hidden_size : int
         Hidden size of the output tensor.
     """
-    act_grad = torch.empty(
+    # Use zeros when pad_offsets is used because padding slots won't be written to
+    # by the kernel. This matches the behavior of Fp8Unpadding.backward which zeros
+    # out the padding slots.
+    alloc = torch.zeros if pad_offsets is not None else torch.empty
+    act_grad = alloc(
         (num_out_tokens, hidden_size), dtype=fwd_output_grad.dtype, device="cuda"
     )
     merging_probs_grad = torch.empty(
