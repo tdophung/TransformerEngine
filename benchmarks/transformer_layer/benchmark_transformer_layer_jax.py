@@ -20,7 +20,7 @@ import argparse
 import os
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -33,27 +33,54 @@ from transformer_engine.jax.sharding import MeshResource
 
 
 # =============================================================================
-# Model Configurations
+# Model Configurations (matching jeremy_bench.py for apples-to-apples comparison)
 # =============================================================================
 
 MODEL_CONFIGS = {
     "small": {
-        "hidden_size": 1024,
-        "num_heads": 8,
-        "mlp_hidden_size": 4096,
+        "batch_size": 8,
         "seq_length": 512,
+        "hidden_size": 1024,
+        "mlp_hidden_size": 4096,
+        "num_heads": 16,
+        "num_gqa_groups": 16,
+        "num_layers": 4,
     },
     "medium": {
-        "hidden_size": 2048,
-        "num_heads": 16,
-        "mlp_hidden_size": 8192,
+        "batch_size": 4,
         "seq_length": 1024,
+        "hidden_size": 2048,
+        "mlp_hidden_size": 8192,
+        "num_heads": 32,
+        "num_gqa_groups": 32,
+        "num_layers": 4,
     },
     "large": {
-        "hidden_size": 4096,
-        "num_heads": 32,
-        "mlp_hidden_size": 16384,
+        "batch_size": 2,
         "seq_length": 2048,
+        "hidden_size": 4096,
+        "mlp_hidden_size": 16384,
+        "num_heads": 32,
+        "num_gqa_groups": 32,
+        "num_layers": 4,
+    },
+    "llama-7b": {
+        "batch_size": 1,
+        "seq_length": 2048,
+        "hidden_size": 4096,
+        "mlp_hidden_size": 11008,
+        "num_heads": 32,
+        "num_gqa_groups": 32,
+        "num_layers": 4,
+    },
+    "llama-70b": {
+        "batch_size": 1,
+        "seq_length": 2048,
+        "hidden_size": 8192,
+        "mlp_hidden_size": 28672,
+        "num_heads": 64,
+        "num_gqa_groups": 8,
+        "num_layers": 4,
     },
 }
 
@@ -70,6 +97,8 @@ class BenchmarkConfig:
     warmup_iters: int
     timing_iters: int
     num_rounds: int
+    num_gqa_groups: int = None  # Defaults to num_heads if not specified
+    num_layers: int = 1  # Number of stacked layers
     dtype: jnp.dtype = jnp.bfloat16
 
 
@@ -89,24 +118,97 @@ class BenchmarkResult:
 # =============================================================================
 
 
-def create_transformer_layer(config: BenchmarkConfig) -> te_flax.TransformerLayer:
-    """Create a TransformerLayer with the given configuration."""
-    return te_flax.TransformerLayer(
-        hidden_size=config.hidden_size,
-        mlp_hidden_size=config.mlp_hidden_size,
-        num_attention_heads=config.num_heads,
-        mlp_activations=("gelu",),
-        self_attn_mask_type="causal",
-        layernorm_epsilon=1e-5,
-        use_bias=True,
-        attention_dropout=0.0,
-        intermediate_dropout=0.0,
-        hidden_dropout=0.0,
-        enable_relative_embedding=False,
-        self_attn_bias_type="no_bias",
-        dtype=config.dtype,
-        transpose_batch_sequence=False,
-    )
+class StackedTransformerLayers(nn.Module):
+    """A stack of TransformerLayer decoder layers for benchmarking.
+
+    Matches jeremy_bench.py StackedDecoderLayers for apples-to-apples comparison.
+    """
+
+    num_layers: int
+    hidden_size: int
+    mlp_hidden_size: int
+    num_attention_heads: int
+    num_gqa_groups: int
+    layernorm_type: str = "rmsnorm"
+    hidden_dropout: float = 0.0
+    attention_dropout: float = 0.0
+    intermediate_dropout: float = 0.0
+    mlp_activations: Tuple[str, ...] = ("silu", "linear")
+    transpose_batch_sequence: bool = False
+    self_attn_mask_type: str = "causal"
+    enable_rotary_pos_emb: bool = True
+    rotary_pos_emb_group_method: str = "consecutive"
+
+    @nn.compact
+    def __call__(
+        self,
+        inputs: jnp.ndarray,
+        deterministic: bool = True,
+    ) -> jnp.ndarray:
+        """Forward pass through all decoder layers."""
+        from transformer_engine.jax.flax import TransformerLayerType
+
+        hidden_states = inputs
+        for i in range(self.num_layers):
+            hidden_states = te_flax.TransformerLayer(
+                layer_type=TransformerLayerType.DECODER,
+                hidden_size=self.hidden_size,
+                mlp_hidden_size=self.mlp_hidden_size,
+                num_attention_heads=self.num_attention_heads,
+                num_gqa_groups=self.num_gqa_groups,
+                layernorm_type=self.layernorm_type,
+                hidden_dropout=self.hidden_dropout,
+                attention_dropout=self.attention_dropout,
+                intermediate_dropout=self.intermediate_dropout,
+                mlp_activations=self.mlp_activations,
+                transpose_batch_sequence=self.transpose_batch_sequence,
+                self_attn_mask_type=self.self_attn_mask_type,
+                enable_rotary_pos_emb=self.enable_rotary_pos_emb,
+                rotary_pos_emb_group_method=self.rotary_pos_emb_group_method,
+                enable_relative_embedding=False,
+                name=f"decoder_layer_{i}",
+            )(
+                hidden_states,
+                deterministic=deterministic,
+            )
+        return hidden_states
+
+
+def create_transformer_layer(config: BenchmarkConfig) -> nn.Module:
+    """Create a TransformerLayer (or stack) with the given configuration."""
+    num_gqa_groups = config.num_gqa_groups or config.num_heads
+
+    if config.num_layers == 1:
+        # Single layer for backward compatibility
+        return te_flax.TransformerLayer(
+            hidden_size=config.hidden_size,
+            mlp_hidden_size=config.mlp_hidden_size,
+            num_attention_heads=config.num_heads,
+            num_gqa_groups=num_gqa_groups,
+            mlp_activations=("silu", "linear"),
+            self_attn_mask_type="causal",
+            layernorm_type="rmsnorm",
+            layernorm_epsilon=1e-5,
+            use_bias=True,
+            attention_dropout=0.0,
+            intermediate_dropout=0.0,
+            hidden_dropout=0.0,
+            enable_relative_embedding=False,
+            enable_rotary_pos_emb=True,
+            rotary_pos_emb_group_method="consecutive",
+            self_attn_bias_type="no_bias",
+            dtype=config.dtype,
+            transpose_batch_sequence=False,
+        )
+    else:
+        # Stacked layers matching jeremy_bench.py
+        return StackedTransformerLayers(
+            num_layers=config.num_layers,
+            hidden_size=config.hidden_size,
+            mlp_hidden_size=config.mlp_hidden_size,
+            num_attention_heads=config.num_heads,
+            num_gqa_groups=num_gqa_groups,
+        )
 
 
 def benchmark_forward(
@@ -293,17 +395,29 @@ def parse_args() -> argparse.Namespace:
         type=str,
         choices=list(MODEL_CONFIGS.keys()),
         default=None,
-        help="Use a predefined model configuration",
+        help="Use a predefined model configuration (small, medium, large, llama-7b, llama-70b)",
     )
-    parser.add_argument("--hidden_size", type=int, default=4096, help="Hidden dimension size")
-    parser.add_argument("--seq_length", type=int, default=2048, help="Sequence length")
-    parser.add_argument("--batch_size", type=int, default=8, help="Batch size")
-    parser.add_argument("--num_heads", type=int, default=32, help="Number of attention heads")
+    parser.add_argument("--hidden_size", type=int, default=None, help="Hidden dimension size")
+    parser.add_argument("--seq_length", type=int, default=None, help="Sequence length")
+    parser.add_argument("--batch_size", type=int, default=None, help="Batch size")
+    parser.add_argument("--num_heads", type=int, default=None, help="Number of attention heads")
     parser.add_argument(
         "--mlp_hidden_size",
         type=int,
         default=None,
         help="MLP hidden size (default: 4 * hidden_size)",
+    )
+    parser.add_argument(
+        "--num_gqa_groups",
+        type=int,
+        default=None,
+        help="Number of GQA groups (default: same as num_heads)",
+    )
+    parser.add_argument(
+        "--num_layers",
+        type=int,
+        default=None,
+        help="Number of stacked transformer layers (default: 4 for configs, 1 otherwise)",
     )
 
     # Benchmark parameters
@@ -345,28 +459,53 @@ def main() -> None:
     """Main benchmark entry point."""
     args = parse_args()
 
-    # Determine configuration
+    # Determine configuration - start with defaults or predefined config
     if args.config:
         model_config = MODEL_CONFIGS[args.config]
         hidden_size = model_config["hidden_size"]
         num_heads = model_config["num_heads"]
         mlp_hidden_size = model_config["mlp_hidden_size"]
         seq_length = model_config["seq_length"]
+        batch_size = model_config["batch_size"]
+        num_gqa_groups = model_config["num_gqa_groups"]
+        num_layers = model_config["num_layers"]
     else:
-        hidden_size = args.hidden_size
-        num_heads = args.num_heads
+        # Custom config - require essential parameters
+        hidden_size = args.hidden_size or 4096
+        num_heads = args.num_heads or 32
         mlp_hidden_size = args.mlp_hidden_size or (4 * hidden_size)
+        seq_length = args.seq_length or 2048
+        batch_size = args.batch_size or 8
+        num_gqa_groups = args.num_gqa_groups or num_heads
+        num_layers = args.num_layers or 1
+
+    # Allow CLI args to override predefined config values
+    if args.hidden_size is not None:
+        hidden_size = args.hidden_size
+    if args.num_heads is not None:
+        num_heads = args.num_heads
+    if args.mlp_hidden_size is not None:
+        mlp_hidden_size = args.mlp_hidden_size
+    if args.seq_length is not None:
         seq_length = args.seq_length
+    if args.batch_size is not None:
+        batch_size = args.batch_size
+    if args.num_gqa_groups is not None:
+        num_gqa_groups = args.num_gqa_groups
+    if args.num_layers is not None:
+        num_layers = args.num_layers
 
     config = BenchmarkConfig(
         hidden_size=hidden_size,
         num_heads=num_heads,
         mlp_hidden_size=mlp_hidden_size,
         seq_length=seq_length,
-        batch_size=args.batch_size,
+        batch_size=batch_size,
         warmup_iters=args.warmup,
         timing_iters=args.timing_iters,
         num_rounds=args.num_rounds,
+        num_gqa_groups=num_gqa_groups,
+        num_layers=num_layers,
     )
 
     # Print header
@@ -375,7 +514,8 @@ def main() -> None:
     print("=" * 60)
     print(f"Config: hidden={config.hidden_size}, seq={config.seq_length}, "
           f"batch={config.batch_size}, heads={config.num_heads}, dtype=bfloat16")
-    print(f"MLP hidden: {config.mlp_hidden_size}")
+    print(f"MLP hidden: {config.mlp_hidden_size}, GQA groups: {config.num_gqa_groups}, "
+          f"Layers: {config.num_layers}")
     print(f"Warmup: {config.warmup_iters}, Timing iters: {config.timing_iters}, "
           f"Rounds: {config.num_rounds}")
     print()
