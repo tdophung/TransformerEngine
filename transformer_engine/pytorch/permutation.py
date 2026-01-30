@@ -3,12 +3,17 @@
 # See LICENSE for license information.
 
 """MoE Permutation API"""
+import os
 import warnings
 from typing import Optional, Tuple
 import torch
 
 import transformer_engine_torch as tex
 import transformer_engine.pytorch.triton.permutation as triton_permutation
+try:
+    import transformer_engine.pytorch.cutile.permutation as cutile_permutation
+except ModuleNotFoundError:
+    cutile_permutation = None
 from transformer_engine.pytorch.constants import TE_DType
 from transformer_engine.pytorch.quantized_tensor import QuantizedTensor
 from transformer_engine.pytorch.tensor.float8_tensor import Float8Tensor
@@ -20,6 +25,14 @@ __all__ = [
     "moe_unpermute",
     "moe_sort_chunks_by_index",
 ]
+
+
+def _get_permutation_backend():
+    """Select permutation backend (triton or cutile)."""
+    use_cutile = os.environ.get("TE_USE_CUTILE_PERMUTATION", "0") == "1"
+    if use_cutile and cutile_permutation is not None:
+        return cutile_permutation
+    return triton_permutation
 
 
 class _moe_permute_index_map(torch.autograd.Function):
@@ -212,7 +225,8 @@ class _moe_permute_mask_map(torch.autograd.Function):
             num_out_tokens is not None
         ), "num_out_tokens must be provided to the fused permute function."
 
-        row_id_map = triton_permutation.make_row_id_map(routing_map, num_tokens, num_experts)
+        permutation_backend = _get_permutation_backend()
+        row_id_map = permutation_backend.make_row_id_map(routing_map, num_tokens, num_experts)
 
         fp8 = isinstance(inp, QuantizedTensor)
         per_tensor_recipe = isinstance(inp, Float8Tensor)
@@ -248,7 +262,8 @@ class _moe_permute_mask_map(torch.autograd.Function):
             fp8_dtype = None
             scale_hidden_dim = None
 
-        output, permuted_scale, permuted_probs = triton_permutation.permute_with_mask_map(
+        permutation_backend = _get_permutation_backend()
+        output, permuted_scale, permuted_probs = permutation_backend.permute_with_mask_map(
             inp,
             row_id_map,
             probs,
@@ -321,7 +336,8 @@ class _moe_permute_mask_map(torch.autograd.Function):
             assert not isinstance(
                 permuted_act_grad, QuantizedTensor
             ), "The backward of moe_permute does not support FP8."
-            act_grad, probs_grad = triton_permutation.unpermute_with_mask_map(
+            permutation_backend = _get_permutation_backend()
+            act_grad, probs_grad = permutation_backend.unpermute_with_mask_map(
                 permuted_act_grad,
                 row_id_map,
                 None,
@@ -371,7 +387,8 @@ class _moe_unpermute_mask_map(torch.autograd.Function):
         assert not isinstance(
             inp, QuantizedTensor
         ), "The forward of moe_unpermute does not support FP8."
-        unpermuted_output, _ = triton_permutation.unpermute_with_mask_map(
+        permutation_backend = _get_permutation_backend()
+        unpermuted_output, _ = permutation_backend.unpermute_with_mask_map(
             inp,
             row_id_map,
             merging_probs,
@@ -446,7 +463,8 @@ class _moe_unpermute_mask_map(torch.autograd.Function):
                     not fp8
                 ), "The backward of moe_unpermute with merging probs does not support FP8."
                 act_grad, probs_grad = (
-                    triton_permutation.unpermute_with_mask_map_bwd_with_merging_probs(
+                    permutation_backend = _get_permutation_backend()
+                    permutation_backend.unpermute_with_mask_map_bwd_with_merging_probs(
                         unpermuted_act_grad,
                         row_id_map,
                         fwd_input,
@@ -459,7 +477,8 @@ class _moe_unpermute_mask_map(torch.autograd.Function):
                     )
                 )
             else:
-                act_grad, permuted_scale, _ = triton_permutation.permute_with_mask_map(
+                permutation_backend = _get_permutation_backend()
+                act_grad, permuted_scale, _ = permutation_backend.permute_with_mask_map(
                     unpermuted_act_grad,
                     row_id_map,
                     None,
@@ -730,13 +749,15 @@ class _moe_chunk_sort(torch.autograd.Function):
             fake_dtype = inp.dtype
             inp = inp._data
 
-        row_id_map = triton_permutation.make_chunk_sort_map(
+        permutation_backend = _get_permutation_backend()
+        row_id_map = permutation_backend.make_chunk_sort_map(
             split_sizes,
             sorted_idxs,
             num_tokens,
             num_splits,
         )
-        output, permuted_probs = triton_permutation.sort_chunks_by_map(
+        permutation_backend = _get_permutation_backend()
+        output, permuted_probs = permutation_backend.sort_chunks_by_map(
             inp,
             row_id_map,
             probs,
@@ -778,7 +799,8 @@ class _moe_chunk_sort(torch.autograd.Function):
                 fp8_scale_inv = permuted_act_grad._scale_inv
                 fake_dtype = permuted_act_grad.dtype
                 permuted_act_grad = permuted_act_grad._data
-            act_grad, probs_grad = triton_permutation.sort_chunks_by_map(
+            permutation_backend = _get_permutation_backend()
+            act_grad, probs_grad = permutation_backend.sort_chunks_by_map(
                 permuted_act_grad,
                 row_id_map,
                 permuted_probs_grad,
