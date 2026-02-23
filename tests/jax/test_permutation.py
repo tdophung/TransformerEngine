@@ -16,6 +16,12 @@ from transformer_engine.jax.permutation import (
     token_combine,
     sort_chunks_by_index,
 )
+
+# Low-level Triton primitives for diagnostic testing
+from transformer_engine.jax.triton_extensions.permutation import (
+    make_chunk_sort_map,
+    sort_chunks_by_map,
+)
 from utils import assert_allclose, pytest_parametrize_wrapper
 
 
@@ -34,6 +40,13 @@ ALL_SORT_CHUNKS_CASES = [
     (8, 4096, 1280),
     (64, 4096, 4096),
     (256, 4096, 9216),
+    # Non-power-of-2 num_splits to exercise padding paths in Triton kernels.
+    # IDX_LOAD_WIDTH = next_power_of_2(num_splits), so these cases have
+    # padding positions where tl.load without other= reads undefined values,
+    # and tl.argmax behavior on padding is nondeterministic.
+    (3, 4096, 1280),
+    (7, 4096, 1280),
+    (13, 4096, 4096),
 ]
 SORT_CHUNKS_CASES = {
     "L0": ALL_SORT_CHUNKS_CASES[0:2],
@@ -747,7 +760,22 @@ class TestHighLevelPermutationAPI:
         )
 
         # Get reference row_id_map
-        row_id_map = reference_make_chunk_sort_map(split_sizes, sorted_indices, total_tokens)
+        ref_row_id_map = reference_make_chunk_sort_map(split_sizes, sorted_indices, total_tokens)
+
+        # ---- Diagnostic: separately test make_chunk_sort_map kernel ----
+        triton_row_id_map = make_chunk_sort_map(
+            split_sizes, sorted_indices, total_tokens, num_splits
+        )
+        map_matches = jnp.array_equal(triton_row_id_map, ref_row_id_map)
+
+        # ---- Diagnostic: test sort_chunks_by_map with REFERENCE row_id_map ----
+        ref_map_output, _ = sort_chunks_by_map(
+            inp, ref_row_id_map, None, total_tokens, hidden_size, is_forward=True
+        )
+        ref_map_ref_output, _ = reference_sort_chunks_by_map(
+            inp, ref_row_id_map, None, is_forward=True
+        )
+        sort_kernel_matches = jnp.allclose(ref_map_output, ref_map_ref_output, rtol=1e-5, atol=1e-5)
 
         # Define loss functions (JIT compiled for performance)
         @jax.jit
@@ -757,19 +785,72 @@ class TestHighLevelPermutationAPI:
 
         @jax.jit
         def ref_loss_fn(x):
-            output, _ = reference_sort_chunks_by_map(x, row_id_map, None, is_forward=True)
+            output, _ = reference_sort_chunks_by_map(x, ref_row_id_map, None, is_forward=True)
             return jnp.sum(output**2)
 
-        # Test forward pass
-        output, _ = sort_chunks_by_index(inp, split_sizes, sorted_indices)
-        ref_output, _ = reference_sort_chunks_by_map(inp, row_id_map, None, is_forward=True)
+        # Test forward pass (end-to-end: make_chunk_sort_map + sort_chunks_by_map)
+        output, returned_row_id_map = sort_chunks_by_index(inp, split_sizes, sorted_indices)
+        ref_output, _ = reference_sort_chunks_by_map(
+            inp, ref_row_id_map, None, is_forward=True
+        )
 
         # Test backward pass with JIT
         loss_val, computed_grad = jax.value_and_grad(loss_fn)(inp)
         ref_loss_val, ref_grad = jax.value_and_grad(ref_loss_fn)(inp)
 
+        # ---- Build diagnostic message on failure ----
+        fwd_matches = jnp.allclose(output, ref_output, rtol=1e-5, atol=1e-5)
+        if not fwd_matches or not map_matches or not sort_kernel_matches:
+            diag = []
+            diag.append(f"\n===== DIAGNOSTIC for ({num_splits}, {total_tokens}, {hidden_size}, {dtype}) =====")
+            diag.append(f"  make_chunk_sort_map (standalone) matches ref: {map_matches}")
+            diag.append(f"  sort_chunks_by_map (with ref map) matches ref: {sort_kernel_matches}")
+            diag.append(f"  sort_chunks_by_index (end-to-end) matches ref: {fwd_matches}")
+
+            # Check the row_id_map returned by sort_chunks_by_index
+            e2e_map_matches = jnp.array_equal(returned_row_id_map, ref_row_id_map)
+            diag.append(f"  row_id_map from sort_chunks_by_index matches ref: {e2e_map_matches}")
+
+            if not map_matches:
+                n_map_mismatch = int(jnp.sum(triton_row_id_map != ref_row_id_map))
+                diag.append(f"  row_id_map mismatches: {n_map_mismatch}/{total_tokens} "
+                            f"({100*n_map_mismatch/total_tokens:.1f}%)")
+                diff_idx = jnp.where(triton_row_id_map != ref_row_id_map)[0][:10]
+                for idx in diff_idx:
+                    diag.append(f"    row_id_map[{int(idx)}]: triton={int(triton_row_id_map[idx])}, "
+                                f"ref={int(ref_row_id_map[idx])}")
+
+            if not sort_kernel_matches:
+                n_sort_mismatch = int(jnp.sum(~jnp.isclose(ref_map_output, ref_map_ref_output,
+                                                            rtol=1e-5, atol=1e-5)))
+                total_elems = ref_map_output.size
+                diag.append(f"  sort_by_map (ref map) mismatches: {n_sort_mismatch}/{total_elems} "
+                            f"({100*n_sort_mismatch/total_elems:.1f}%)")
+
+            if not fwd_matches:
+                n_fwd_mismatch = int(jnp.sum(~jnp.isclose(output, ref_output,
+                                                           rtol=1e-5, atol=1e-5)))
+                total_elems = output.size
+                diag.append(f"  end-to-end fwd mismatches: {n_fwd_mismatch}/{total_elems} "
+                            f"({100*n_fwd_mismatch/total_elems:.1f}%)")
+
+                # Check if it's a row-level issue (whole rows mismatched)
+                row_has_mismatch = ~jnp.all(jnp.isclose(output, ref_output,
+                                                         rtol=1e-5, atol=1e-5), axis=1)
+                n_bad_rows = int(jnp.sum(row_has_mismatch))
+                diag.append(f"  rows with any mismatch: {n_bad_rows}/{total_tokens} "
+                            f"({100*n_bad_rows/total_tokens:.1f}%)")
+
+            diag.append(f"  split_sizes: {split_sizes.tolist()}")
+            diag.append(f"  sorted_indices: {sorted_indices.tolist()}")
+            diag.append("===== END DIAGNOSTIC =====")
+            diag_msg = "\n".join(diag)
+            print(diag_msg)
+        else:
+            diag_msg = ""
+
         # Compare forward and backward
-        assert_allclose(output, ref_output)
+        assert_allclose(output, ref_output, err_msg=diag_msg if diag_msg else None)
         assert_allclose(loss_val, ref_loss_val)
         assert_allclose(computed_grad, ref_grad)
 
