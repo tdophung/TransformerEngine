@@ -777,37 +777,46 @@ class TestHighLevelPermutationAPI:
         loss_val, computed_grad = jax.value_and_grad(loss_fn)(inp)
         ref_loss_val, ref_grad = jax.value_and_grad(ref_loss_fn)(inp)
 
-        # On failure: diagnose which kernel is wrong using already-computed results
-        # (no extra kernel calls -- just compare returned_row_id_map vs reference)
+        # Collect all results, diagnose any failures before asserting
         fwd_ok = jnp.allclose(output, ref_output, rtol=1e-5, atol=1e-5)
-        if not fwd_ok:
+        loss_ok = jnp.allclose(loss_val, ref_loss_val, rtol=1e-5, atol=1e-5)
+        grad_ok = jnp.allclose(computed_grad, ref_grad, rtol=1e-5, atol=1e-5)
+
+        if not fwd_ok or not loss_ok or not grad_ok:
             diag = []
             diag.append(f"\n===== DIAGNOSTIC for ({num_splits}, {total_tokens}, {hidden_size}, {dtype}) =====")
+            diag.append(f"  forward output matches:  {fwd_ok}")
+            diag.append(f"  loss value matches:      {loss_ok}")
+            diag.append(f"  gradient matches:        {grad_ok}")
 
             map_ok = jnp.array_equal(returned_row_id_map, ref_row_id_map)
-            diag.append(f"  row_id_map matches ref: {map_ok}")
+            diag.append(f"  row_id_map matches ref:  {map_ok}")
 
-            if not map_ok:
-                n_map_bad = int(jnp.sum(returned_row_id_map != ref_row_id_map))
-                diag.append(f"  ==> BUG IS IN make_chunk_sort_map kernel (row mapping is wrong)")
-                diag.append(f"  row_id_map mismatches: {n_map_bad}/{total_tokens} "
-                            f"({100*n_map_bad/total_tokens:.1f}%)")
-                diff_idx = jnp.where(returned_row_id_map != ref_row_id_map)[0][:10]
-                for idx in diff_idx:
-                    diag.append(f"    row_id_map[{int(idx)}]: triton={int(returned_row_id_map[idx])}, "
-                                f"ref={int(ref_row_id_map[idx])}")
-            else:
-                diag.append(f"  ==> BUG IS IN sort_chunks_by_map kernel (row map correct, sort wrong)")
+            if not fwd_ok:
+                n_bad = int(jnp.sum(~jnp.isclose(output, ref_output, rtol=1e-5, atol=1e-5)))
+                diag.append(f"  fwd mismatches: {n_bad}/{output.size} ({100*n_bad/output.size:.1f}%)")
+                if not map_ok:
+                    diag.append(f"  ==> BUG: make_chunk_sort_map (row_id_map wrong)")
+                else:
+                    diag.append(f"  ==> BUG: sort_chunks_by_map FORWARD kernel")
 
-            n_fwd_bad = int(jnp.sum(~jnp.isclose(output, ref_output, rtol=1e-5, atol=1e-5)))
-            total_elems = output.size
-            diag.append(f"  output mismatches: {n_fwd_bad}/{total_elems} "
-                        f"({100*n_fwd_bad/total_elems:.1f}%)")
+            if not grad_ok:
+                n_bad = int(jnp.sum(~jnp.isclose(computed_grad, ref_grad, rtol=1e-5, atol=1e-5)))
+                total_elems = computed_grad.size
+                diag.append(f"  grad mismatches: {n_bad}/{total_elems} ({100*n_bad/total_elems:.1f}%)")
 
-            row_bad = ~jnp.all(jnp.isclose(output, ref_output, rtol=1e-5, atol=1e-5), axis=1)
-            n_bad_rows = int(jnp.sum(row_bad))
-            diag.append(f"  rows with any mismatch: {n_bad_rows}/{total_tokens} "
-                        f"({100*n_bad_rows/total_tokens:.1f}%)")
+                row_bad = ~jnp.all(jnp.isclose(computed_grad, ref_grad, rtol=1e-5, atol=1e-5), axis=1)
+                n_bad_rows = int(jnp.sum(row_bad))
+                diag.append(f"  grad rows with mismatch: {n_bad_rows}/{total_tokens} "
+                            f"({100*n_bad_rows/total_tokens:.1f}%)")
+
+                if fwd_ok and map_ok:
+                    diag.append(f"  ==> BUG: sort_chunks_by_map BACKWARD kernel (fwd+map OK, grad wrong)")
+                    diag.append(f"  Theory: XLA buffer aliasing during autotuning of FORWARD=False kernel")
+                    diag.append(f"  The backward sort_by_map input (grad_output=2*output) may share a")
+                    diag.append(f"  buffer with its output (grad_input). During autotuning, repeated")
+                    diag.append(f"  kernel runs corrupt the shared buffer. The save/restore mechanism")
+                    diag.append(f"  in TritonAutotunedKernelCall is disabled (empty aliases workaround).")
 
             diag.append(f"  split_sizes: {split_sizes.tolist()}")
             diag.append(f"  sorted_indices: {sorted_indices.tolist()}")
@@ -819,8 +828,8 @@ class TestHighLevelPermutationAPI:
 
         # Compare forward and backward
         assert_allclose(output, ref_output, err_msg=diag_msg if diag_msg else None)
-        assert_allclose(loss_val, ref_loss_val)
-        assert_allclose(computed_grad, ref_grad)
+        assert_allclose(loss_val, ref_loss_val, err_msg=diag_msg if diag_msg else None)
+        assert_allclose(computed_grad, ref_grad, err_msg=diag_msg if diag_msg else None)
 
     # =========================================================================
     # Consolidated dispatch + combine with padding tests
