@@ -625,29 +625,18 @@ def _sort_chunks_by_map_kernel(
             tl.store(permuted_probs_ptr + permuted_prob_off, prob)
 
 
-# TODO(tdophung): Re-enable autotuning once the jaxlib fix for
-# TritonAutotunedKernelCall buffer save/restore lands.
-#
-# Bug: When jax.value_and_grad compiles the backward pass, XLA may alias the
-# kernel's input buffer (grad_output) with its output buffer (grad_input)
-# since they have the same shape and grad_output is dead after the kernel.
-# During autotuning, TritonAutotunedKernelCall runs the kernel multiple times
-# with different BLOCK_SIZE configs, corrupting the shared buffer. The
-# save/restore mechanism is disabled due to a jaxlib bug (see
-# triton_extensions/utils.py triton_call_lowering).
-#
-# try:
-#     _sort_chunks_by_map_kernel = triton.autotune(
-#         configs=[
-#             triton.Config({"BLOCK_SIZE": 64}),
-#             triton.Config({"BLOCK_SIZE": 128}),
-#             triton.Config({"BLOCK_SIZE": 256}),
-#             triton.Config({"BLOCK_SIZE": 512}),
-#             triton.Config({"BLOCK_SIZE": 1024}),
-#             triton.Config({"BLOCK_SIZE": 2048}),
-#             triton.Config({"BLOCK_SIZE": 4096}),
-#         ],
-#         key=["hidden_size"],
-#     )(_sort_chunks_by_map_kernel)
-# except RuntimeError:
-#     pass
+try:
+    _sort_chunks_by_map_kernel = triton.autotune(
+        configs=[
+            triton.Config({"BLOCK_SIZE": 64}),
+            triton.Config({"BLOCK_SIZE": 128}),
+            triton.Config({"BLOCK_SIZE": 256}),
+            triton.Config({"BLOCK_SIZE": 512}),
+            triton.Config({"BLOCK_SIZE": 1024}),
+            triton.Config({"BLOCK_SIZE": 2048}),
+            triton.Config({"BLOCK_SIZE": 4096}),
+        ],
+        key=["hidden_size"],
+    )(_sort_chunks_by_map_kernel)
+except RuntimeError:
+    pass

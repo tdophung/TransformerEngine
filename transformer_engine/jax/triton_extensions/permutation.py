@@ -1709,6 +1709,14 @@ class SortChunksByMapPrimitive(BasePrimitive):
         block_size = _get_min_block_size(_sort_chunks_by_map_kernel)
         grid = (num_tokens, triton.cdiv(hidden_size, block_size))
 
+        # Declare that inp (input 0) may alias with output (output 0).
+        # XLA's buffer assignment can independently alias these when inp is
+        # dead after the kernel (e.g., backward pass grad_output -> grad_input).
+        # Without this declaration, TritonAutotunedKernelCall's save/restore
+        # logic won't protect the shared buffer during autotuning, causing
+        # data corruption on repeated kernel runs.
+        input_output_aliases = {0: 0}
+
         return triton_call_lowering(
             ctx,
             _sort_chunks_by_map_kernel,
@@ -1716,6 +1724,7 @@ class SortChunksByMapPrimitive(BasePrimitive):
             row_id_map,
             probs,
             grid=grid,
+            input_output_aliases=input_output_aliases,
             constexprs={
                 "stride_input_token": inp_stride_token,
                 "stride_input_hidden": inp_stride_hidden,
