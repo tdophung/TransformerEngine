@@ -587,6 +587,9 @@ def _sort_chunks_by_map_kernel(
     input_ptr,
     row_id_map_ptr,
     probs_ptr,
+    # Pre-allocated output buffer (for input_output_aliases compatibility).
+    # Aliased with output_ptr by XLA; prevents in-place buffer reuse of input_ptr.
+    output_buf_ptr,  # pylint: disable=unused-argument
     # strides
     stride_input_token,
     stride_input_hidden,
@@ -624,6 +627,11 @@ def _sort_chunks_by_map_kernel(
             permuted_prob_off = dst_row * stride_permuted_probs_token
             tl.store(permuted_probs_ptr + permuted_prob_off, prob)
 
+
+# Autotuning is safe here because SortChunksByMapPrimitive.lowering passes a
+# pre-allocated output_buf aliased to the output via input_output_aliases={3: 0}.
+# This prevents XLA from implicitly reusing the input buffer for the output,
+# which would corrupt data since this kernel is a permutation (src_row != dst_row).
 
 try:
     _sort_chunks_by_map_kernel = triton.autotune(

@@ -1666,10 +1666,18 @@ class SortChunksByMapPrimitive(BasePrimitive):
 
     @staticmethod
     def abstract(
-        inp_aval, row_id_map_aval, probs_aval, *, num_tokens, hidden_size, is_forward, with_probs
+        inp_aval,
+        row_id_map_aval,
+        probs_aval,
+        output_buf_aval=None,  # Pre-allocated output buffer (inner primitive only)
+        *,
+        num_tokens,
+        hidden_size,
+        is_forward,
+        with_probs,
     ):
         """Shape/dtype inference."""
-        del row_id_map_aval, is_forward
+        del row_id_map_aval, is_forward, output_buf_aval
 
         output_aval = jax.core.ShapedArray((num_tokens, hidden_size), inp_aval.dtype)
 
@@ -1684,10 +1692,14 @@ class SortChunksByMapPrimitive(BasePrimitive):
     def impl(inp, row_id_map, probs, num_tokens, hidden_size, is_forward, with_probs):
         """Forward to inner primitive."""
         assert SortChunksByMapPrimitive.inner_primitive is not None
+
+        output_buf = jnp.empty((num_tokens, hidden_size), dtype=inp.dtype)
+
         return SortChunksByMapPrimitive.inner_primitive.bind(
             inp,
             row_id_map,
             probs,
+            output_buf,
             num_tokens=num_tokens,
             hidden_size=hidden_size,
             is_forward=is_forward,
@@ -1695,7 +1707,9 @@ class SortChunksByMapPrimitive(BasePrimitive):
         )
 
     @staticmethod
-    def lowering(ctx, inp, row_id_map, probs, *, num_tokens, hidden_size, is_forward, with_probs):
+    def lowering(
+        ctx, inp, row_id_map, probs, output_buf, *, num_tokens, hidden_size, is_forward, with_probs
+    ):
         """MLIR lowering using triton_call_lowering."""
         # Compute strides
         inp_stride_token = hidden_size
@@ -1709,6 +1723,7 @@ class SortChunksByMapPrimitive(BasePrimitive):
         block_size = _get_min_block_size(_sort_chunks_by_map_kernel)
         grid = (num_tokens, triton.cdiv(hidden_size, block_size))
 
+<<<<<<< HEAD
         # Declare that inp (input 0) may alias with output (output 0).
         # XLA's buffer assignment can independently alias these when inp is
         # dead after the kernel (e.g., backward pass grad_output -> grad_input).
@@ -1716,6 +1731,15 @@ class SortChunksByMapPrimitive(BasePrimitive):
         # logic won't protect the shared buffer during autotuning, causing
         # data corruption on repeated kernel runs.
         input_output_aliases = {0: 0}
+=======
+        # Alias output_buf (input 3) with output (output 0). This forces XLA to
+        # use output_buf's buffer for the output, preventing it from implicitly
+        # reusing inp's buffer — which would corrupt this permutation kernel
+        # since src_row != dst_row (cannot operate in-place).
+        # Input indices: 0=inp, 1=row_id_map, 2=probs, 3=output_buf
+        # Output indices: 0=output, 1=permuted_probs
+        input_output_aliases = {3: 0}
+>>>>>>> 468e7ad3 (WAR that actually passes, to alias input to a dummy output  such that XLA does not automatically alias input to the real output)
 
         return triton_call_lowering(
             ctx,
@@ -1723,6 +1747,7 @@ class SortChunksByMapPrimitive(BasePrimitive):
             inp,
             row_id_map,
             probs,
+            output_buf,
             grid=grid,
             input_output_aliases=input_output_aliases,
             constexprs={
@@ -1792,7 +1817,8 @@ class SortChunksByMapPrimitive(BasePrimitive):
             )
         out_shardings = [output_sharding, permuted_probs_sharding]
 
-        def sharded_impl(inp, row_id_map, probs):
+        def sharded_impl(inp, row_id_map, probs, output_buf):
+            del output_buf
             local_num_tokens = inp.shape[0]
             return SortChunksByMapPrimitive.impl(
                 inp,
@@ -1816,11 +1842,12 @@ class SortChunksByMapPrimitive(BasePrimitive):
         inp_spec = (f"{prefix}_tokens", f"{prefix}_hidden")
         row_id_map_spec = (f"{prefix}_tokens",)
         probs_spec = (f"{prefix}_tokens",) if with_probs else (f"{prefix}_empty",)
+        output_buf_spec = (f"{prefix}_tokens", f"{prefix}_hidden")
         output_spec = (f"{prefix}_tokens", f"{prefix}_hidden")
         permuted_probs_spec = (f"{prefix}_tokens",) if with_probs else (f"{prefix}_empty2",)
 
         return SdyShardingRule(
-            (inp_spec, row_id_map_spec, probs_spec),
+            (inp_spec, row_id_map_spec, probs_spec, output_buf_spec),
             (output_spec, permuted_probs_spec),
         )
 
@@ -2266,3 +2293,5 @@ def sort_chunks_by_map(
         permuted_probs = None
 
     return output, permuted_probs
+
+
