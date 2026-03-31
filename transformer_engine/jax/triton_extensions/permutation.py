@@ -4,6 +4,7 @@
 
 """JAX/TE custom ops for permutation in MOE using Triton kernels."""
 
+import os
 from typing import Optional, Tuple
 
 import jax
@@ -1729,7 +1730,12 @@ class SortChunksByMapPrimitive(BasePrimitive):
         # other input (like output_grad in backward) to the output buffer.
         # Input indices: 0=inp, 1=row_id_map, 2=probs, 3=output_buf
         # Output indices: 0=output, 1=permuted_probs
-        input_output_aliases = {3: 0}
+        # Set NVTE_DISABLE_SORT_CHUNKS_AUTOTUNE=1 to disable both autotune and
+        # this alias hint, for root-cause testing (no WAR, no autotune).
+        if os.getenv("NVTE_DISABLE_SORT_CHUNKS_AUTOTUNE", "0") == "1":
+            input_output_aliases = None
+        else:
+            input_output_aliases = {3: 0}
 
         return triton_call_lowering(
             ctx,

@@ -4,6 +4,8 @@
 
 """Efficient Permutation kernels written with OpenAI Triton."""
 
+import os
+
 import triton
 import triton.language as tl
 
@@ -642,17 +644,18 @@ def _sort_chunks_by_map_kernel(
 
 
 try:
-    _sort_chunks_by_map_kernel = triton.autotune(
-        configs=[
-            triton.Config({"BLOCK_SIZE": 64}),
-            triton.Config({"BLOCK_SIZE": 128}),
-            triton.Config({"BLOCK_SIZE": 256}),
-            triton.Config({"BLOCK_SIZE": 512}),
-            triton.Config({"BLOCK_SIZE": 1024}),
-            triton.Config({"BLOCK_SIZE": 2048}),
-            triton.Config({"BLOCK_SIZE": 4096}),
-        ],
-        key=["hidden_size"],
-    )(_sort_chunks_by_map_kernel)
+    if os.getenv("NVTE_DISABLE_SORT_CHUNKS_AUTOTUNE", "0") != "1":
+        _sort_chunks_by_map_kernel = triton.autotune(
+            configs=[
+                triton.Config({"BLOCK_SIZE": 64}),
+                triton.Config({"BLOCK_SIZE": 128}),
+                triton.Config({"BLOCK_SIZE": 256}),
+                triton.Config({"BLOCK_SIZE": 512}),
+                triton.Config({"BLOCK_SIZE": 1024}),
+                triton.Config({"BLOCK_SIZE": 2048}),
+                triton.Config({"BLOCK_SIZE": 4096}),
+            ],
+            key=["hidden_size"],
+        )(_sort_chunks_by_map_kernel)
 except RuntimeError:
     pass

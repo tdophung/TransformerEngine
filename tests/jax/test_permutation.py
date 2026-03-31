@@ -751,6 +751,17 @@ class TestHighLevelPermutationAPI:
     @pytest_parametrize_wrapper("dtype", DTYPES)
     def test_sort_chunks_by_index(self, num_splits, total_tokens, hidden_size, dtype):
         """Test sort_chunks_by_index forward and backward pass against reference"""
+
+        def _log_mem(label):
+            mem_stats = jax.devices()[0].memory_stats()
+            if mem_stats:
+                print(
+                    f"\n[MemStats:{label}] bytes_in_use={mem_stats.get('bytes_in_use', 0) / 1e9:.3f} GB"
+                    f"  peak={mem_stats.get('peak_bytes_in_use', 0) / 1e9:.3f} GB"
+                    f"  limit={mem_stats.get('bytes_limit', 0) / 1e9:.3f} GB"
+                )
+
+        _log_mem("test_start")
         key = jax.random.PRNGKey(42)
 
         # Generate random split sizes
@@ -786,9 +797,13 @@ class TestHighLevelPermutationAPI:
         output, _ = sort_chunks_by_index(inp, split_sizes, sorted_indices)
         ref_output, _ = reference_sort_chunks_by_map(inp, row_id_map, None, is_forward=True)
 
+        _log_mem("before_backward")
+
         # Test backward pass with JIT
         loss_val, computed_grad = jax.value_and_grad(loss_fn)(inp)
         ref_loss_val, ref_grad = jax.value_and_grad(ref_loss_fn)(inp)
+
+        _log_mem("test_end")
 
         # Compare forward and backward
         assert_allclose(output, ref_output)
