@@ -32,7 +32,11 @@ TRITON_EXTENSION_MIN_JAX_VERSION = "0.8.0"
 # Accessing a missing entry produced a null vector → CUDA_ERROR_INVALID_VALUE.
 # Fixed by: https://github.com/jax-ml/jax/pull/35218 (merged 2026-03-17, main).
 # Ships in JAX 0.9.3 (not yet released as of 2026-03-31).
-TRITON_AUTOTUNED_INPUT_OUTPUT_ALIAS_MIN_JAX_VERSION = "0.9.3"
+#
+# We accept "0.9.2.dev0" as the minimum so that nightly containers whose reported
+# version is "0.9.2devYYYYMMDD" (a pre-release of 0.9.2 in packaging.version terms)
+# also satisfy the check.  Any 0.9.2 dev build post-2026-03-17 contains the fix.
+TRITON_AUTOTUNED_INPUT_OUTPUT_ALIAS_MIN_JAX_VERSION = "0.9.2.dev0"
 
 
 def is_triton_extension_supported() -> bool:
