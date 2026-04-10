@@ -43,8 +43,10 @@ import jax
 import jax.numpy as jnp
 
 from ..version_utils import (
+    TRITON_AUTOTUNED_INPUT_OUTPUT_ALIAS_MIN_JAX_VERSION,
     TRITON_EXTENSION_MIN_JAX_VERSION,
     is_triton_extension_supported,
+    jax_version_meet_requirement,
 )
 
 
@@ -431,8 +433,45 @@ def triton_call_lowering(
     num_ctas = 1
     kernel_constexprs = constexprs if constexprs is not None else {}
 
-    # Handle autotuned kernels - compile all configs
+    # Handle autotuned kernels - compile all configs.
+    #
+    # On JAX < TRITON_AUTOTUNED_INPUT_OUTPUT_ALIAS_MIN_JAX_VERSION the restore phase
+    # of TritonAutotunedKernelCall (jaxlib/gpu/triton_kernels.cc) crashes or silently
+    # corrupts gradients when XLA aliases input/output buffers (jax-ml/jax#35218):
+    # the restore loop unconditionally accesses input_copies[input_idx], but the save
+    # phase only populates that map when XLA actually shared the buffers at runtime,
+    # so if XLA chose not to alias the entry is missing → null vector → CUDA error or
+    # gradient corruption on the next autotuning trial.
+    #
+    # On old JAX we therefore disable autotuning and fall back to a single-config
+    # dispatch using the first config's parameters.  This avoids both the crash and
+    # the multi-trial corruption while still running the kernel correctly.
+    #
+    # Set NVTE_JAX_ENFORCE_TRITON_AUTOTUNING=1 to raise a hard error instead (useful
+    # to surface this condition and prompt a JAX upgrade for better performance).
     is_autotuned = isinstance(kernel_fn, autotuner.Autotuner)
+    if is_autotuned and not jax_version_meet_requirement(
+        TRITON_AUTOTUNED_INPUT_OUTPUT_ALIAS_MIN_JAX_VERSION
+    ):
+        if os.environ.get("NVTE_JAX_ENFORCE_TRITON_AUTOTUNING", "0") == "1":
+            raise RuntimeError(
+                "NVTE_JAX_ENFORCE_TRITON_AUTOTUNING=1 requires JAX >= "
+                f"{TRITON_AUTOTUNED_INPUT_OUTPUT_ALIAS_MIN_JAX_VERSION} for safe autotuning. "
+                f"Current JAX {jax.__version__} has a bug in TritonAutotunedKernelCall "
+                "(jax-ml/jax#35218): the restore phase crashes (CUDA_ERROR_INVALID_VALUE) "
+                "or silently corrupts gradients when XLA aliases input/output buffers. "
+                "Upgrade: pip install --upgrade jax jaxlib"
+            )
+        warnings.warn(
+            f"JAX {jax.__version__} < {TRITON_AUTOTUNED_INPUT_OUTPUT_ALIAS_MIN_JAX_VERSION}: "
+            "Triton autotuning disabled to prevent gradient corruption (jax-ml/jax#35218). "
+            f"Upgrade to JAX >= {TRITON_AUTOTUNED_INPUT_OUTPUT_ALIAS_MIN_JAX_VERSION} to "
+            "enable autotuning: pip install --upgrade jax jaxlib",
+            UserWarning,
+            stacklevel=2,
+        )
+        is_autotuned = False
+
     if is_autotuned:
         # Compile all configs for runtime selection
         kernel_calls = []
@@ -474,27 +513,41 @@ def triton_call_lowering(
 
             kernel_calls.append((config_call, str(config)))
 
-        # IMPORTANT: We pass an empty tuple for input_output_aliases_with_sizes.
-        #
-        # Background:
-        # 1. jax.ffi.ffi_lowering(operand_output_aliases=...) is a HINT to XLA that an
-        #    output can reuse an input's buffer. XLA may or may not honor this.
-        # 2. TritonAutotunedKernelCall's input_output_aliases_with_sizes triggers
-        #    save/restore logic during autotuning (see jaxlib/gpu/triton_kernels.cc:630-701).
-        #
-        # The problem: The save phase (triton_kernels.cc:632) only saves if buffers[input_idx] == buffers[output_idx],
-        # but the restore phase (triton_kernels.cc:697-700) unconditionally iterates over all aliases and tries
-        # to access input_copies[input_idx]. If XLA didn't actually alias the buffers, input_copies[input_idx] doesn't exist, creating an empty vector whose .data() returns nullptr, causing CUDA_ERROR_INVALID_VALUE during the restore memcpy.
-        #
-        # WAR: Don't pass aliases to TritonAutotunedKernelCall.
+        # Compute input_output_aliases_with_sizes for TritonAutotunedKernelCall's
+        # save/restore logic.  We only reach this path on JAX >=
+        # TRITON_AUTOTUNED_INPUT_OUTPUT_ALIAS_MIN_JAX_VERSION which has the fix for
+        # jax-ml/jax#35218, so it is safe to pass non-empty aliases here.
+        input_output_aliases_with_sizes = ()
+        if input_output_aliases:
+            num_inputs = len(ctx.avals_in)
+            aliases = []
+            for in_idx, out_idx in input_output_aliases.items():
+                aval = ctx.avals_in[in_idx]
+                size_bytes = aval.size * jnp.dtype(aval.dtype).itemsize
+                aliases.append((in_idx, num_inputs + out_idx, size_bytes))
+            input_output_aliases_with_sizes = tuple(aliases)
+
         kernel_call = gpu_triton.TritonAutotunedKernelCall(
             f"{actual_kernel_fn.__name__}_autotuned",
             kernel_calls,
-            (),  # Empty to avoid buggy save/restore in jaxlib/gpu/triton_kernels.cc
+            input_output_aliases_with_sizes,
         )
 
     else:
-        # Regular kernel: compile single config
+        # Regular kernel or old-JAX fallback from autotuner: compile single config.
+        # When falling back from an Autotuner, unwrap the fn and use the first
+        # config's parameters so the kernel compiles with its intended defaults.
+        if isinstance(kernel_fn, autotuner.Autotuner):
+            actual_kernel_fn = kernel_fn.fn
+            if kernel_fn.configs:
+                first_cfg = kernel_fn.configs[0]
+                kernel_constexprs = {**first_cfg.kwargs, **(constexprs or {})}
+                num_warps = first_cfg.num_warps if first_cfg.num_warps is not None else num_warps
+                num_stages = (
+                    first_cfg.num_stages if first_cfg.num_stages is not None else num_stages
+                )
+                num_ctas = first_cfg.num_ctas if first_cfg.num_ctas is not None else num_ctas
+
         kernel = compile_triton(
             actual_kernel_fn,
             signature,
