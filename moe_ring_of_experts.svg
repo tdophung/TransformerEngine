@@ -1,0 +1,114 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="740" height="580" viewBox="0 0 740 580" xmlns="http://www.w3.org/2000/svg" font-family="monospace, 'Courier New'">
+  <rect width="740" height="580" fill="#0f1117"/>
+  <defs>
+    <marker id="arr" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#4a90d9"/>
+    </marker>
+    <marker id="arr_g" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#ffa726"/>
+    </marker>
+  </defs>
+
+  <!-- Title -->
+  <text x="370" y="28" text-anchor="middle" fill="#90caf9" font-size="15" font-weight="bold">Ring-of-Experts: All-Gather + Local Compute</text>
+  <text x="370" y="46" text-anchor="middle" fill="#546e7a" font-size="11">4 tokens · 4 experts · 2 EP shards   —   simple but higher comms cost</text>
+
+  <!-- all-gather arrow spanning top -->
+  <rect x="90" y="60" width="240" height="36" rx="7" fill="#1a2433" stroke="#42a5f5" stroke-width="1.5"/>
+  <text x="210" y="75" text-anchor="middle" fill="#e8eaf6" font-size="11" font-weight="bold">Shard 0  (experts E₀, E₁)</text>
+  <text x="210" y="90" text-anchor="middle" fill="#546e7a" font-size="10">T₀, T₁, T₂, T₃  (local)</text>
+
+  <rect x="410" y="60" width="240" height="36" rx="7" fill="#1a2433" stroke="#42a5f5" stroke-width="1.5"/>
+  <text x="530" y="75" text-anchor="middle" fill="#e8eaf6" font-size="11" font-weight="bold">Shard 1  (experts E₂, E₃)</text>
+  <text x="530" y="90" text-anchor="middle" fill="#546e7a" font-size="10">T₀, T₁, T₂, T₃  (local)</text>
+
+  <!-- all-gather double arrow -->
+  <line x1="335" y1="77" x2="405" y2="77" stroke="#ffa726" stroke-width="2" marker-end="url(#arr_g)"/>
+  <line x1="405" y1="83" x2="335" y2="83" stroke="#ffa726" stroke-width="2" marker-end="url(#arr_g)"/>
+  <text x="370" y="73" text-anchor="middle" fill="#ffa726" font-size="10" font-weight="bold">all_gather</text>
+  <text x="370" y="92" text-anchor="middle" fill="#546e7a" font-size="9">tokens replicated</text>
+
+  <!-- after all-gather -->
+  <line x1="210" y1="96" x2="210" y2="120" stroke="#4a90d9" stroke-width="1.5" marker-end="url(#arr)"/>
+  <line x1="530" y1="96" x2="530" y2="120" stroke="#4a90d9" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <rect x="90" y="120" width="240" height="30" rx="5" fill="#1a2433" stroke="#7986cb" stroke-width="1"/>
+  <text x="210" y="140" text-anchor="middle" fill="#9fa8da" font-size="10">T₀,T₁,T₂,T₃  ← all tokens present</text>
+
+  <rect x="410" y="120" width="240" height="30" rx="5" fill="#1a2433" stroke="#7986cb" stroke-width="1"/>
+  <text x="530" y="140" text-anchor="middle" fill="#9fa8da" font-size="10">T₀,T₁,T₂,T₃  ← all tokens present</text>
+
+  <!-- route + permute -->
+  <line x1="210" y1="150" x2="210" y2="170" stroke="#4a90d9" stroke-width="1.5" marker-end="url(#arr)"/>
+  <line x1="530" y1="150" x2="530" y2="170" stroke="#4a90d9" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <text x="210" y="165" text-anchor="middle" fill="#546e7a" font-size="9">local route + permute</text>
+  <text x="530" y="165" text-anchor="middle" fill="#546e7a" font-size="9">local route + permute</text>
+
+  <!-- expert groups shard 0 -->
+  <rect x="90" y="172" width="110" height="56" rx="5" fill="#0d1a0d" stroke="#388e3c" stroke-width="1.5"/>
+  <text x="145" y="190" text-anchor="middle" fill="#81c784" font-size="10" font-weight="bold">Expert E₀</text>
+  <text x="145" y="205" text-anchor="middle" fill="#b0bec5" font-size="10">[ T₃ ]</text>
+  <text x="145" y="220" text-anchor="middle" fill="#546e7a" font-size="9">1 token</text>
+
+  <rect x="218" y="172" width="112" height="56" rx="5" fill="#0d1a0d" stroke="#388e3c" stroke-width="1.5"/>
+  <text x="274" y="190" text-anchor="middle" fill="#81c784" font-size="10" font-weight="bold">Expert E₁</text>
+  <text x="274" y="205" text-anchor="middle" fill="#b0bec5" font-size="10">[ T₀,T₂,T₃ ]</text>
+  <text x="274" y="220" text-anchor="middle" fill="#546e7a" font-size="9">3 tokens</text>
+
+  <!-- expert groups shard 1 -->
+  <rect x="410" y="172" width="110" height="56" rx="5" fill="#0d1a0d" stroke="#388e3c" stroke-width="1.5"/>
+  <text x="465" y="190" text-anchor="middle" fill="#81c784" font-size="10" font-weight="bold">Expert E₂</text>
+  <text x="465" y="205" text-anchor="middle" fill="#b0bec5" font-size="10">[ T₁ ]</text>
+  <text x="465" y="220" text-anchor="middle" fill="#546e7a" font-size="9">1 token</text>
+
+  <rect x="540" y="172" width="110" height="56" rx="5" fill="#0d1a0d" stroke="#388e3c" stroke-width="1.5"/>
+  <text x="595" y="190" text-anchor="middle" fill="#81c784" font-size="10" font-weight="bold">Expert E₃</text>
+  <text x="595" y="205" text-anchor="middle" fill="#b0bec5" font-size="10">[ T₀,T₄ ]</text>
+  <text x="595" y="220" text-anchor="middle" fill="#546e7a" font-size="9">2 tokens</text>
+
+  <!-- grouped gemm shard 0 -->
+  <line x1="210" y1="228" x2="210" y2="252" stroke="#4a90d9" stroke-width="1.5" marker-end="url(#arr)"/>
+  <line x1="530" y1="228" x2="530" y2="252" stroke="#4a90d9" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <rect x="90" y="252" width="240" height="36" rx="7" fill="#1e1a2e" stroke="#ab47bc" stroke-width="1.5"/>
+  <text x="210" y="268" text-anchor="middle" fill="#ab47bc" font-size="11" font-weight="bold">Grouped GEMM</text>
+  <text x="210" y="284" text-anchor="middle" fill="#b0bec5" font-size="10">E₀, E₁ experts  (local weights)</text>
+
+  <rect x="410" y="252" width="240" height="36" rx="7" fill="#1e1a2e" stroke="#ab47bc" stroke-width="1.5"/>
+  <text x="530" y="268" text-anchor="middle" fill="#ab47bc" font-size="11" font-weight="bold">Grouped GEMM</text>
+  <text x="530" y="284" text-anchor="middle" fill="#b0bec5" font-size="10">E₂, E₃ experts  (local weights)</text>
+
+  <!-- outputs -->
+  <line x1="210" y1="288" x2="210" y2="312" stroke="#4a90d9" stroke-width="1.5" marker-end="url(#arr)"/>
+  <line x1="530" y1="288" x2="530" y2="312" stroke="#4a90d9" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <rect x="90" y="312" width="240" height="30" rx="5" fill="#1e2433" stroke="#66bb6a" stroke-width="1"/>
+  <text x="210" y="332" text-anchor="middle" fill="#81c784" font-size="10">E₀_out,  E₁_out</text>
+
+  <rect x="410" y="312" width="240" height="30" rx="5" fill="#1e2433" stroke="#66bb6a" stroke-width="1"/>
+  <text x="530" y="332" text-anchor="middle" fill="#81c784" font-size="10">E₂_out,  E₃_out</text>
+
+  <!-- psum_scatter double arrow -->
+  <line x1="210" y1="342" x2="210" y2="380" stroke="#4a90d9" stroke-width="1.5"/>
+  <line x1="530" y1="342" x2="530" y2="380" stroke="#4a90d9" stroke-width="1.5"/>
+  <line x1="210" y1="380" x2="530" y2="380" stroke="#4a90d9" stroke-width="1.5"/>
+  <line x1="370" y1="380" x2="370" y2="400" stroke="#4a90d9" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="370" y="375" text-anchor="middle" fill="#ffa726" font-size="10" font-weight="bold">psum_scatter  (reduce-scatter)</text>
+  <text x="370" y="392" text-anchor="middle" fill="#546e7a" font-size="9">each shard gets its token slice</text>
+
+  <!-- final output -->
+  <rect x="220" y="400" width="300" height="36" rx="7" fill="#1e2433" stroke="#4a90d9" stroke-width="2"/>
+  <text x="370" y="418" text-anchor="middle" fill="#e8eaf6" font-size="12" font-weight="bold">Final output tokens</text>
+  <text x="370" y="434" text-anchor="middle" fill="#7986cb" font-size="10">[N, H]</text>
+
+  <!-- code snippet -->
+  <rect x="40" y="456" width="660" height="110" rx="7" fill="#141822" stroke="#37474f" stroke-width="1"/>
+  <text x="370" y="474" text-anchor="middle" fill="#78909c" font-size="11" font-weight="bold">MaxText  moe.py</text>
+  <text x="60" y="492" fill="#80cbc4" font-size="10">x = jax.lax.all_gather(x, axis_name=ep_axis, tiled=True)</text>
+  <text x="60" y="508" fill="#80cbc4" font-size="10">x, perm_state = self.permute(x, ..., roll_to_expert_id=shard_id*n_local_experts)</text>
+  <text x="60" y="524" fill="#80cbc4" font-size="10">x = expert_mlp(x, local_weights)</text>
+  <text x="60" y="540" fill="#80cbc4" font-size="10">x = jax.lax.psum_scatter(x, ep_axis, scatter_dimension=0, tiled=True)</text>
+  <text x="60" y="558" fill="#546e7a" font-size="9">Tradeoff: simple to implement · comm cost = O(N × H × (E_shards - 1))</text>
+</svg>

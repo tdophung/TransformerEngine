@@ -1,0 +1,109 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="640" height="620" viewBox="0 0 640 620" xmlns="http://www.w3.org/2000/svg" font-family="monospace, 'Courier New'">
+  <rect width="640" height="620" fill="#0f1117"/>
+  <defs>
+    <marker id="arr" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#4a90d9"/>
+    </marker>
+    <marker id="arr2" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#78909c"/>
+    </marker>
+  </defs>
+
+  <!-- Title -->
+  <text x="320" y="28" text-anchor="middle" fill="#90caf9" font-size="15" font-weight="bold">Fused Router Pipeline (Forward)</text>
+
+  <!-- Input -->
+  <rect x="195" y="44" width="250" height="40" rx="7" fill="#1e2433" stroke="#4a90d9" stroke-width="1.5"/>
+  <text x="320" y="60" text-anchor="middle" fill="#e8eaf6" font-size="12" font-weight="bold">logits</text>
+  <text x="320" y="76" text-anchor="middle" fill="#7986cb" font-size="11">[N, E]</text>
+
+  <!-- arrow -->
+  <line x1="320" y1="84" x2="320" y2="112" stroke="#4a90d9" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <!-- kernel box -->
+  <rect x="60" y="112" width="520" height="326" rx="8" fill="#141822" stroke="#42a5f5" stroke-width="1.5" stroke-dasharray="6,3"/>
+  <text x="320" y="132" text-anchor="middle" fill="#42a5f5" font-size="11" font-weight="bold">fused_topk_with_score_function_forward_kernel</text>
+  <text x="320" y="147" text-anchor="middle" fill="#546e7a" font-size="10">one warp (32 threads) per token</text>
+
+  <!-- step 1 -->
+  <rect x="110" y="156" width="420" height="32" rx="5" fill="#1a2340" stroke="#546e7a" stroke-width="1"/>
+  <text x="140" y="171" fill="#b0bec5" font-size="11">1.  Load logits  →  shared memory</text>
+  <text x="140" y="183" fill="#607d8b" font-size="10">warp loads one token's E logits into shmem</text>
+
+  <!-- arrow -->
+  <line x1="320" y1="188" x2="320" y2="200" stroke="#546e7a" stroke-width="1" marker-end="url(#arr2)"/>
+
+  <!-- step 2 -->
+  <rect x="110" y="200" width="420" height="44" rx="5" fill="#1a2340" stroke="#546e7a" stroke-width="1"/>
+  <text x="140" y="217" fill="#b0bec5" font-size="11">2.  Score function  →  intermediate_output [N, E]</text>
+  <rect x="140" y="224" width="170" height="16" rx="3" fill="#112233"/>
+  <text x="148" y="235" fill="#81d4fa" font-size="10">softmax:  eˣ / Σeˣ</text>
+  <rect x="320" y="224" width="195" height="16" rx="3" fill="#112233"/>
+  <text x="328" y="235" fill="#80cbc4" font-size="10">sigmoid:  1/(1+e⁻ˣ)</text>
+
+  <!-- arrow -->
+  <line x1="320" y1="244" x2="320" y2="256" stroke="#546e7a" stroke-width="1" marker-end="url(#arr2)"/>
+
+  <!-- step 3 -->
+  <rect x="110" y="256" width="420" height="28" rx="5" fill="#1a2340" stroke="#546e7a" stroke-width="1"/>
+  <text x="140" y="270" fill="#b0bec5" font-size="11">3.  Add expert_bias  (optional)</text>
+  <text x="480" y="275" fill="#546e7a" font-size="9" font-style="italic">optional</text>
+
+  <!-- arrow -->
+  <line x1="320" y1="284" x2="320" y2="296" stroke="#546e7a" stroke-width="1" marker-end="url(#arr2)"/>
+
+  <!-- step 4 -->
+  <rect x="110" y="296" width="420" height="44" rx="5" fill="#1a2340" stroke="#546e7a" stroke-width="1"/>
+  <text x="140" y="313" fill="#b0bec5" font-size="11">4.  Top-K selection</text>
+  <text x="140" y="330" fill="#607d8b" font-size="10">warp shuffle: 5 rounds of __shfl_xor_sync  →  O(log₂32) reduction, no shmem</text>
+
+  <!-- arrow -->
+  <line x1="320" y1="340" x2="320" y2="352" stroke="#546e7a" stroke-width="1" marker-end="url(#arr2)"/>
+
+  <!-- step 5 -->
+  <rect x="110" y="352" width="420" height="28" rx="5" fill="#1a2340" stroke="#546e7a" stroke-width="1"/>
+  <text x="140" y="366" fill="#b0bec5" font-size="11">5.  Revert bias, post-softmax / normalize  (optional)</text>
+
+  <!-- arrow -->
+  <line x1="320" y1="380" x2="320" y2="392" stroke="#546e7a" stroke-width="1" marker-end="url(#arr2)"/>
+
+  <!-- step 6 -->
+  <rect x="110" y="392" width="420" height="40" rx="5" fill="#1a2340" stroke="#546e7a" stroke-width="1"/>
+  <text x="140" y="408" fill="#b0bec5" font-size="11">6.  Write outputs</text>
+  <text x="140" y="423" fill="#607d8b" font-size="10">probs[topk_indices] = scaling × score     routing_map[topk_indices] = True</text>
+
+  <!-- end kernel box -->
+
+  <!-- arrow out -->
+  <line x1="320" y1="438" x2="320" y2="468" stroke="#4a90d9" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <!-- Outputs row -->
+  <!-- probs -->
+  <rect x="68" y="468" width="152" height="52" rx="7" fill="#1e2433" stroke="#66bb6a" stroke-width="1.5"/>
+  <text x="144" y="487" text-anchor="middle" fill="#66bb6a" font-size="11" font-weight="bold">probs</text>
+  <text x="144" y="502" text-anchor="middle" fill="#7986cb" font-size="10">[N, E]  sparse</text>
+  <text x="144" y="515" text-anchor="middle" fill="#546e7a" font-size="9">K nonzero per row</text>
+
+  <!-- routing_map -->
+  <rect x="234" y="468" width="172" height="52" rx="7" fill="#1e2433" stroke="#ffa726" stroke-width="1.5"/>
+  <text x="320" y="487" text-anchor="middle" fill="#ffa726" font-size="11" font-weight="bold">routing_map</text>
+  <text x="320" y="502" text-anchor="middle" fill="#7986cb" font-size="10">[N, E]  bool</text>
+  <text x="320" y="515" text-anchor="middle" fill="#546e7a" font-size="9">True where routed</text>
+
+  <!-- intermediate_output -->
+  <rect x="420" y="468" width="152" height="52" rx="7" fill="#1e2433" stroke="#ab47bc" stroke-width="1.5"/>
+  <text x="496" y="487" text-anchor="middle" fill="#ab47bc" font-size="11" font-weight="bold">intermediate</text>
+  <text x="496" y="502" text-anchor="middle" fill="#7986cb" font-size="10">[N, E]  all scores</text>
+  <text x="496" y="515" text-anchor="middle" fill="#546e7a" font-size="9">saved for backward</text>
+
+  <!-- output labels -->
+  <line x1="232" y1="494" x2="222" y2="494" stroke="#4a90d9" stroke-width="1" marker-end="url(#arr)"/>
+  <line x1="408" y1="494" x2="418" y2="494" stroke="#4a90d9" stroke-width="1" marker-end="url(#arr)"/>
+
+  <!-- aux loss note -->
+  <rect x="68" y="536" width="504" height="60" rx="7" fill="#141822" stroke="#37474f" stroke-width="1"/>
+  <text x="320" y="554" text-anchor="middle" fill="#78909c" font-size="11" font-weight="bold">Auxiliary Load-Balancing Loss (separate kernels)</text>
+  <text x="88" y="572" fill="#607d8b" font-size="10">fused_score_for_moe_aux_loss  →  dense scores [N, E]  (no bias/groups)</text>
+  <text x="88" y="587" fill="#607d8b" font-size="10">fused_moe_aux_loss  →  L_aux = C · Σ (avg_prob_i × f_i)   prevents expert collapse</text>
+</svg>

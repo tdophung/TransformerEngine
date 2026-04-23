@@ -1,0 +1,131 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="780" height="680" viewBox="0 0 780 680" xmlns="http://www.w3.org/2000/svg" font-family="monospace, 'Courier New'">
+  <rect width="780" height="680" fill="#0f1117"/>
+  <defs>
+    <marker id="arr" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#4a90d9"/>
+    </marker>
+    <marker id="arr_g" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#66bb6a"/>
+    </marker>
+    <marker id="arr_o" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#ffa726"/>
+    </marker>
+    <marker id="arr_p" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#ab47bc"/>
+    </marker>
+  </defs>
+
+  <!-- Title -->
+  <text x="390" y="28" text-anchor="middle" fill="#90caf9" font-size="15" font-weight="bold">Row-ID Map: 3-Pass Construction</text>
+  <text x="390" y="46" text-anchor="middle" fill="#546e7a" font-size="11">routing_map M [N=5, E=4]  →  row_id_map R [N, 2E+1]</text>
+
+  <!-- INPUT: routing map table -->
+  <text x="60" y="72" fill="#78909c" font-size="11" font-weight="bold">Input: routing_map M</text>
+  <!-- table header -->
+  <text x="160" y="90" text-anchor="middle" fill="#546e7a" font-size="10">E₀</text>
+  <text x="200" y="90" text-anchor="middle" fill="#546e7a" font-size="10">E₁</text>
+  <text x="240" y="90" text-anchor="middle" fill="#546e7a" font-size="10">E₂</text>
+  <text x="280" y="90" text-anchor="middle" fill="#546e7a" font-size="10">E₃</text>
+  <!-- rows -->
+  <text x="100" y="105" fill="#78909c" font-size="10">T₀</text>
+  <text x="160" y="105" text-anchor="middle" fill="#ef9a9a" font-size="11">0</text>
+  <text x="200" y="105" text-anchor="middle" fill="#a5d6a7" font-size="11">1</text>
+  <text x="240" y="105" text-anchor="middle" fill="#ef9a9a" font-size="11">0</text>
+  <text x="280" y="105" text-anchor="middle" fill="#a5d6a7" font-size="11">1</text>
+  <text x="340" y="105" fill="#546e7a" font-size="10">T₀→E₁,E₃</text>
+
+  <text x="100" y="121" fill="#78909c" font-size="10">T₁</text>
+  <text x="160" y="121" text-anchor="middle" fill="#ef9a9a" font-size="11">0</text>
+  <text x="200" y="121" text-anchor="middle" fill="#ef9a9a" font-size="11">0</text>
+  <text x="240" y="121" text-anchor="middle" fill="#a5d6a7" font-size="11">1</text>
+  <text x="280" y="121" text-anchor="middle" fill="#ef9a9a" font-size="11">0</text>
+  <text x="340" y="121" fill="#546e7a" font-size="10">T₁→E₂</text>
+
+  <text x="100" y="137" fill="#78909c" font-size="10">T₂</text>
+  <text x="160" y="137" text-anchor="middle" fill="#ef9a9a" font-size="11">0</text>
+  <text x="200" y="137" text-anchor="middle" fill="#a5d6a7" font-size="11">1</text>
+  <text x="240" y="137" text-anchor="middle" fill="#ef9a9a" font-size="11">0</text>
+  <text x="280" y="137" text-anchor="middle" fill="#ef9a9a" font-size="11">0</text>
+  <text x="340" y="137" fill="#546e7a" font-size="10">T₂→E₁</text>
+
+  <text x="100" y="153" fill="#78909c" font-size="10">T₃</text>
+  <text x="160" y="153" text-anchor="middle" fill="#a5d6a7" font-size="11">1</text>
+  <text x="200" y="153" text-anchor="middle" fill="#a5d6a7" font-size="11">1</text>
+  <text x="240" y="153" text-anchor="middle" fill="#ef9a9a" font-size="11">0</text>
+  <text x="280" y="153" text-anchor="middle" fill="#ef9a9a" font-size="11">0</text>
+  <text x="340" y="153" fill="#546e7a" font-size="10">T₃→E₀,E₁</text>
+
+  <text x="100" y="169" fill="#78909c" font-size="10">T₄</text>
+  <text x="160" y="169" text-anchor="middle" fill="#ef9a9a" font-size="11">0</text>
+  <text x="200" y="169" text-anchor="middle" fill="#ef9a9a" font-size="11">0</text>
+  <text x="240" y="169" text-anchor="middle" fill="#ef9a9a" font-size="11">0</text>
+  <text x="280" y="169" text-anchor="middle" fill="#a5d6a7" font-size="11">1</text>
+  <text x="340" y="169" fill="#546e7a" font-size="10">T₄→E₃</text>
+
+  <!-- ───── PASS 1 ───── -->
+  <line x1="390" y1="60" x2="390" y2="210" stroke="#37474f" stroke-width="1" stroke-dasharray="4,3"/>
+
+  <rect x="420" y="56" width="330" height="130" rx="8" fill="#1a2330" stroke="#42a5f5" stroke-width="1.5"/>
+  <text x="585" y="74" text-anchor="middle" fill="#42a5f5" font-size="12" font-weight="bold">Pass 1 — Block Cumsum × Mask</text>
+  <text x="585" y="89" text-anchor="middle" fill="#546e7a" font-size="10">grid: (num_experts, ⌈N/BLOCK⌉)</text>
+  <text x="438" y="106" fill="#b0bec5" font-size="10">Expert 1 column: [ 1, 0, 1, 1, 0 ]   (BLOCK=3)</text>
+  <text x="438" y="121" fill="#b0bec5" font-size="10">Block 0 [T0-T2]:  cumsum×mask = [ 1, 0, 2 ]</text>
+  <text x="438" y="136" fill="#b0bec5" font-size="10">                  workspace[0] = 2</text>
+  <text x="438" y="151" fill="#b0bec5" font-size="10">Block 1 [T3-T4]:  cumsum×mask = [ 1, 0 ]</text>
+  <text x="438" y="166" fill="#b0bec5" font-size="10">                  workspace[1] = 1</text>
+  <text x="438" y="181" fill="#607d8b" font-size="9" font-style="italic">local row IDs within each block</text>
+
+  <!-- pass 1 → pass 2 arrow -->
+  <line x1="390" y1="212" x2="390" y2="240" stroke="#4a90d9" stroke-width="1.5" marker-end="url(#arr)"/>
+  <line x1="585" y1="186" x2="585" y2="240" stroke="#4a90d9" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <!-- ───── PASS 2 ───── -->
+  <rect x="40" y="240" width="330" height="120" rx="8" fill="#1a2830" stroke="#66bb6a" stroke-width="1.5"/>
+  <text x="205" y="258" text-anchor="middle" fill="#66bb6a" font-size="12" font-weight="bold">Pass 2 — Global Offset Correction</text>
+  <text x="205" y="273" text-anchor="middle" fill="#546e7a" font-size="10">grid: (num_experts, ⌈N/BLOCK⌉)</text>
+  <text x="58" y="292" fill="#b0bec5" font-size="10">workspace = [2, 1]  →  prefix_sum = [0, 2]</text>
+  <text x="58" y="308" fill="#b0bec5" font-size="10">Block 0: [1,0,2] + 0 - 1  →  [0, -1, 1]</text>
+  <text x="58" y="324" fill="#b0bec5" font-size="10">Block 1: [1,0]   + 2 - 1  →  [2, -1]</text>
+  <text x="58" y="344" fill="#607d8b" font-size="9" font-style="italic">-1 = not routed to this expert</text>
+
+  <rect x="420" y="240" width="330" height="120" rx="8" fill="#1a2830" stroke="#66bb6a" stroke-width="1.5"/>
+  <text x="585" y="258" text-anchor="middle" fill="#66bb6a" font-size="12" font-weight="bold">Intermediate R (after Pass 2)</text>
+  <text x="438" y="278" fill="#546e7a" font-size="10">       E₀    E₁    E₂    E₃</text>
+  <text x="438" y="294" fill="#b0bec5" font-size="10">T₀  [ -1,    0,   -1,    0 ]</text>
+  <text x="438" y="310" fill="#b0bec5" font-size="10">T₁  [ -1,   -1,    0,   -1 ]</text>
+  <text x="438" y="326" fill="#b0bec5" font-size="10">T₂  [ -1,    1,   -1,   -1 ]</text>
+  <text x="438" y="342" fill="#b0bec5" font-size="10">T₃  [  0,    2,   -1,   -1 ]</text>
+  <text x="438" y="358" fill="#b0bec5" font-size="10">T₄  [ -1,   -1,   -1,    1 ]</text>
+
+  <!-- pass 2 → pass 3 arrows -->
+  <line x1="205" y1="360" x2="205" y2="400" stroke="#4a90d9" stroke-width="1.5" marker-end="url(#arr)"/>
+  <line x1="585" y1="362" x2="585" y2="400" stroke="#4a90d9" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <!-- ───── PASS 3 ───── -->
+  <rect x="40" y="400" width="330" height="120" rx="8" fill="#28182a" stroke="#ab47bc" stroke-width="1.5"/>
+  <text x="205" y="418" text-anchor="middle" fill="#ab47bc" font-size="12" font-weight="bold">Pass 3 — Densification</text>
+  <text x="205" y="433" text-anchor="middle" fill="#546e7a" font-size="10">grid: (num_tokens,)  —  bitonic sort per token</text>
+  <text x="58" y="453" fill="#b0bec5" font-size="10">Pack valid entries (≥0) to front; append expert IDs</text>
+  <text x="58" y="470" fill="#b0bec5" font-size="10">T₀: [-1,0,-1,0] exps[_,1,_,3]  →  [0,0 | 1,3 | 2]</text>
+  <text x="58" y="486" fill="#b0bec5" font-size="10">T₃: [0,2,-1,-1] exps[0,1,_,_]  →  [0,2 | 0,1 | 2]</text>
+  <text x="58" y="502" fill="#b0bec5" font-size="10">T₁: [-1,-1,0,-1] exps[_,_,2,_] →  [0   | 2   | 1]</text>
+  <text x="58" y="516" fill="#607d8b" font-size="9" font-style="italic">format: [dsts... | experts... | n_active]</text>
+
+  <!-- output -->
+  <rect x="420" y="400" width="330" height="148" rx="8" fill="#1e2433" stroke="#ffa726" stroke-width="1.5"/>
+  <text x="585" y="418" text-anchor="middle" fill="#ffa726" font-size="12" font-weight="bold">Output: row_id_map R</text>
+  <text x="585" y="433" text-anchor="middle" fill="#546e7a" font-size="10">int32  [N, 2E+1] = [5, 9]</text>
+  <text x="438" y="453" fill="#546e7a" font-size="10">       dsts        exps      n</text>
+  <text x="438" y="469" fill="#ffcc80" font-size="10">T₀  [  0,  0, -1,-1 | 1, 3,-1,-1 | 2 ]</text>
+  <text x="438" y="485" fill="#ffcc80" font-size="10">T₁  [  0, -1, -1,-1 | 2,-1,-1,-1 | 1 ]</text>
+  <text x="438" y="501" fill="#ffcc80" font-size="10">T₂  [  1, -1, -1,-1 | 1,-1,-1,-1 | 1 ]</text>
+  <text x="438" y="517" fill="#ffcc80" font-size="10">T₃  [  0,  2, -1,-1 | 0, 1,-1,-1 | 2 ]</text>
+  <text x="438" y="533" fill="#ffcc80" font-size="10">T₄  [  1, -1, -1,-1 | 3,-1,-1,-1 | 1 ]</text>
+
+  <!-- usage note -->
+  <rect x="40" y="548" width="710" height="52" rx="7" fill="#141822" stroke="#37474f" stroke-width="1"/>
+  <text x="390" y="566" text-anchor="middle" fill="#78909c" font-size="11" font-weight="bold">How the permute kernel uses row_id_map:</text>
+  <text x="390" y="584" text-anchor="middle" fill="#607d8b" font-size="10">for k in range(R[i, 2E]):   dst = R[i, k];   exp = R[i, E+k];   Y[dst, :] = X[i, :]</text>
+  <text x="390" y="598" text-anchor="middle" fill="#546e7a" font-size="9">Same map reused for unpermute (gather) — no recomputation needed</text>
+</svg>

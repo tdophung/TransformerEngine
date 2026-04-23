@@ -1,0 +1,96 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="720" height="520" viewBox="0 0 720 520" xmlns="http://www.w3.org/2000/svg" font-family="monospace, 'Courier New'">
+  <rect width="720" height="520" fill="#0f1117"/>
+  <defs>
+    <marker id="arr_b" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#42a5f5"/>
+    </marker>
+    <marker id="arr_o" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#ffa726"/>
+    </marker>
+    <marker id="arr_g" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#66bb6a"/>
+    </marker>
+  </defs>
+
+  <!-- Title -->
+  <text x="360" y="28" text-anchor="middle" fill="#90caf9" font-size="15" font-weight="bold">Custom VJP: Making Permutation Differentiable</text>
+  <text x="360" y="46" text-anchor="middle" fill="#546e7a" font-size="11">jax.custom_vjp  —  forward stores residuals; backward reuses them</text>
+
+  <!-- ═══ FORWARD COLUMN ═══ -->
+  <text x="185" y="72" text-anchor="middle" fill="#42a5f5" font-size="13" font-weight="bold">FORWARD  (token_dispatch)</text>
+
+  <!-- inp -->
+  <rect x="60" y="84" width="250" height="40" rx="7" fill="#1e2433" stroke="#42a5f5" stroke-width="1.5"/>
+  <text x="185" y="100" text-anchor="middle" fill="#e8eaf6" font-size="12">inp</text>
+  <text x="185" y="116" text-anchor="middle" fill="#7986cb" font-size="10">[N, H]  ·  routing_map [N,E]  ·  probs [N,E]</text>
+
+  <line x1="185" y1="124" x2="185" y2="152" stroke="#42a5f5" stroke-width="1.5" marker-end="url(#arr_b)"/>
+
+  <!-- scatter box -->
+  <rect x="60" y="152" width="250" height="54" rx="7" fill="#1a2340" stroke="#42a5f5" stroke-width="1.5"/>
+  <text x="185" y="170" text-anchor="middle" fill="#42a5f5" font-size="12" font-weight="bold">Scatter  (permute)</text>
+  <text x="185" y="186" text-anchor="middle" fill="#b0bec5" font-size="10">_permute_kernel</text>
+  <text x="185" y="200" text-anchor="middle" fill="#607d8b" font-size="10">Y[R[i,k]] = X[i]  for each active k</text>
+
+  <line x1="185" y1="206" x2="185" y2="234" stroke="#42a5f5" stroke-width="1.5" marker-end="url(#arr_b)"/>
+
+  <!-- output -->
+  <rect x="60" y="234" width="250" height="54" rx="7" fill="#1e2433" stroke="#66bb6a" stroke-width="1.5"/>
+  <text x="185" y="252" text-anchor="middle" fill="#66bb6a" font-size="11" font-weight="bold">output  [N_out, H]</text>
+  <text x="185" y="268" text-anchor="middle" fill="#b0bec5" font-size="10">permuted_probs  [N_out, 1]</text>
+  <text x="185" y="283" text-anchor="middle" fill="#7986cb" font-size="10">tokens_per_expert  [E]</text>
+
+  <!-- residuals -->
+  <line x1="185" y1="288" x2="185" y2="316" stroke="#42a5f5" stroke-width="1.5" marker-end="url(#arr_b)"/>
+  <rect x="60" y="316" width="250" height="72" rx="7" fill="#1e1a2e" stroke="#ab47bc" stroke-width="1.5"/>
+  <text x="185" y="334" text-anchor="middle" fill="#ab47bc" font-size="11" font-weight="bold">Residuals (saved for backward)</text>
+  <text x="80" y="352" fill="#ce93d8" font-size="10">row_id_map   [N, 2E+1]</text>
+  <text x="80" y="368" fill="#ce93d8" font-size="10">pad_offsets  [E]</text>
+  <text x="80" y="383" fill="#ce93d8" font-size="10">probs        [N, E]    routing_map  [N, E]</text>
+
+  <!-- ═══ BACKWARD COLUMN ═══ -->
+  <text x="535" y="72" text-anchor="middle" fill="#ffa726" font-size="13" font-weight="bold">BACKWARD  (VJP rule)</text>
+
+  <!-- grad_output -->
+  <rect x="410" y="84" width="250" height="40" rx="7" fill="#1e2433" stroke="#ffa726" stroke-width="1.5"/>
+  <text x="535" y="100" text-anchor="middle" fill="#e8eaf6" font-size="12">grad_output</text>
+  <text x="535" y="116" text-anchor="middle" fill="#7986cb" font-size="10">[N_out, H]</text>
+
+  <line x1="535" y1="124" x2="535" y2="152" stroke="#ffa726" stroke-width="1.5" marker-end="url(#arr_o)"/>
+
+  <!-- gather box -->
+  <rect x="410" y="152" width="250" height="54" rx="7" fill="#1e1a0a" stroke="#ffa726" stroke-width="1.5"/>
+  <text x="535" y="170" text-anchor="middle" fill="#ffa726" font-size="12" font-weight="bold">Gather  (unpermute)</text>
+  <text x="535" y="186" text-anchor="middle" fill="#b0bec5" font-size="10">_unpermute_kernel</text>
+  <text x="535" y="200" text-anchor="middle" fill="#607d8b" font-size="10">g_in[i] += W[e_k] · g_out[R[i,k]]</text>
+
+  <line x1="535" y1="206" x2="535" y2="234" stroke="#ffa726" stroke-width="1.5" marker-end="url(#arr_o)"/>
+
+  <!-- grad_input -->
+  <rect x="410" y="234" width="250" height="40" rx="7" fill="#1e2433" stroke="#66bb6a" stroke-width="1.5"/>
+  <text x="535" y="252" text-anchor="middle" fill="#66bb6a" font-size="11" font-weight="bold">grad_inp  [N, H]</text>
+  <text x="535" y="268" text-anchor="middle" fill="#7986cb" font-size="10">grad_probs  [N, E]  (if probs used)</text>
+
+  <!-- residuals used -->
+  <line x1="535" y1="278" x2="535" y2="316" stroke="#ab47bc" stroke-width="1.5" stroke-dasharray="5,3" marker-end="url(#arr_o)"/>
+  <rect x="410" y="316" width="250" height="72" rx="7" fill="#1e1a2e" stroke="#ab47bc" stroke-width="1.5" stroke-dasharray="5,3"/>
+  <text x="535" y="334" text-anchor="middle" fill="#ab47bc" font-size="11" font-weight="bold">Residuals (from fwd)</text>
+  <text x="428" y="352" fill="#ce93d8" font-size="10">row_id_map   ← reused directly</text>
+  <text x="428" y="368" fill="#ce93d8" font-size="10">pad_offsets  ← reused directly</text>
+  <text x="428" y="383" fill="#ce93d8" font-size="10">probs, routing_map  ← grad_probs</text>
+
+  <!-- symmetry arrow between columns -->
+  <line x1="318" y1="178" x2="402" y2="178" stroke="#546e7a" stroke-width="1" stroke-dasharray="4,2"/>
+  <text x="360" y="173" text-anchor="middle" fill="#546e7a" font-size="9">dual</text>
+
+  <!-- bwd of dispatch = combine arrow -->
+  <rect x="200" y="430" width="320" height="52" rx="7" fill="#141822" stroke="#546e7a" stroke-width="1"/>
+  <text x="360" y="450" text-anchor="middle" fill="#78909c" font-size="11" font-weight="bold">Key Symmetry</text>
+  <text x="360" y="467" text-anchor="middle" fill="#607d8b" font-size="10">bwd(token_dispatch)  =  token_combine  (gather)</text>
+  <text x="360" y="482" text-anchor="middle" fill="#607d8b" font-size="10">bwd(token_combine)   =  token_dispatch  (scatter)</text>
+
+  <!-- code snippet -->
+  <rect x="60" y="406" width="590" height="20" rx="3" fill="#0d1218"/>
+  <text x="75" y="420" fill="#80cbc4" font-size="10">@partial(jax.custom_vjp, nondiff_argnums=(3,4,5,6))   def _token_dispatch(inp, routing_map, ...):</text>
+</svg>

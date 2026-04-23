@@ -1,0 +1,99 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="720" height="560" viewBox="0 0 720 560" xmlns="http://www.w3.org/2000/svg" font-family="monospace, 'Courier New'">
+  <rect width="720" height="560" fill="#0f1117"/>
+  <defs>
+    <marker id="arr" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#4a90d9"/>
+    </marker>
+  </defs>
+
+  <!-- Title -->
+  <text x="360" y="28" text-anchor="middle" fill="#90caf9" font-size="15" font-weight="bold">Grouped GEMM: Expert MLP</text>
+  <text x="360" y="46" text-anchor="middle" fill="#546e7a" font-size="11">one cuBLASLt call for all E experts  —  contiguous buffer, variable M_i</text>
+
+  <!-- Memory buffer diagram -->
+  <text x="360" y="70" text-anchor="middle" fill="#78909c" font-size="11" font-weight="bold">Permuted Activations Buffer  [sum(M_i), K]</text>
+  <rect x="40" y="78" width="200" height="44" rx="4" fill="#0d1a0d" stroke="#388e3c" stroke-width="1.5"/>
+  <text x="140" y="96" text-anchor="middle" fill="#81c784" font-size="11">Expert 0</text>
+  <text x="140" y="112" text-anchor="middle" fill="#546e7a" font-size="10">M₀ × K  rows</text>
+
+  <rect x="244" y="78" width="264" height="44" rx="4" fill="#0d1a0d" stroke="#388e3c" stroke-width="1.5"/>
+  <text x="376" y="96" text-anchor="middle" fill="#81c784" font-size="11">Expert 1</text>
+  <text x="376" y="112" text-anchor="middle" fill="#546e7a" font-size="10">M₁ × K  rows</text>
+
+  <rect x="512" y="78" width="110" height="44" rx="4" fill="#0d1a0d" stroke="#388e3c" stroke-width="1.5"/>
+  <text x="567" y="96" text-anchor="middle" fill="#81c784" font-size="11">E₂</text>
+  <text x="567" y="112" text-anchor="middle" fill="#546e7a" font-size="10">M₂ × K</text>
+
+  <rect x="626" y="78" width="54" height="44" rx="4" fill="#0d1a0d" stroke="#388e3c" stroke-width="1"/>
+  <text x="653" y="100" text-anchor="middle" fill="#66bb6a" font-size="10">...</text>
+
+  <!-- first_dims annotation -->
+  <text x="360" y="138" text-anchor="middle" fill="#ffa726" font-size="10">first_dims = [M₀, M₁, M₂, ...]   ·   offsets = [0, M₀·K, (M₀+M₁)·K, ...]</text>
+
+  <!-- GEMM 1 -->
+  <line x1="360" y1="148" x2="360" y2="172" stroke="#4a90d9" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <rect x="60" y="172" width="600" height="96" rx="8" fill="#1e1a2e" stroke="#ab47bc" stroke-width="2"/>
+  <text x="360" y="191" text-anchor="middle" fill="#ab47bc" font-size="13" font-weight="bold">GROUPED GEMM #1  —  Gate / Up Projection</text>
+  <text x="360" y="208" text-anchor="middle" fill="#546e7a" font-size="10">cuBLASLt grouped GEMM  (one call, E sub-problems)</text>
+
+  <!-- matrix dims -->
+  <rect x="80" y="216" width="176" height="40" rx="4" fill="#0d0d1a" stroke="#7986cb" stroke-width="1"/>
+  <text x="168" y="231" text-anchor="middle" fill="#9fa8da" font-size="11">A  [sum(M_i), K]</text>
+  <text x="168" y="248" text-anchor="middle" fill="#607d8b" font-size="10">permuted tokens</text>
+
+  <text x="280" y="240" text-anchor="middle" fill="#546e7a" font-size="14">@</text>
+
+  <rect x="300" y="216" width="176" height="40" rx="4" fill="#0d0d1a" stroke="#7986cb" stroke-width="1"/>
+  <text x="388" y="231" text-anchor="middle" fill="#9fa8da" font-size="11">B  [E, K, N']</text>
+  <text x="388" y="248" text-anchor="middle" fill="#607d8b" font-size="10">W1 per expert (uniform)</text>
+
+  <text x="500" y="240" text-anchor="middle" fill="#546e7a" font-size="14">=</text>
+
+  <rect x="520" y="216" width="120" height="40" rx="4" fill="#0d0d1a" stroke="#66bb6a" stroke-width="1"/>
+  <text x="580" y="231" text-anchor="middle" fill="#81c784" font-size="11">D  [sum(M_i), N']</text>
+  <text x="580" y="248" text-anchor="middle" fill="#607d8b" font-size="10">intermediate</text>
+
+  <!-- activation -->
+  <line x1="360" y1="268" x2="360" y2="292" stroke="#4a90d9" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <rect x="220" y="292" width="280" height="36" rx="7" fill="#1a1a0a" stroke="#ffa726" stroke-width="1.5"/>
+  <text x="360" y="310" text-anchor="middle" fill="#ffa726" font-size="12" font-weight="bold">Activation  (SiLU / GeLU)  — element-wise</text>
+  <text x="360" y="323" text-anchor="middle" fill="#607d8b" font-size="10">[sum(M_i), N']  unchanged shape</text>
+
+  <!-- GEMM 2 -->
+  <line x1="360" y1="328" x2="360" y2="352" stroke="#4a90d9" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <rect x="60" y="352" width="600" height="96" rx="8" fill="#1e2040" stroke="#42a5f5" stroke-width="2"/>
+  <text x="360" y="371" text-anchor="middle" fill="#42a5f5" font-size="13" font-weight="bold">GROUPED GEMM #2  —  Down Projection</text>
+  <text x="360" y="388" text-anchor="middle" fill="#546e7a" font-size="10">same first_dims reused  (token distribution unchanged)</text>
+
+  <rect x="80" y="396" width="176" height="40" rx="4" fill="#0d0d1a" stroke="#7986cb" stroke-width="1"/>
+  <text x="168" y="411" text-anchor="middle" fill="#9fa8da" font-size="11">A  [sum(M_i), N']</text>
+  <text x="168" y="428" text-anchor="middle" fill="#607d8b" font-size="10">activated intermediate</text>
+
+  <text x="280" y="420" text-anchor="middle" fill="#546e7a" font-size="14">@</text>
+
+  <rect x="300" y="396" width="176" height="40" rx="4" fill="#0d0d1a" stroke="#7986cb" stroke-width="1"/>
+  <text x="388" y="411" text-anchor="middle" fill="#9fa8da" font-size="11">B  [E, N', K]</text>
+  <text x="388" y="428" text-anchor="middle" fill="#607d8b" font-size="10">W2 per expert (uniform)</text>
+
+  <text x="500" y="420" text-anchor="middle" fill="#546e7a" font-size="14">=</text>
+
+  <rect x="520" y="396" width="120" height="40" rx="4" fill="#0d0d1a" stroke="#ffa726" stroke-width="1"/>
+  <text x="580" y="411" text-anchor="middle" fill="#ffcc80" font-size="11">D  [sum(M_i), K]</text>
+  <text x="580" y="428" text-anchor="middle" fill="#607d8b" font-size="10">expert outputs</text>
+
+  <!-- arrow to unpermute -->
+  <line x1="360" y1="448" x2="360" y2="472" stroke="#4a90d9" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <rect x="180" y="472" width="360" height="36" rx="7" fill="#1e2433" stroke="#66bb6a" stroke-width="1.5"/>
+  <text x="360" y="490" text-anchor="middle" fill="#66bb6a" font-size="11" font-weight="bold">UNPERMUTE  (token_combine)</text>
+  <text x="360" y="503" text-anchor="middle" fill="#7986cb" font-size="10">[sum(M_i), K]  →  [N, K]</text>
+
+  <!-- alignment note -->
+  <rect x="40" y="520" width="640" height="32" rx="5" fill="#141822" stroke="#37474f" stroke-width="1"/>
+  <text x="360" y="536" text-anchor="middle" fill="#607d8b" font-size="10">Alignment padding (align_size=16): each expert block padded to 16-row boundary for BF16 cuBLAS efficiency</text>
+  <text x="360" y="549" text-anchor="middle" fill="#546e7a" font-size="9">pad_offsets[E] stored in row_id_map · unpermute skips padding during gather</text>
+</svg>

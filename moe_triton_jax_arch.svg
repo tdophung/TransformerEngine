@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="680" height="600" viewBox="0 0 680 600" xmlns="http://www.w3.org/2000/svg" font-family="monospace, 'Courier New'">
+  <rect width="680" height="600" fill="#0f1117"/>
+  <defs>
+    <marker id="arr" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#4a90d9"/>
+    </marker>
+  </defs>
+
+  <!-- Title -->
+  <text x="340" y="28" text-anchor="middle" fill="#90caf9" font-size="15" font-weight="bold">Triton-in-JAX Architecture</text>
+  <text x="340" y="46" text-anchor="middle" fill="#546e7a" font-size="11">JAX user code  →  BasePrimitive  →  MLIR custom_call  →  PTX kernel</text>
+
+  <!-- Layer 1: JAX user code -->
+  <rect x="160" y="64" width="360" height="52" rx="8" fill="#1a2433" stroke="#42a5f5" stroke-width="2"/>
+  <text x="340" y="82" text-anchor="middle" fill="#42a5f5" font-size="12" font-weight="bold">JAX user code</text>
+  <text x="340" y="98" text-anchor="middle" fill="#b0bec5" font-size="10">from transformer_engine.jax.permutation import token_dispatch</text>
+  <text x="340" y="112" text-anchor="middle" fill="#607d8b" font-size="9">permutation.py  ·  custom_vjp wrappers  ·  Python</text>
+
+  <line x1="340" y1="116" x2="340" y2="144" stroke="#4a90d9" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <!-- Layer 2: triton_extensions -->
+  <rect x="120" y="144" width="440" height="52" rx="8" fill="#1a2433" stroke="#7986cb" stroke-width="1.5"/>
+  <text x="340" y="162" text-anchor="middle" fill="#9fa8da" font-size="12" font-weight="bold">triton_extensions.permute_with_mask_map()</text>
+  <text x="340" y="178" text-anchor="middle" fill="#b0bec5" font-size="10">triton_extensions/permutation.py  ·  BasePrimitive subclasses (8 ops)</text>
+  <text x="340" y="192" text-anchor="middle" fill="#607d8b" font-size="9">abstract_eval() — shape inference at trace time · Python</text>
+
+  <line x1="340" y1="196" x2="340" y2="224" stroke="#4a90d9" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <!-- Layer 3: BasePrimitive.lowering -->
+  <rect x="80" y="224" width="520" height="80" rx="8" fill="#1e1a2e" stroke="#ab47bc" stroke-width="1.5"/>
+  <text x="340" y="244" text-anchor="middle" fill="#ab47bc" font-size="12" font-weight="bold">BasePrimitive.lowering()  →  MLIR emission</text>
+  <text x="340" y="260" text-anchor="middle" fill="#b0bec5" font-size="10">triton_extensions/utils.py  ·  triton_call_lowering()</text>
+  <!-- sub-steps -->
+  <rect x="100" y="266" width="220" height="32" rx="4" fill="#0d0d1a"/>
+  <text x="210" y="280" text-anchor="middle" fill="#ce93d8" font-size="10">compile_triton()</text>
+  <text x="210" y="293" text-anchor="middle" fill="#607d8b" font-size="9">MD5 cache · specialize · PTX</text>
+  <rect x="340" y="266" width="240" height="32" rx="4" fill="#0d0d1a"/>
+  <text x="460" y="280" text-anchor="middle" fill="#ce93d8" font-size="10">stablehlo.custom_call</text>
+  <text x="460" y="293" text-anchor="middle" fill="#607d8b" font-size="9">kernel+grid zlib-compressed in attr</text>
+
+  <line x1="340" y1="304" x2="340" y2="332" stroke="#4a90d9" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <!-- Layer 4: XLA GPU backend -->
+  <rect x="120" y="332" width="440" height="44" rx="8" fill="#1a2233" stroke="#4a90d9" stroke-width="1.5"/>
+  <text x="340" y="352" text-anchor="middle" fill="#64b5f6" font-size="12" font-weight="bold">XLA GPU Backend</text>
+  <text x="340" y="368" text-anchor="middle" fill="#b0bec5" font-size="10">dispatches  __gpu$xla.gpu.triton  custom_call via registered Triton runtime</text>
+
+  <line x1="340" y1="376" x2="340" y2="404" stroke="#4a90d9" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <!-- Layer 5: Triton PTX kernel -->
+  <rect x="160" y="404" width="360" height="52" rx="8" fill="#0d1a0d" stroke="#66bb6a" stroke-width="2"/>
+  <text x="340" y="422" text-anchor="middle" fill="#66bb6a" font-size="12" font-weight="bold">Triton PTX kernel  (GPU)</text>
+  <text x="340" y="438" text-anchor="middle" fill="#b0bec5" font-size="10">common/triton/permutation.py  ·  @triton.jit</text>
+  <text x="340" y="452" text-anchor="middle" fill="#607d8b" font-size="9">_permute_kernel · _unpermute_kernel · _row_id_map_pass_{1,2,3}_kernel</text>
+
+  <!-- right side: file map -->
+  <rect x="40" y="468" width="600" height="110" rx="7" fill="#141822" stroke="#37474f" stroke-width="1"/>
+  <text x="340" y="486" text-anchor="middle" fill="#78909c" font-size="11" font-weight="bold">Source Layout</text>
+  <text x="60" y="503" fill="#607d8b" font-size="10">jax/permutation.py               ← public API (custom_vjp wrappers)</text>
+  <text x="60" y="518" fill="#607d8b" font-size="10">jax/triton_extensions/permutation.py  ← BasePrimitive subclasses (8 ops)</text>
+  <text x="60" y="533" fill="#607d8b" font-size="10">jax/triton_extensions/utils.py   ← compile_triton(), triton_call_lowering()</text>
+  <text x="60" y="548" fill="#607d8b" font-size="10">common/triton/permutation.py     ← @triton.jit kernels</text>
+  <text x="60" y="563" fill="#607d8b" font-size="10">jax/cpp_extensions/base.py       ← register_primitive()  (inner + outer primitives)</text>
+  <text x="60" y="578" fill="#546e7a" font-size="9">inner = single-device  ·  outer = multi-device with custom_partitioning + shardy sharding rules</text>
+</svg>

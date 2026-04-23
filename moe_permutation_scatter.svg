@@ -1,0 +1,117 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="740" height="520" viewBox="0 0 740 520" xmlns="http://www.w3.org/2000/svg" font-family="monospace, 'Courier New'">
+  <rect width="740" height="520" fill="#0f1117"/>
+  <defs>
+    <marker id="arr" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#4a90d9"/>
+    </marker>
+    <!-- token colors -->
+  </defs>
+
+  <!-- Title -->
+  <text x="370" y="28" text-anchor="middle" fill="#90caf9" font-size="15" font-weight="bold">Permutation: Scatter (token_dispatch)</text>
+  <text x="370" y="46" text-anchor="middle" fill="#546e7a" font-size="11">[N, H]  →  [N·K, H]   tokens reordered by expert</text>
+
+  <!-- ── LEFT: Input X ── -->
+  <text x="130" y="72" text-anchor="middle" fill="#78909c" font-size="11" font-weight="bold">Input X  [5, H]</text>
+  <text x="130" y="86" text-anchor="middle" fill="#546e7a" font-size="10">sequence order</text>
+
+  <!-- token boxes left -->
+  <rect x="60" y="96" width="140" height="38" rx="6" fill="#1a2b4a" stroke="#42a5f5" stroke-width="1.5"/>
+  <text x="130" y="111" text-anchor="middle" fill="#e3f2fd" font-size="12" font-weight="bold">T₀</text>
+  <text x="130" y="126" text-anchor="middle" fill="#7986cb" font-size="10">[1, 2, 3]  →  E₁, E₃</text>
+
+  <rect x="60" y="146" width="140" height="38" rx="6" fill="#1a2b4a" stroke="#42a5f5" stroke-width="1.5"/>
+  <text x="130" y="161" text-anchor="middle" fill="#e3f2fd" font-size="12" font-weight="bold">T₁</text>
+  <text x="130" y="176" text-anchor="middle" fill="#7986cb" font-size="10">[4, 5, 6]  →  E₂</text>
+
+  <rect x="60" y="196" width="140" height="38" rx="6" fill="#1a2b4a" stroke="#42a5f5" stroke-width="1.5"/>
+  <text x="130" y="211" text-anchor="middle" fill="#e3f2fd" font-size="12" font-weight="bold">T₂</text>
+  <text x="130" y="226" text-anchor="middle" fill="#7986cb" font-size="10">[7, 8, 9]  →  E₁</text>
+
+  <rect x="60" y="246" width="140" height="38" rx="6" fill="#1a2b4a" stroke="#42a5f5" stroke-width="1.5"/>
+  <text x="130" y="261" text-anchor="middle" fill="#e3f2fd" font-size="12" font-weight="bold">T₃</text>
+  <text x="130" y="276" text-anchor="middle" fill="#7986cb" font-size="10">[2, 3, 4]  →  E₀, E₁</text>
+
+  <rect x="60" y="296" width="140" height="38" rx="6" fill="#1a2b4a" stroke="#42a5f5" stroke-width="1.5"/>
+  <text x="130" y="311" text-anchor="middle" fill="#e3f2fd" font-size="12" font-weight="bold">T₄</text>
+  <text x="130" y="326" text-anchor="middle" fill="#7986cb" font-size="10">[5, 6, 7]  →  E₃</text>
+
+  <!-- row_id_map middle annotation -->
+  <text x="370" y="72" text-anchor="middle" fill="#ffa726" font-size="11" font-weight="bold">row_id_map R</text>
+  <text x="370" y="86" text-anchor="middle" fill="#546e7a" font-size="9">(from 3-pass build)</text>
+
+  <!-- row_id_map entries -->
+  <rect x="296" y="96" width="148" height="28" rx="4" fill="#1a1a0a" stroke="#f57c00" stroke-width="1"/>
+  <text x="370" y="115" text-anchor="middle" fill="#ffcc80" font-size="10">R[T₀] = dst:[0,0] exp:[1,3]</text>
+
+  <rect x="296" y="146" width="148" height="28" rx="4" fill="#1a1a0a" stroke="#f57c00" stroke-width="1"/>
+  <text x="370" y="165" text-anchor="middle" fill="#ffcc80" font-size="10">R[T₁] = dst:[0]   exp:[2]</text>
+
+  <rect x="296" y="196" width="148" height="28" rx="4" fill="#1a1a0a" stroke="#f57c00" stroke-width="1"/>
+  <text x="370" y="215" text-anchor="middle" fill="#ffcc80" font-size="10">R[T₂] = dst:[1]   exp:[1]</text>
+
+  <rect x="296" y="246" width="148" height="28" rx="4" fill="#1a1a0a" stroke="#f57c00" stroke-width="1"/>
+  <text x="370" y="265" text-anchor="middle" fill="#ffcc80" font-size="10">R[T₃] = dst:[0,2] exp:[0,1]</text>
+
+  <rect x="296" y="296" width="148" height="28" rx="4" fill="#1a1a0a" stroke="#f57c00" stroke-width="1"/>
+  <text x="370" y="315" text-anchor="middle" fill="#ffcc80" font-size="10">R[T₄] = dst:[1]   exp:[3]</text>
+
+  <!-- ── RIGHT: Permuted Y ── -->
+  <text x="606" y="72" text-anchor="middle" fill="#78909c" font-size="11" font-weight="bold">Permuted Y  [7, H]</text>
+  <text x="606" y="86" text-anchor="middle" fill="#546e7a" font-size="10">expert order</text>
+
+  <!-- expert 0 -->
+  <text x="540" y="106" fill="#66bb6a" font-size="10" font-weight="bold">Expert 0</text>
+  <rect x="536" y="110" width="140" height="28" rx="5" fill="#0d1a0d" stroke="#388e3c" stroke-width="1.5"/>
+  <text x="606" y="129" text-anchor="middle" fill="#e3f2fd" font-size="11">Row 0:  T₃  [2,3,4]</text>
+
+  <!-- expert 1 -->
+  <text x="540" y="152" fill="#66bb6a" font-size="10" font-weight="bold">Expert 1</text>
+  <rect x="536" y="156" width="140" height="28" rx="5" fill="#0d1a0d" stroke="#388e3c" stroke-width="1.5"/>
+  <text x="606" y="175" text-anchor="middle" fill="#e3f2fd" font-size="11">Row 1:  T₀  [1,2,3]</text>
+
+  <rect x="536" y="192" width="140" height="28" rx="5" fill="#0d1a0d" stroke="#388e3c" stroke-width="1.5"/>
+  <text x="606" y="211" text-anchor="middle" fill="#e3f2fd" font-size="11">Row 2:  T₂  [7,8,9]</text>
+
+  <rect x="536" y="228" width="140" height="28" rx="5" fill="#0d1a0d" stroke="#388e3c" stroke-width="1.5"/>
+  <text x="606" y="247" text-anchor="middle" fill="#e3f2fd" font-size="11">Row 3:  T₃  [2,3,4]</text>
+
+  <!-- expert 2 -->
+  <text x="540" y="272" fill="#66bb6a" font-size="10" font-weight="bold">Expert 2</text>
+  <rect x="536" y="276" width="140" height="28" rx="5" fill="#0d1a0d" stroke="#388e3c" stroke-width="1.5"/>
+  <text x="606" y="295" text-anchor="middle" fill="#e3f2fd" font-size="11">Row 4:  T₁  [4,5,6]</text>
+
+  <!-- expert 3 -->
+  <text x="540" y="318" fill="#66bb6a" font-size="10" font-weight="bold">Expert 3</text>
+  <rect x="536" y="322" width="140" height="28" rx="5" fill="#0d1a0d" stroke="#388e3c" stroke-width="1.5"/>
+  <text x="606" y="341" text-anchor="middle" fill="#e3f2fd" font-size="11">Row 5:  T₀  [1,2,3]</text>
+
+  <rect x="536" y="358" width="140" height="28" rx="5" fill="#0d1a0d" stroke="#388e3c" stroke-width="1.5"/>
+  <text x="606" y="377" text-anchor="middle" fill="#e3f2fd" font-size="11">Row 6:  T₄  [5,6,7]</text>
+
+  <!-- scatter arrows: T₃→Row0 (E0) -->
+  <path d="M200,261 Q260,124 536,124" fill="none" stroke="#ef9a9a" stroke-width="1.2" stroke-dasharray="4,2" marker-end="url(#arr)"/>
+  <!-- T₀→Row1 (E1) -->
+  <path d="M200,110 Q260,168 536,170" fill="none" stroke="#80cbc4" stroke-width="1.2" stroke-dasharray="4,2" marker-end="url(#arr)"/>
+  <!-- T₂→Row2 (E1) -->
+  <path d="M200,210 Q280,204 536,206" fill="none" stroke="#ffe082" stroke-width="1.2" stroke-dasharray="4,2" marker-end="url(#arr)"/>
+  <!-- T₃→Row3 (E1) -->
+  <path d="M200,264 Q270,238 536,242" fill="none" stroke="#ef9a9a" stroke-width="1.2" stroke-dasharray="4,2" marker-end="url(#arr)"/>
+  <!-- T₁→Row4 (E2) -->
+  <path d="M200,160 Q310,268 536,290" fill="none" stroke="#b39ddb" stroke-width="1.2" stroke-dasharray="4,2" marker-end="url(#arr)"/>
+  <!-- T₀→Row5 (E3) -->
+  <path d="M200,113 Q320,322 536,336" fill="none" stroke="#80cbc4" stroke-width="1.2" stroke-dasharray="4,2" marker-end="url(#arr)"/>
+  <!-- T₄→Row6 (E3) -->
+  <path d="M200,310 Q310,360 536,372" fill="none" stroke="#a5d6a7" stroke-width="1.2" stroke-dasharray="4,2" marker-end="url(#arr)"/>
+
+  <!-- kernel label -->
+  <rect x="40" y="420" width="660" height="80" rx="7" fill="#141822" stroke="#37474f" stroke-width="1"/>
+  <text x="370" y="440" text-anchor="middle" fill="#78909c" font-size="11" font-weight="bold">_permute_kernel  (autotuned, BLOCK_SIZE ∈ {64…4096})</text>
+  <text x="370" y="457" text-anchor="middle" fill="#607d8b" font-size="10">grid: (num_tokens, ⌈H/BLOCK_SIZE⌉)   —   one program per (token, hidden chunk)</text>
+  <text x="370" y="473" text-anchor="middle" fill="#607d8b" font-size="10">Y[R[i,k], :] = X[i, :]   for each active expert k  (from row_id_map)</text>
+  <text x="370" y="489" text-anchor="middle" fill="#546e7a" font-size="9">Unpermute (_unpermute_kernel) uses same map in reverse: X_out[i,:] = Σ W[e_k] · Y[R[i,k],:]</text>
+
+  <!-- shape label -->
+  <text x="370" y="514" text-anchor="middle" fill="#546e7a" font-size="10">N=5 tokens, topK=2  →  N_out = 7 rows  (T₀ copies twice, T₃ copies twice)</text>
+</svg>

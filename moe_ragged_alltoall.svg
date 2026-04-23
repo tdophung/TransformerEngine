@@ -1,0 +1,144 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="760" height="640" viewBox="0 0 760 640" xmlns="http://www.w3.org/2000/svg" font-family="monospace, 'Courier New'">
+  <rect width="760" height="640" fill="#0f1117"/>
+  <defs>
+    <marker id="arr" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#4a90d9"/>
+    </marker>
+    <marker id="arr_r" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#ef5350"/>
+    </marker>
+    <marker id="arr_g" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#ffa726"/>
+    </marker>
+  </defs>
+
+  <!-- Title -->
+  <text x="380" y="28" text-anchor="middle" fill="#90caf9" font-size="15" font-weight="bold">Ragged All-to-All: Send Only What's Needed</text>
+  <text x="380" y="46" text-anchor="middle" fill="#546e7a" font-size="11">4 tokens · 4 experts · 2 EP shards   —   lower comms, higher complexity</text>
+
+  <!-- Shard labels -->
+  <rect x="60" y="60" width="270" height="34" rx="7" fill="#1a2433" stroke="#42a5f5" stroke-width="1.5"/>
+  <text x="195" y="75" text-anchor="middle" fill="#e8eaf6" font-size="12" font-weight="bold">Shard 0  (experts E₀, E₁)</text>
+  <text x="195" y="89" text-anchor="middle" fill="#546e7a" font-size="10">T₀, T₁, T₂, T₃  (local tokens)</text>
+
+  <rect x="430" y="60" width="270" height="34" rx="7" fill="#1a2433" stroke="#42a5f5" stroke-width="1.5"/>
+  <text x="565" y="75" text-anchor="middle" fill="#e8eaf6" font-size="12" font-weight="bold">Shard 1  (experts E₂, E₃)</text>
+  <text x="565" y="89" text-anchor="middle" fill="#546e7a" font-size="10">T₀, T₁, T₂, T₃  (local tokens)</text>
+
+  <!-- route arrows -->
+  <line x1="195" y1="94" x2="195" y2="114" stroke="#4a90d9" stroke-width="1.5" marker-end="url(#arr)"/>
+  <line x1="565" y1="94" x2="565" y2="114" stroke="#4a90d9" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="195" y="110" text-anchor="middle" fill="#546e7a" font-size="9">route</text>
+  <text x="565" y="110" text-anchor="middle" fill="#546e7a" font-size="9">route</text>
+
+  <!-- local / remote split shard 0 -->
+  <rect x="60" y="116" width="125" height="44" rx="5" fill="#0d1a0d" stroke="#388e3c" stroke-width="1.5"/>
+  <text x="122" y="132" text-anchor="middle" fill="#66bb6a" font-size="10" font-weight="bold">local</text>
+  <text x="122" y="146" text-anchor="middle" fill="#b0bec5" font-size="10">T₃→E₀  T₀,T₂,T₃→E₁</text>
+  <text x="122" y="156" text-anchor="middle" fill="#546e7a" font-size="9">stays on shard 0</text>
+
+  <rect x="205" y="116" width="125" height="44" rx="5" fill="#1a0d0d" stroke="#ef5350" stroke-width="1.5"/>
+  <text x="267" y="132" text-anchor="middle" fill="#ef9a9a" font-size="10" font-weight="bold">remote</text>
+  <text x="267" y="146" text-anchor="middle" fill="#b0bec5" font-size="10">T₁→E₂  (shard 1)</text>
+  <text x="267" y="156" text-anchor="middle" fill="#546e7a" font-size="9">must travel</text>
+
+  <!-- local / remote split shard 1 -->
+  <rect x="430" y="116" width="125" height="44" rx="5" fill="#0d1a0d" stroke="#388e3c" stroke-width="1.5"/>
+  <text x="492" y="132" text-anchor="middle" fill="#66bb6a" font-size="10" font-weight="bold">local</text>
+  <text x="492" y="146" text-anchor="middle" fill="#b0bec5" font-size="10">T₁→E₂  T₀,T₄→E₃</text>
+  <text x="492" y="156" text-anchor="middle" fill="#546e7a" font-size="9">stays on shard 1</text>
+
+  <rect x="565" y="116" width="125" height="44" rx="5" fill="#1a0d0d" stroke="#ef5350" stroke-width="1.5"/>
+  <text x="627" y="132" text-anchor="middle" fill="#ef9a9a" font-size="10" font-weight="bold">remote</text>
+  <text x="627" y="146" text-anchor="middle" fill="#b0bec5" font-size="10">T₃→E₁  (shard 0)</text>
+  <text x="627" y="156" text-anchor="middle" fill="#546e7a" font-size="9">must travel</text>
+
+  <!-- ragged all-to-all crossing arrows -->
+  <path d="M267,160 Q380,188 430,182" fill="none" stroke="#ef5350" stroke-width="1.8" stroke-dasharray="5,3" marker-end="url(#arr_r)"/>
+  <path d="M565,160 Q380,196 330,182" fill="none" stroke="#ef5350" stroke-width="1.8" stroke-dasharray="5,3" marker-end="url(#arr_r)"/>
+  <text x="380" y="178" text-anchor="middle" fill="#ef5350" font-size="11" font-weight="bold">ragged_all_to_all</text>
+  <text x="380" y="192" text-anchor="middle" fill="#546e7a" font-size="9">only remote tokens cross the network</text>
+
+  <!-- after all-to-all: shard 0 receives T₁ -->
+  <rect x="60" y="204" width="270" height="28" rx="5" fill="#1a2433" stroke="#7986cb" stroke-width="1"/>
+  <text x="195" y="222" text-anchor="middle" fill="#9fa8da" font-size="10">shard 0 has: T₃(E₀), T₀T₂T₃T₁(E₁)   ← T₁ received</text>
+
+  <rect x="430" y="204" width="270" height="28" rx="5" fill="#1a2433" stroke="#7986cb" stroke-width="1"/>
+  <text x="565" y="222" text-anchor="middle" fill="#9fa8da" font-size="10">shard 1 has: T₁(E₂), T₀T₄T₃(E₃)   ← T₃ received</text>
+
+  <!-- sort_chunks_by_index -->
+  <line x1="195" y1="232" x2="195" y2="252" stroke="#4a90d9" stroke-width="1.5" marker-end="url(#arr)"/>
+  <line x1="565" y1="232" x2="565" y2="252" stroke="#4a90d9" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <rect x="60" y="252" width="270" height="30" rx="5" fill="#1e1a2e" stroke="#ab47bc" stroke-width="1.5"/>
+  <text x="195" y="268" text-anchor="middle" fill="#ce93d8" font-size="10" font-weight="bold">sort_chunks_by_index</text>
+  <text x="195" y="279" text-anchor="middle" fill="#607d8b" font-size="9">reorder: shard×expert → expert×shard</text>
+
+  <rect x="430" y="252" width="270" height="30" rx="5" fill="#1e1a2e" stroke="#ab47bc" stroke-width="1.5"/>
+  <text x="565" y="268" text-anchor="middle" fill="#ce93d8" font-size="10" font-weight="bold">sort_chunks_by_index</text>
+  <text x="565" y="279" text-anchor="middle" fill="#607d8b" font-size="9">reorder: shard×expert → expert×shard</text>
+
+  <!-- expert groups after sort -->
+  <line x1="195" y1="282" x2="195" y2="302" stroke="#4a90d9" stroke-width="1.5" marker-end="url(#arr)"/>
+  <line x1="565" y1="282" x2="565" y2="302" stroke="#4a90d9" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <rect x="60" y="302" width="125" height="44" rx="5" fill="#0d1a0d" stroke="#388e3c" stroke-width="1.5"/>
+  <text x="122" y="318" text-anchor="middle" fill="#66bb6a" font-size="10" font-weight="bold">E₀</text>
+  <text x="122" y="332" text-anchor="middle" fill="#b0bec5" font-size="10">[ T₃ ]</text>
+  <text x="122" y="344" text-anchor="middle" fill="#546e7a" font-size="9">1 token</text>
+
+  <rect x="205" y="302" width="125" height="44" rx="5" fill="#0d1a0d" stroke="#388e3c" stroke-width="1.5"/>
+  <text x="267" y="318" text-anchor="middle" fill="#66bb6a" font-size="10" font-weight="bold">E₁</text>
+  <text x="267" y="332" text-anchor="middle" fill="#b0bec5" font-size="10">[ T₀,T₂,T₃,T₁ ]</text>
+  <text x="267" y="344" text-anchor="middle" fill="#546e7a" font-size="9">4 tokens</text>
+
+  <rect x="430" y="302" width="125" height="44" rx="5" fill="#0d1a0d" stroke="#388e3c" stroke-width="1.5"/>
+  <text x="492" y="318" text-anchor="middle" fill="#66bb6a" font-size="10" font-weight="bold">E₂</text>
+  <text x="492" y="332" text-anchor="middle" fill="#b0bec5" font-size="10">[ T₁, T₃ ]</text>
+  <text x="492" y="344" text-anchor="middle" fill="#546e7a" font-size="9">2 tokens</text>
+
+  <rect x="565" y="302" width="125" height="44" rx="5" fill="#0d1a0d" stroke="#388e3c" stroke-width="1.5"/>
+  <text x="627" y="318" text-anchor="middle" fill="#66bb6a" font-size="10" font-weight="bold">E₃</text>
+  <text x="627" y="332" text-anchor="middle" fill="#b0bec5" font-size="10">[ T₀, T₄ ]</text>
+  <text x="627" y="344" text-anchor="middle" fill="#546e7a" font-size="9">2 tokens</text>
+
+  <!-- grouped gemm -->
+  <line x1="195" y1="346" x2="195" y2="366" stroke="#4a90d9" stroke-width="1.5" marker-end="url(#arr)"/>
+  <line x1="565" y1="346" x2="565" y2="366" stroke="#4a90d9" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <rect x="60" y="366" width="270" height="30" rx="7" fill="#1e1a2e" stroke="#ab47bc" stroke-width="1.5"/>
+  <text x="195" y="386" text-anchor="middle" fill="#ab47bc" font-size="11" font-weight="bold">Grouped GEMM  (E₀, E₁)</text>
+
+  <rect x="430" y="366" width="270" height="30" rx="7" fill="#1e1a2e" stroke="#ab47bc" stroke-width="1.5"/>
+  <text x="565" y="386" text-anchor="middle" fill="#ab47bc" font-size="11" font-weight="bold">Grouped GEMM  (E₂, E₃)</text>
+
+  <!-- inverse sort + ragged a2a reverse -->
+  <line x1="195" y1="396" x2="195" y2="416" stroke="#4a90d9" stroke-width="1.5" marker-end="url(#arr)"/>
+  <line x1="565" y1="396" x2="565" y2="416" stroke="#4a90d9" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <rect x="60" y="416" width="270" height="30" rx="5" fill="#1a1a0a" stroke="#ffa726" stroke-width="1.5"/>
+  <text x="195" y="436" text-anchor="middle" fill="#ffcc80" font-size="10">sort_chunks (inverse) + ragged_a2a reverse</text>
+
+  <rect x="430" y="416" width="270" height="30" rx="5" fill="#1a1a0a" stroke="#ffa726" stroke-width="1.5"/>
+  <text x="565" y="436" text-anchor="middle" fill="#ffcc80" font-size="10">sort_chunks (inverse) + ragged_a2a reverse</text>
+
+  <!-- combine -->
+  <line x1="195" y1="446" x2="195" y2="466" stroke="#4a90d9" stroke-width="1.5"/>
+  <line x1="565" y1="446" x2="565" y2="466" stroke="#4a90d9" stroke-width="1.5"/>
+  <line x1="195" y1="466" x2="565" y2="466" stroke="#4a90d9" stroke-width="1.5"/>
+  <line x1="380" y1="466" x2="380" y2="486" stroke="#4a90d9" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="380" y="462" text-anchor="middle" fill="#ffa726" font-size="10" font-weight="bold">psum / combine</text>
+
+  <rect x="240" y="486" width="280" height="36" rx="7" fill="#1e2433" stroke="#4a90d9" stroke-width="2"/>
+  <text x="380" y="504" text-anchor="middle" fill="#e8eaf6" font-size="12" font-weight="bold">Final output tokens</text>
+  <text x="380" y="520" text-anchor="middle" fill="#7986cb" font-size="10">[N, H]</text>
+
+  <!-- tradeoff -->
+  <rect x="40" y="536" width="680" height="90" rx="7" fill="#141822" stroke="#37474f" stroke-width="1"/>
+  <text x="380" y="554" text-anchor="middle" fill="#78909c" font-size="11" font-weight="bold">Tradeoff vs Ring-of-Experts</text>
+  <text x="60" y="572" fill="#607d8b" font-size="10">Comm volume:  only tokens actually routed to remote experts cross the network  →  O(N × H × avg_remote_frac)</text>
+  <text x="60" y="588" fill="#607d8b" font-size="10">Complexity:   requires sort_chunks_by_index + inverse + 2× ragged_all_to_all  (vs single all_gather + psum_scatter)</text>
+  <text x="60" y="604" fill="#546e7a" font-size="9">sort_chunks_by_index implemented as Triton _make_chunk_sort_map_kernel + _sort_chunks_by_map_kernel</text>
+  <text x="60" y="618" fill="#546e7a" font-size="9">When expert load is uneven and N×H is large, ragged A2A wins; when load is uniform, ring is simpler</text>
+</svg>
