@@ -32,6 +32,7 @@ from ..sharding import (
     all_reduce_max_along_all_axes_except_PP,
     all_reduce_sum_along_dp_fsdp,
     get_num_devices_in_mesh,
+    global_mesh_resource,
 )
 from ..quantize import (
     ScaledTensor2x,
@@ -1245,6 +1246,7 @@ def grouped_quantize(
     quantizer: GroupedQuantizer,
     group_sizes: jnp.ndarray = None,
     flatten_axis: int = -1,
+    amax_scope: AmaxScope = AmaxScope.LOCAL,
 ) -> Union[GroupedScaledTensor1x, GroupedNoScaleTensor]:
     """Quantize a tensor in grouped manner.
 
@@ -1257,6 +1259,31 @@ def grouped_quantize(
         quantizer: The quantizer to use for quantization
         group_sizes: Array of ints containing the size of each group (default: None)
         flatten_axis: The axis along which the tensor could be flattened to 2D (default: -1)
+        amax_scope: Scope of the per-group amax reduction. Default
+            ``AmaxScope.LOCAL`` means each shard derives its scales from its
+            local data only -- the legacy behavior. ``AmaxScope.FSDP`` performs
+            a ``jax.lax.pmax`` (parallel max collective) of the per-group amax
+            across the mesh's FSDP resource so all FSDP peers derive identical
+            scales: required when the caller intends to all-gather the
+            per-shard FP8 buffers along FSDP into a single coherent tensor
+            (quantize-before-FSDP-AG flows). Has no effect when the active mesh
+            has no FSDP resource declared. Per-mode behavior under ``FSDP`` scope:
+
+            * ``CURRENT_TENSOR_SCALING``: per-group amax is pmax'd before
+              ``compute_scale_from_amax``; the FFI then sees identical scales
+              across peers.
+            * ``DELAYED_TENSOR_SCALING``: the FFI-returned ``updated_amax`` is
+              pmax'd before being stored back into the quantizer's running
+              state, so the *next* step's stored scale is consistent across
+              the FSDP shard.
+            * Block-scaling modes (e.g. ``MXFP8_1D_SCALING``): no-op. The
+              per-block amax is already correct on each shard because each
+              block fits within a single FSDP slice (FSDP shard boundaries are
+              required to be block-aligned for MXFP8); AG of the per-shard FP8
+              data and per-block scale_inv simply concatenates correct values.
+              No cross-peer reduction is required.
+
+            ``AmaxScope.TPSP`` is a no-op here (weights have no sequence dim).
 
     Returns:
         A GroupedScaledTensor1x containing the quantized data
@@ -1296,6 +1323,22 @@ def grouped_quantize(
     assert n_groups == len(
         quantizer.quantizers
     ), f"n_groups={n_groups} != n_quantizers = {len(quantizer.quantizers)}"
+
+    # Resolve the FSDP mesh axis name once. ``None`` when the caller has no
+    # FSDP resource declared, in which case ``amax_scope=FSDP`` degrades to
+    # a no-op (matches the behavior of ``calculate_amax``'s partition rule).
+    # For block-scaling modes (e.g. MXFP8) this is also left ``None`` because
+    # per-block amax is already peer-correct (each block fits within one FSDP
+    # slice); the only branches that consult ``fsdp_axis`` are the tensor-
+    # scaling ones.
+    fsdp_axis = (
+        global_mesh_resource().fsdp_resource
+        if amax_scope is AmaxScope.FSDP
+        and quantizer.scaling_mode
+        in (ScalingMode.CURRENT_TENSOR_SCALING, ScalingMode.DELAYED_TENSOR_SCALING)
+        else None
+    )
+
     scale = jnp.ones((n_groups,), jnp.float32)
 
     if quantizer.scaling_mode == ScalingMode.DELAYED_TENSOR_SCALING:
@@ -1306,6 +1349,12 @@ def grouped_quantize(
         row_amax = jnp.max(jnp.abs(x), axis=range(1, x.ndim))
         segment_ids = jnp.repeat(jnp.arange(n_groups), group_sizes, total_repeat_length=x.shape[0])
         grouped_amax = jax.ops.segment_max(row_amax, segment_ids, num_segments=n_groups)
+        # Reduce the per-group amax across FSDP peers so all derive identical
+        # scales. Required when the caller intends to all-gather the per-shard
+        # FP8 buffers into a single coherent tensor (otherwise different peers
+        # would produce FP8 bytes with mutually-inconsistent scale factors).
+        if fsdp_axis is not None:
+            grouped_amax = jax.lax.pmax(grouped_amax, axis_name=fsdp_axis)
         for i in range(n_groups):
             tmp_scale = compute_scale_from_amax(grouped_amax[i], quantizer.q_dtype, margin=0.0)
             scale = scale.at[i].set(tmp_scale[0])
@@ -1342,6 +1391,12 @@ def grouped_quantize(
 
     # TODO(Phuong): store the whole updated_amax in the grouped_quantize instead?
     if quantizer.scaling_mode == ScalingMode.DELAYED_TENSOR_SCALING:
+        # Reduce the outgoing per-group amax across FSDP peers so the next
+        # step's delayed scale is consistent across the FSDP shard. The scale
+        # used in *this* step still reflects whatever was stored previously,
+        # so consistency converges after one step.
+        if fsdp_axis is not None:
+            updated_amax = jax.lax.pmax(updated_amax, axis_name=fsdp_axis)
         for i, quantizer_i in enumerate(quantizer.quantizers):
             quantizer_i.update(updated_amax[i].reshape((1,)))
 

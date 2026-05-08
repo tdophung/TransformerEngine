@@ -16,8 +16,13 @@ and verify:
 * DeepSeek-style grouped top-k (``num_groups`` / ``group_topk``) runs.
 * ``align_size > 0`` produces numerically-equivalent outputs to ``align_size = 0``
   for the pure-JAX backend (padding must not change the result).
+* The smoke tests (forward shape/finite, backward grad finite/nonzero) are
+  parametrized over the supported quantization recipes
+  (BF16 + ``Float8CurrentScaling`` + ``DelayedScaling`` + ``MXFP8BlockScaling``)
+  so any one of them regressing on this hardware fails the suite locally.
 """
 
+import contextlib
 import sys
 from typing import Tuple
 
@@ -39,11 +44,52 @@ def _inject_moe(request):
         yield
         return
 
+    from transformer_engine.jax import MeshResource, autocast
     from transformer_engine.jax.flax import MoEBlock
 
     mod = sys.modules[__name__]
+    mod.MeshResource = MeshResource
+    mod.autocast = autocast
     mod.MoEBlock = MoEBlock
     yield
+
+
+# -----------------------------------------------------------------------------
+# Recipe parametrization
+# -----------------------------------------------------------------------------
+#
+# Build a list of recipes to parametrize over. ``None`` denotes the BF16
+# baseline (no autocast). FP8 / MXFP8 recipes are added only when the
+# hardware reports them as supported, mirroring the pattern in
+# ``test_distributed_layernorm.py`` etc.
+
+from transformer_engine.common import recipe as _recipe  # noqa: E402
+from transformer_engine.jax.quantize import ScalingMode, is_fp8_available  # noqa: E402
+
+_is_fp8_supported, _ = is_fp8_available()
+_is_mxfp8_supported, _ = is_fp8_available(ScalingMode.MXFP8_1D_SCALING)
+
+SUPPORTED_RECIPES = [pytest.param(None, id="bf16")]
+if _is_fp8_supported:
+    SUPPORTED_RECIPES.append(pytest.param(_recipe.DelayedScaling(), id="DelayedScaling"))
+    SUPPORTED_RECIPES.append(pytest.param(_recipe.Float8CurrentScaling(), id="CurrentScaling"))
+if _is_mxfp8_supported:
+    SUPPORTED_RECIPES.append(pytest.param(_recipe.MXFP8BlockScaling(), id="MXFP8BlockScaling"))
+
+
+def _autocast_for(recipe_or_none):
+    """Return an ``autocast`` context for ``recipe_or_none`` (or a no-op).
+
+    BF16 baseline (``None``) returns a do-nothing context. FP8 recipes
+    return ``autocast(enabled=True, recipe=...)`` with an empty
+    ``MeshResource``; the single-device tests don't rely on any mesh
+    axes, so the default resource is sufficient.
+    """
+    if recipe_or_none is None:
+        return contextlib.nullcontext()
+    return autocast(  # noqa: F821 -- injected by ``_inject_moe`` fixture
+        enabled=True, recipe=recipe_or_none, mesh_resource=MeshResource()  # noqa: F821
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -92,7 +138,8 @@ class TestMoEBlockSingleDevice:
     """Single-device smoke tests for :class:`MoEBlock`."""
 
     @pytest.mark.parametrize("permutation_backend", ["pure_jax", "triton"])
-    def test_forward_shape_and_finite(self, permutation_backend):
+    @pytest.mark.parametrize("quantization_recipe", SUPPORTED_RECIPES)
+    def test_forward_shape_and_finite(self, permutation_backend, quantization_recipe):
         key = jax.random.PRNGKey(0)
         init_key, data_key = jax.random.split(key)
 
@@ -104,7 +151,8 @@ class TestMoEBlockSingleDevice:
             dtype=DTYPE,
         )
         inputs = _make_inputs(data_key)
-        _variables, output, aux_loss = _init_and_apply(block, inputs, init_key)
+        with _autocast_for(quantization_recipe):
+            _variables, output, aux_loss = _init_and_apply(block, inputs, init_key)
 
         assert (
             output.shape == inputs.shape
@@ -114,7 +162,8 @@ class TestMoEBlockSingleDevice:
         assert aux_loss is None, "aux_loss should be None when aux_loss_coeff=0"
 
     @pytest.mark.parametrize("permutation_backend", ["pure_jax", "triton"])
-    def test_backward_grad_is_finite_and_nonzero(self, permutation_backend):
+    @pytest.mark.parametrize("quantization_recipe", SUPPORTED_RECIPES)
+    def test_backward_grad_is_finite_and_nonzero(self, permutation_backend, quantization_recipe):
         key = jax.random.PRNGKey(1)
         init_key, data_key = jax.random.split(key)
 
@@ -126,13 +175,14 @@ class TestMoEBlockSingleDevice:
             dtype=DTYPE,
         )
         inputs = _make_inputs(data_key)
-        variables = block.init(init_key, inputs)
+        with _autocast_for(quantization_recipe):
+            variables = block.init(init_key, inputs)
 
-        def loss_fn(variables, inputs):
-            output, _ = block.apply(variables, inputs)
-            return jnp.mean(output.astype(jnp.float32) ** 2)
+            def loss_fn(variables, inputs):
+                output, _ = block.apply(variables, inputs)
+                return jnp.mean(output.astype(jnp.float32) ** 2)
 
-        grads = jax.grad(loss_fn)(variables, inputs)
+            grads = jax.grad(loss_fn)(variables, inputs)
         # All trainable kernels should receive a non-trivial gradient.
         for name in ("gate_kernel", "wi_0", "wi_1", "wo"):
             g = _unwrap_partitioned(grads["params"][name])
@@ -205,7 +255,8 @@ class TestMoEBlockSingleDevice:
             )
 
     @pytest.mark.parametrize("permutation_backend", ["pure_jax", "triton"])
-    def test_aux_loss_returned(self, permutation_backend):
+    @pytest.mark.parametrize("quantization_recipe", SUPPORTED_RECIPES)
+    def test_aux_loss_returned(self, permutation_backend, quantization_recipe):
         key = jax.random.PRNGKey(3)
         init_key, data_key = jax.random.split(key)
 
@@ -218,7 +269,8 @@ class TestMoEBlockSingleDevice:
             dtype=DTYPE,
         )
         inputs = _make_inputs(data_key)
-        _variables, output, aux_loss = _init_and_apply(block, inputs, init_key)
+        with _autocast_for(quantization_recipe):
+            _variables, output, aux_loss = _init_and_apply(block, inputs, init_key)
 
         assert output.shape == inputs.shape
         assert aux_loss is not None, "aux_loss should be returned when coeff > 0"
@@ -429,9 +481,11 @@ class TestMoEBlockSingleDevice:
         )
 
     @pytest.mark.parametrize("permutation_backend", ["pure_jax", "triton"])
-    def test_jit_and_determinism(self, permutation_backend):
+    @pytest.mark.parametrize("quantization_recipe", SUPPORTED_RECIPES)
+    def test_jit_and_determinism(self, permutation_backend, quantization_recipe):
         """The block must be JIT-compilable and produce a deterministic
-        forward pass across repeat calls with the same params."""
+        forward pass across repeat calls with the same params (no
+        ``mutable=``, so the quantizer state is not updated)."""
         key = jax.random.PRNGKey(6)
         init_key, data_key = jax.random.split(key)
 
@@ -443,12 +497,13 @@ class TestMoEBlockSingleDevice:
             dtype=DTYPE,
         )
         inputs = _make_inputs(data_key)
-        variables = block.init(init_key, inputs)
+        with _autocast_for(quantization_recipe):
+            variables = block.init(init_key, inputs)
 
-        @jax.jit
-        def forward(variables, inputs):
-            return block.apply(variables, inputs)[0]
+            @jax.jit
+            def forward(variables, inputs):
+                return block.apply(variables, inputs)[0]
 
-        out_a = forward(variables, inputs)
-        out_b = forward(variables, inputs)
+            out_a = forward(variables, inputs)
+            out_b = forward(variables, inputs)
         assert jnp.array_equal(out_a, out_b), "JITted forward is non-deterministic"

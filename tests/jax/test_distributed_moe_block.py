@@ -2,7 +2,18 @@
 #
 # See LICENSE for license information.
 
-"""Distributed tests for ``transformer_engine.jax.flax.MoEBlock``."""
+"""Distributed tests for ``transformer_engine.jax.flax.MoEBlock``.
+
+Parametrized over the supported quantization recipes (BF16 +
+``Float8CurrentScaling`` + ``DelayedScaling`` + ``MXFP8BlockScaling``)
+so any one of them regressing on this hardware fails the suite. FP8
+modes use looser tolerances because the legacy code path (knob
+``quantize_before_fsdp_ag=False``) quantizes activations per-shard
+without an amax reduction across FSDP peers, which introduces
+small per-peer scale drift relative to the single-device run. The
+forthcoming Exp 1 Stage 3 plumbing will tighten this back to BF16-level
+agreement.
+"""
 
 import sys
 
@@ -13,7 +24,21 @@ import numpy as np
 import pytest
 from jax.sharding import Mesh, PartitionSpec
 
+from transformer_engine.common import recipe as _recipe
+from transformer_engine.jax.quantize import ScalingMode, is_fp8_available
+
 from utils import assert_allclose, is_devices_enough
+
+
+_is_fp8_supported, _ = is_fp8_available()
+_is_mxfp8_supported, _ = is_fp8_available(ScalingMode.MXFP8_1D_SCALING)
+
+SUPPORTED_RECIPES = [pytest.param(None, id="bf16")]
+if _is_fp8_supported:
+    SUPPORTED_RECIPES.append(pytest.param(_recipe.DelayedScaling(), id="DelayedScaling"))
+    SUPPORTED_RECIPES.append(pytest.param(_recipe.Float8CurrentScaling(), id="CurrentScaling"))
+if _is_mxfp8_supported:
+    SUPPORTED_RECIPES.append(pytest.param(_recipe.MXFP8BlockScaling(), id="MXFP8BlockScaling"))
 
 
 @pytest.fixture(autouse=True, scope="function")
@@ -52,12 +77,30 @@ def _unwrap_partitioned(x):
     return x.value if hasattr(x, "value") else x
 
 
+def _tolerances_for(recipe_or_none):
+    """Return ``(atol_out, rtol_out, atol_grad, rtol_grad)`` for the recipe.
+
+    BF16 keeps the historical ``5e-2 / 5e-2`` for outputs and
+    ``1e-1 / 1e-1`` for gradients. FP8 / MXFP8 are looser because the
+    legacy code path (no ``quantize_before_fsdp_ag``) quantizes
+    activations per-shard without an FSDP-wide amax reduction, so the
+    sharded vs single-device runs see different scales for the same
+    activation values. Stage 3 of Exp 1 will eliminate this drift.
+    """
+    if recipe_or_none is None:
+        return 5e-2, 5e-2, 1e-1, 1e-1
+    return 2e-1, 2e-1, 3e-1, 3e-1
+
+
 @pytest.mark.triton
 class TestDistributedMoEBlock:
     @pytest.mark.parametrize("permutation_backend", ["pure_jax", "triton"])
-    def test_ep2_fsdp2_matches_single_device(self, permutation_backend):
+    @pytest.mark.parametrize("quantization_recipe", SUPPORTED_RECIPES)
+    def test_ep2_fsdp2_matches_single_device(self, permutation_backend, quantization_recipe):
         if not is_devices_enough(4):
             pytest.skip("MoE distributed test requires 4 devices for EP=2 x FSDP=2.")
+
+        atol_out, rtol_out, atol_grad, rtol_grad = _tolerances_for(quantization_recipe)
 
         key = jax.random.PRNGKey(11)
         init_key, data_key = jax.random.split(key)
@@ -92,7 +135,17 @@ class TestDistributedMoEBlock:
 
             return jax.jit(jax.value_and_grad(loss_fn, has_aux=True))
 
-        with autocast(enabled=False, mesh_resource=MeshResource()):
+        # Single-device reference. Use the same recipe (or no autocast for
+        # BF16) so the comparison apples-to-apples isolates the
+        # sharding-induced drift, not the BF16-vs-FP8 dtype gap.
+        single_autocast_kwargs = dict(mesh_resource=MeshResource())
+        if quantization_recipe is None:
+            single_ctx = autocast(enabled=False, **single_autocast_kwargs)
+        else:
+            single_ctx = autocast(
+                enabled=True, recipe=quantization_recipe, **single_autocast_kwargs
+            )
+        with single_ctx:
             single_variables = single_block.init(init_key, inputs)
             (single_loss, (single_output, single_aux)), single_grads = _make_loss_and_grad(
                 single_block
@@ -127,7 +180,14 @@ class TestDistributedMoEBlock:
             **base_kwargs,
         )
 
-        with mesh, autocast(enabled=False, mesh_resource=MeshResource(fsdp_resource="fsdp")):
+        sharded_autocast_kwargs = dict(mesh_resource=MeshResource(fsdp_resource="fsdp"))
+        if quantization_recipe is None:
+            sharded_ctx = autocast(enabled=False, **sharded_autocast_kwargs)
+        else:
+            sharded_ctx = autocast(
+                enabled=True, recipe=quantization_recipe, **sharded_autocast_kwargs
+            )
+        with mesh, sharded_ctx:
             with nn.logical_axis_rules(logical_axis_rules):
                 # ``MoEBlock`` registers params via ``with_logical_partitioning``
                 # which only attaches LogicallyPartitioned metadata; the
@@ -164,9 +224,13 @@ class TestDistributedMoEBlock:
         assert wi_1.sharding.spec == PartitionSpec("ep", "fsdp", None)
         assert wo.sharding.spec == PartitionSpec("ep", None, "fsdp")
 
-        assert_allclose(sharded_output, single_output, dtype=DTYPE, atol=5e-2, rtol=5e-2)
-        assert_allclose(sharded_loss, single_loss, dtype=jnp.float32, atol=5e-2, rtol=5e-2)
-        assert_allclose(sharded_aux, single_aux, dtype=jnp.float32, atol=5e-2, rtol=5e-2)
+        assert_allclose(sharded_output, single_output, dtype=DTYPE, atol=atol_out, rtol=rtol_out)
+        assert_allclose(
+            sharded_loss, single_loss, dtype=jnp.float32, atol=atol_out, rtol=rtol_out
+        )
+        assert_allclose(
+            sharded_aux, single_aux, dtype=jnp.float32, atol=atol_out, rtol=rtol_out
+        )
 
         for name in ("gate_kernel", "wi_0", "wi_1", "wo"):
             grad_single = _unwrap_partitioned(single_grads["params"][name])
@@ -175,7 +239,7 @@ class TestDistributedMoEBlock:
                 grad_sharded,
                 grad_single,
                 dtype=DTYPE,
-                atol=1e-1,
-                rtol=1e-1,
+                atol=atol_grad,
+                rtol=rtol_grad,
                 err_msg=f"Distributed gradient mismatch for {name}",
             )
