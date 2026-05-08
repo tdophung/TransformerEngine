@@ -227,6 +227,26 @@ class MoEBlock(TransformerEngineBase):
         set, the output of the ``wo`` grouped GEMM is ``psum_scatter`` ed
         along this axis.
 
+    quantize_before_fsdp_ag : bool
+        When ``True`` (and the active ``flax.linen.logical_axis_rules``
+        map a kernel logical axis to a physical mesh axis listed in
+        :attr:`data_parallelism_axes`), ``MoEBlock`` keeps the FSDP dim
+        of ``wi_*`` / ``wo`` sharded across the EP ``shard_map``
+        boundary and passes a ``kernel_fsdp_info`` tuple to each
+        :func:`grouped_dense` call. ``grouped_dense``'s forward rule is
+        then responsible for running the per-shard quantize BEFORE the
+        FSDP all-gather, so the AG payload is FP8 instead of bf16
+        (~2x AG bandwidth saving on the wire).
+
+        Default ``False`` preserves the legacy behavior: the FSDP AG of
+        weights happens implicitly *outside* the ``shard_map`` (because
+        ``in_specs`` strips the FSDP axis), and ``grouped_dense``
+        receives a fully gathered weight.
+
+        Currently support for the FSDP-aware fwd path inside
+        ``_grouped_dense_fwd_rule`` is gated by an internal assertion;
+        setting this ``True`` requires the corresponding
+        ``grouped_dense`` enablement to be present.
     permutation_backend : str
         ``"pure_jax"`` (default) or ``"triton"``.
     align_size : int
@@ -275,6 +295,8 @@ class MoEBlock(TransformerEngineBase):
     # ``jax.sharding.Mesh`` to use when ``expert_parallelism_axis`` is set.
     # Required for the ``shard_map`` wrapper; ignored otherwise.
     mesh: Optional[Any] = None
+
+    quantize_before_fsdp_ag: bool = False
 
     # Permutation
     permutation_backend: str = "pure_jax"
@@ -419,6 +441,100 @@ class MoEBlock(TransformerEngineBase):
         if self.aux_loss_coeff <= 0.0:
             aux_loss = None
         return output, aux_loss
+
+    # ------------------------------------------------------------------
+    # FSDP info derivation (used only when quantize_before_fsdp_ag=True)
+    # ------------------------------------------------------------------
+
+    def _derive_kernel_fsdp_info(
+        self, kernel_axes: Tuple[Optional[str], ...]
+    ) -> Tuple[Optional[str], int]:
+        """Find which kernel dim (if any) is FSDP-sharded.
+
+        Walks ``kernel_axes`` and resolves each entry against the active
+        ``flax.linen.logical_axis_rules`` to a physical mesh axis. Returns
+        the first ``(mesh_axis_name, kernel_dim_idx)`` whose physical axis
+        is in :attr:`data_parallelism_axes`, or ``(None, -1)`` when the
+        knob is off, no flax rules are active, or no kernel dim is
+        FSDP-sharded.
+
+        Raises
+        ------
+        ValueError
+            If multiple kernel dims resolve to an FSDP physical axis;
+            only a single FSDP dim per kernel is supported.
+        """
+        if not self.quantize_before_fsdp_ag:
+            return (None, -1)
+        if not kernel_axes or not self.data_parallelism_axes:
+            return (None, -1)
+
+        try:
+            flax_rules = nn.get_logical_axis_rules()
+        except Exception:  # pylint: disable=broad-except
+            flax_rules = ()
+        if not flax_rules:
+            return (None, -1)
+
+        # A logical axis may map to a tuple of physical axes.
+        logical_to_physical: dict = {}
+        for entry in flax_rules:
+            if not entry or len(entry) != 2:
+                continue
+            logical, physical = entry
+            if physical is None:
+                physicals: Tuple[str, ...] = ()
+            elif isinstance(physical, (list, tuple)):
+                physicals = tuple(p for p in physical if p is not None)
+            else:
+                physicals = (physical,)
+            logical_to_physical.setdefault(logical, set()).update(physicals)
+
+        dp_axes = set(self.data_parallelism_axes)
+        matches = [
+            (physical, dim_idx)
+            for dim_idx, logical_axis in enumerate(kernel_axes)
+            if logical_axis is not None
+            for physical in logical_to_physical.get(logical_axis, ())
+            if physical in dp_axes
+        ]
+
+        if not matches:
+            return (None, -1)
+        if len(matches) > 1:
+            raise ValueError(
+                f"kernel_axes={kernel_axes!r} resolve to multiple FSDP "
+                f"physical axes {[m[0] for m in matches]!r} via the active "
+                "flax.linen.logical_axis_rules; only one kernel dim can be "
+                "FSDP-sharded under quantize_before_fsdp_ag=True."
+            )
+        return matches[0]
+
+    @staticmethod
+    def _build_kernel_in_spec(
+        *,
+        ep_axis: str,
+        kernel_fsdp_info: Tuple[Optional[str], int],
+        kernel_rank: int,
+    ) -> P:
+        """Build the EP ``shard_map`` ``in_spec`` for an expert-leading
+        kernel of rank ``kernel_rank`` (dim 0 reserved for ``ep_axis``).
+
+        When ``kernel_fsdp_info`` is non-trivial, the FSDP axis is kept
+        on its kernel dim so the weight stays sharded across the
+        ``shard_map`` boundary; otherwise all non-expert dims are
+        unsharded (``P(ep_axis, None, ...)``).
+        """
+        spec = [None] * kernel_rank
+        spec[0] = ep_axis
+        fsdp_axis, fsdp_dim = kernel_fsdp_info
+        if fsdp_axis is not None:
+            assert 0 < fsdp_dim < kernel_rank, (
+                f"invalid FSDP dim {fsdp_dim} for kernel of rank {kernel_rank}"
+                " (dim 0 reserved for expert axis)"
+            )
+            spec[fsdp_dim] = fsdp_axis
+        return P(*spec)
 
     # ------------------------------------------------------------------
     # Gate
@@ -652,7 +768,21 @@ class MoEBlock(TransformerEngineBase):
         -------
         expert_outputs : jnp.ndarray
             ``[buffer_size, hidden]``.
+
+        Notes
+        -----
+        Per-kernel ``kernel_fsdp_info`` for ``grouped_dense`` is derived
+        in-place via :meth:`_derive_kernel_fsdp_info` so callers do not
+        have to plumb FSDP info down. The derivation is pure (depends
+        only on :attr:`wi_kernel_axes` / :attr:`wo_kernel_axes`,
+        :attr:`data_parallelism_axes`, :attr:`quantize_before_fsdp_ag`,
+        and the ambient ``flax.linen.logical_axis_rules``), so it is
+        consistent with the EP ``in_specs`` constructed in
+        :meth:`_forward_a2a_ep`.
         """
+        wi_kernel_fsdp_info = self._derive_kernel_fsdp_info(self.wi_kernel_axes)
+        wo_kernel_fsdp_info = self._derive_kernel_fsdp_info(self.wo_kernel_axes)
+
         # Each grouped_dense call gets its own quantizer_set with
         # n_groups matching ``group_sizes``; this keeps the FP8 meta
         # tensors correctly sized in both no-EP and A2A-EP cases.
@@ -676,6 +806,7 @@ class MoEBlock(TransformerEngineBase):
             contracting_dims=((1,), (1,)),
             bias=wi_0_bias,
             quantizer_set=q_set_w0,
+            kernel_fsdp_info=wi_kernel_fsdp_info,
         )
         layer_w1 = grouped_dense(
             sorted_inputs,
@@ -684,6 +815,7 @@ class MoEBlock(TransformerEngineBase):
             contracting_dims=((1,), (1,)),
             bias=wi_1_bias,
             quantizer_set=q_set_w1,
+            kernel_fsdp_info=wi_kernel_fsdp_info,
         )
 
         act_fn = _convert_to_activation_function(self.activation_type)
@@ -696,6 +828,7 @@ class MoEBlock(TransformerEngineBase):
             contracting_dims=((1,), (1,)),
             bias=wo_bias,
             quantizer_set=q_set_wo,
+            kernel_fsdp_info=wo_kernel_fsdp_info,
         )
         return expert_outputs
 
@@ -929,12 +1062,28 @@ class MoEBlock(TransformerEngineBase):
             "wi_1": wi_1,
             "wo": wo,
         }
+        # When ``quantize_before_fsdp_ag`` is True and a kernel dim is
+        # FSDP-sharded, retain that axis in the in_spec so the weight
+        # crosses the shard_map boundary still sharded (per-shard); the
+        # AG happens INSIDE the body, after the per-shard FP8 quantize.
+        # Otherwise (knob=False, or no FSDP) the in_spec strips fsdp,
+        # forcing JAX to AG the bf16 weight before entering shard_map.
+        wi_in_spec = self._build_kernel_in_spec(
+            ep_axis=ep_axis,
+            kernel_fsdp_info=self._derive_kernel_fsdp_info(self.wi_kernel_axes),
+            kernel_rank=wi_0.ndim,
+        )
+        wo_in_spec = self._build_kernel_in_spec(
+            ep_axis=ep_axis,
+            kernel_fsdp_info=self._derive_kernel_fsdp_info(self.wo_kernel_axes),
+            kernel_rank=wo.ndim,
+        )
         in_specs: dict = {
             "inputs": P(batch_pspec_axis, None, None),
             "gate_logits": P(batch_pspec_axis, None, None),
-            "wi_0": P(ep_axis, None, None),
-            "wi_1": P(ep_axis, None, None),
-            "wo": P(ep_axis, None, None),
+            "wi_0": wi_in_spec,
+            "wi_1": wi_in_spec,
+            "wo": wo_in_spec,
         }
         if expert_bias is not None:
             captured["expert_bias"] = expert_bias
