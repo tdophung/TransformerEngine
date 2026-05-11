@@ -24,6 +24,7 @@ from .quantize import (
     with_sharding_constraint_by_logical_axes,
     TensorUsage,
 )
+from .quantize.tensor import GroupedScaledTensor1x
 
 
 def _all_gather_kernel(kernel, mesh_axis, axis_idx):
@@ -52,6 +53,166 @@ def _psum_scatter_kernel(kernel, scattered_kernel_shape, mesh_axis, axis_idx):
     kernel = jax.lax.psum_scatter(kernel, mesh_axis, scatter_dimension=axis_idx)
     kernel = kernel.reshape(scattered_kernel_shape)
     return kernel
+
+
+# MXFP8 block layout constants (mirrors BlockScalingModeMetadataImpl).
+# block_dims = (1, 32). block_alignment = (128, 4). For a 2D view
+# ``(n_block_x_M_side, n_block_y_K_side)``:
+#   * Rowwise (is_colwise=False): block_y=32 (per-block along K),
+#     alignment_y=4. Per-shard size on K-side FSDP axis must be a
+#     multiple of block_y*alignment_y = 32*4 = 128.
+#   * Colwise (is_colwise=True): block_y=1 (per-element along K),
+#     alignment_y=128. Per-shard size constraint = 1*128 = 128 -- same.
+# In both cases the per-shard mult-of-128 check ensures (a) no block
+# straddles peers and (b) per-shard n_block_y has no alignment padding,
+# so AG along the n_block_y axis composes cleanly.
+_MXFP8_PER_SHARD_MIN_ALIGN = 128
+
+
+def _mxfp8_block_y_alignment_y(is_colwise: bool) -> Tuple[int, int]:
+    """Return ``(block_y, alignment_y)`` for the K-side of MXFP8 scales.
+
+    These are the layout knobs that determine ``n_block_y_per_shard``
+    (= ``flattened_last_dim_per_shard // block_y``) and the per-shard
+    alignment padding (= ``DIVUP(n_block_y, alignment_y) * alignment_y``)
+    on the FSDP-shardable K side of the 2D scale view.
+    """
+    return (1, 128) if is_colwise else (32, 4)
+
+
+def _all_gather_grouped_scaled_tensor_1x(t, mesh_axis, axis_idx):
+    """All-gather a per-shard ``GroupedScaledTensor1x`` along the kernel's FSDP axis.
+
+    Used by ``grouped_dense`` when the **kernel** is FSDP-sharded and the
+    caller has already quantized per shard via
+    ``tex.grouped_quantize(..., amax_scope=AmaxScope.FSDP)``. ``t`` always
+    refers to a kernel-side tensor (the activations are *never* AG'd; they
+    flow into the GEMM on their own EP shard).
+
+    On-device, ``GroupedScaledTensor1x.data`` is flat 1D (see the
+    ``ndim == 1`` invariant in its ``__post_init__``); the multi-D layout
+    is encoded in ``original_shape``. We therefore reshape ``t.data`` to
+    ``t.original_shape``, all-gather along ``axis_idx`` (the kernel dim
+    that FSDP sliced), reflatten, and rewrap with the full-shape
+    ``original_shape``.
+
+    Per scaling mode:
+
+    * **Tensor scaling** (``CurrentScaling``, ``DelayedScaling``): one
+      ``scale_inv`` per expert, made FSDP-consistent by the ``pmax`` inside
+      ``grouped_quantize``. We reuse it as-is; only ``data`` is gathered.
+
+    * **MXFP8 block scaling** (rowwise *and* colwise, since the forward
+      GEMM consumes the colwise tensor as its RHS): per-block
+      ``scale_inv``. Two cases:
+
+      - **K-side FSDP** (``axis_idx >= flatten_axis``): the FSDP axis
+        is on the K side of the 2D scale view. Padding for groups
+        affects only ``n_block_x``, which is FSDP-invariant in this
+        case, so we reshape ``scale_inv`` to
+        ``(padded_n_block_x, n_block_y_per_shard)``, AG along axis 1,
+        and reflatten. The 2D layout is the same for rowwise and
+        colwise; only ``(block_y, alignment_y)`` differs (32/4 vs 1/128
+        respectively). Requires per-shard size on ``axis_idx`` to be a
+        multiple of 128 so per-shard ``n_block_y`` carries no alignment
+        padding in either layout.
+
+      - **M-side FSDP** (``axis_idx < flatten_axis``): worst-case group
+        padding (``(G-1) * 128`` for rowwise or ``(G-1) * 4`` for
+        colwise) is added on every peer's ``n_block_x_padded``, so a
+        naive AG-concatenate overshoots the full-shape padded layout.
+        Not currently implemented; raises ``NotImplementedError`` with
+        a pointer to follow-up options (un-pad / re-pad via the V2
+        int64 workspace, or scatter-and-psum).
+    """
+    assert isinstance(t, GroupedScaledTensor1x)
+    assert mesh_axis is not None
+    assert 0 < axis_idx < len(t.original_shape)
+
+    reshaped = t.data.reshape(t.original_shape)
+    gathered_data = jax.lax.all_gather(reshaped, mesh_axis, axis=axis_idx, tiled=True)
+    full_orig_shape = (
+        *t.original_shape[:axis_idx],
+        gathered_data.shape[axis_idx],
+        *t.original_shape[axis_idx + 1 :],
+    )
+
+    if t.scaling_mode.is_tensor_scaling():
+        gathered_scale_inv = t.scale_inv
+    elif t.scaling_mode.is_mxfp8_scaling:
+        # K-side FSDP only (see docstring). Rowwise and colwise both
+        # produce a 2D scale view ``(padded_n_block_x, n_block_y)`` whose
+        # n_block_y axis aligns with the K side of the data; the only
+        # difference is which ``(block_y, alignment_y)`` constants we
+        # divide by. M-side FSDP is rejected because the worst-case
+        # ``(G-1)*alignment_x`` group padding does not compose under AG.
+        if axis_idx < t.flatten_axis:
+            raise NotImplementedError(
+                f"MXFP8 + FSDP AG along an M-side axis (axis_idx={axis_idx} "
+                f"< flatten_axis={t.flatten_axis}) is not implemented: "
+                "worst-case per-group scale padding does not compose under "
+                "all-gather. See dense.py:_all_gather_grouped_scaled_"
+                "tensor_1x docstring for follow-up options."
+            )
+
+        per_shard_size = t.original_shape[axis_idx]
+        assert per_shard_size % _MXFP8_PER_SHARD_MIN_ALIGN == 0, (
+            f"MXFP8 + FSDP requires per-shard size on axis {axis_idx} to be "
+            f"a multiple of {_MXFP8_PER_SHARD_MIN_ALIGN} (= block_y * "
+            f"alignment_y on the K side: 32*4 for rowwise, 1*128 for "
+            f"colwise); got per-shard size {per_shard_size}. This "
+            "guarantees no block straddles peers AND per-shard n_block_y "
+            "has no alignment padding so the scale_inv AG composes cleanly."
+        )
+
+        # n_block_y for the per-shard slice on the flatten_axis side.
+        # original_shape[flatten_axis:] are the K-side dims; their
+        # product divided by block_y gives n_block_y_per_shard. With the
+        # per-shard mult-of-128 check above this is already a multiple
+        # of alignment_y for both is_colwise values, so no per-shard
+        # padding on n_block_y.
+        block_y, _alignment_y = _mxfp8_block_y_alignment_y(t.is_colwise)
+        flattened_last_dim_per_shard = 1
+        for d in t.original_shape[t.flatten_axis :]:
+            flattened_last_dim_per_shard *= d
+        n_block_y_per_shard = flattened_last_dim_per_shard // block_y
+
+        scale_total = t.scale_inv.shape[0]
+        assert scale_total % n_block_y_per_shard == 0, (
+            f"scale_inv flat size {scale_total} not divisible by "
+            f"n_block_y_per_shard={n_block_y_per_shard} "
+            f"(is_colwise={t.is_colwise}, block_y={block_y}); cannot "
+            "reshape to 2D"
+        )
+        padded_n_block_x = scale_total // n_block_y_per_shard
+
+        scale_2d = t.scale_inv.reshape((padded_n_block_x, n_block_y_per_shard))
+        gathered_scale_2d = jax.lax.all_gather(
+            scale_2d, mesh_axis, axis=1, tiled=True
+        )
+        gathered_scale_inv = gathered_scale_2d.reshape(-1)
+    else:
+        raise NotImplementedError(
+            f"FSDP all-gather for scaling_mode={t.scaling_mode} is not "
+            "implemented. Currently supported: tensor scaling (CurrentScaling, "
+            "DelayedScaling) and MXFP8 (K-side FSDP only)."
+        )
+
+    return GroupedScaledTensor1x(
+        data=gathered_data.reshape(-1),
+        scale_inv=gathered_scale_inv,
+        amax=t.amax,
+        first_dims=t.first_dims,
+        last_dims=t.last_dims,
+        scaling_mode=t.scaling_mode,
+        dq_dtype=t.dq_dtype,
+        _dq_func=t._dq_func,
+        is_colwise=t.is_colwise,
+        data_layout=t.data_layout,
+        flatten_axis=t.flatten_axis,
+        original_shape=full_orig_shape,
+        pre_swizzled=t.pre_swizzled,
+    )
 
 
 def dense(
@@ -408,8 +569,38 @@ def _grouped_dense_fwd_rule(
 
     kernel_fsdp_mesh_axis, kernel_fsdp_axis_idx = kernel_fsdp_info
     kernel_fsdp_enabled = kernel_fsdp_mesh_axis is not None
-    assert not kernel_fsdp_enabled, "FSDP sharding for grouped_dense is not supported yet."
-    del kernel_fsdp_mesh_axis, kernel_fsdp_axis_idx, kernel_fsdp_info, kernel_fsdp_enabled
+    has_kernel_quantizer = (
+        kernel_fsdp_enabled
+        and quantizer_set is not None
+        and quantizer_set.kernel is not None
+    )
+    if kernel_fsdp_enabled and not has_kernel_quantizer:
+        # No FP8 quantization (e.g. bf16 autocast disabled): the
+        # "quantize before AG" win collapses to "AG inside body vs.
+        # outside body", which is semantically identical. Plain-AG the
+        # kernel up front so the rest of the fwd code sees a full
+        # kernel and follows the legacy path. The bwd still needs
+        # ``psum_scatter`` on wgrad because the kernel input was
+        # per-shard.
+        kernel = jax.lax.all_gather(
+            kernel,
+            kernel_fsdp_mesh_axis,
+            axis=kernel_fsdp_axis_idx,
+            tiled=True,
+        )
+    if has_kernel_quantizer:
+        # FP8 / MXFP8 "quantize before AG" path. Supported scaling
+        # modes: tensor scaling (CurrentScaling, DelayedScaling) and
+        # MXFP8 K-side FSDP. See ``_all_gather_grouped_scaled_tensor_1x``
+        # for the per-mode contract and the M-side MXFP8 limitation.
+        kernel_scaling_mode = quantizer_set.kernel.scaling_mode
+        assert (
+            kernel_scaling_mode.is_tensor_scaling() or kernel_scaling_mode.is_mxfp8_scaling
+        ), (
+            "quantize-before-FSDP-AG (kernel_fsdp_info != (None, -1)) currently "
+            "supports tensor-scaling FP8 (CurrentScaling / DelayedScaling) and "
+            f"MXFP8 (K-side FSDP only); got kernel scaling_mode={kernel_scaling_mode}"
+        )
 
     x_contracting_dims, k_contracting_dims = contracting_dims
     flatten_axis_x = -len(x_contracting_dims)
@@ -422,7 +613,12 @@ def _grouped_dense_fwd_rule(
         flatten_axis=flatten_axis_x,
     )
 
-    casted_kernel = tex.grouped_quantize(kernel, quantizer_set.kernel, flatten_axis=flatten_axis_k)
+    casted_kernel = tex.grouped_quantize(
+        kernel,
+        quantizer_set.kernel,
+        flatten_axis=flatten_axis_k,
+        amax_scope=AmaxScope.FSDP if has_kernel_quantizer else AmaxScope.LOCAL,
+    )
     contracting_dims = (x_contracting_dims, k_contracting_dims)
 
     # For x_contracting_dims == (1,) and k_contracting_dims == (1,), we should have
@@ -443,6 +639,18 @@ def _grouped_dense_fwd_rule(
     ctx_kernel = casted_kernel.get_tensor(usage=TensorUsage.RHS_TRANS)
 
     grouped_gemm_kernel = casted_kernel.get_tensor(usage=TensorUsage.RHS)
+    if has_kernel_quantizer:
+        # All-gather the per-shard FP8 RHS data (rowwise for tensor
+        # scaling, colwise for MXFP8 since ``get_tensor(usage=RHS)``
+        # returns colwise under MXFP8) along the kernel's FSDP axis.
+        # ``scale_inv`` is handled inside the helper: reused as-is for
+        # tensor scaling (peer-identical after the ``pmax`` inside
+        # ``grouped_quantize``) or AG'd along its K-block axis for
+        # MXFP8. ``ctx_kernel`` below is intentionally left per-shard;
+        # the bwd rule AGs it separately for the dgrad GEMM.
+        grouped_gemm_kernel = _all_gather_grouped_scaled_tensor_1x(
+            grouped_gemm_kernel, kernel_fsdp_mesh_axis, kernel_fsdp_axis_idx
+        )
     grouped_gemm_kernel = (
         grouped_gemm_kernel.checkpoint(quantizer_set.kernel)
         if isinstance(grouped_gemm_kernel, ScaledTensor)
@@ -478,9 +686,8 @@ def _grouped_dense_fwd_rule(
 def _grouped_dense_bwd_rule(
     contracting_dims, precision, preferred_element_type, group_offset, kernel_fsdp_info, ctx, grad
 ):
-    kernel_fsdp_mesh_axis, _ = kernel_fsdp_info
+    kernel_fsdp_mesh_axis, kernel_fsdp_axis_idx = kernel_fsdp_info
     kernel_fsdp_enabled = kernel_fsdp_mesh_axis is not None
-    assert not kernel_fsdp_enabled, "FSDP sharding for grouped_dense is not supported yet."
 
     fwd_x_contracting_dims, fwd_k_contracting_dims = contracting_dims
 
@@ -512,6 +719,19 @@ def _grouped_dense_bwd_rule(
     dgrad_contracting_dims = (g_contracting_dim, k_contracting_dim)
     dgrad_grad = casted_grad.get_tensor(usage=TensorUsage.LHS)
     dgrad_kernel_T = ctx_kernel
+    if kernel_fsdp_enabled and isinstance(ctx_kernel, GroupedScaledTensor1x):
+        # FP8 / MXFP8 path: fwd saved ctx_kernel per-shard. Mirror the
+        # fwd AG on the colwise (RHS_TRANS) data so the dgrad GEMM sees
+        # the full kernel and produces a full-K dgrad (matching x's
+        # full-K spec; x is FSDP-sharded on batch, not on K). The helper
+        # handles both rowwise and colwise via its is_colwise branch;
+        # original_shape and flatten_axis are layout-invariant, so
+        # ``kernel_fsdp_axis_idx`` (defined against the original kernel
+        # shape) applies unchanged. For bf16 we already AG'd the kernel
+        # up front in fwd, so ctx_kernel is already full -- skip.
+        dgrad_kernel_T = _all_gather_grouped_scaled_tensor_1x(
+            dgrad_kernel_T, kernel_fsdp_mesh_axis, kernel_fsdp_axis_idx
+        )
 
     # g_contracting_dim = (0, )
     # x_contracting_dim = (0, )
@@ -539,6 +759,21 @@ def _grouped_dense_bwd_rule(
         preferred_element_type=preferred_element_type,
         group_offset=group_offset,
     )
+
+    if kernel_fsdp_enabled:
+        # ``wgrad`` is full kernel-shape ``(G, K, N)``; the kernel input was
+        # per-shard on ``kernel_fsdp_axis_idx``, so the bwd output must be
+        # too. ``psum_scatter`` is the autodiff transpose of the fwd
+        # ``all_gather``: it sums per-FSDP-peer partial wgrads (different
+        # peers contribute different ctx_x batch slices) and scatters the
+        # summed result back along the FSDP axis. Each peer keeps only its
+        # K-slice of the global wgrad, matching the per-shard kernel spec.
+        wgrad = jax.lax.psum_scatter(
+            wgrad,
+            kernel_fsdp_mesh_axis,
+            scatter_dimension=kernel_fsdp_axis_idx,
+            tiled=True,
+        )
 
     group_sizes_grad = None
     dbias = tex.grouped_dbias(grad, group_sizes) if use_bias else None

@@ -243,10 +243,12 @@ class MoEBlock(TransformerEngineBase):
         ``in_specs`` strips the FSDP axis), and ``grouped_dense``
         receives a fully gathered weight.
 
-        Currently support for the FSDP-aware fwd path inside
-        ``_grouped_dense_fwd_rule`` is gated by an internal assertion;
-        setting this ``True`` requires the corresponding
-        ``grouped_dense`` enablement to be present.
+        The backward rule mirrors the forward AG with a
+        ``psum_scatter`` along the same FSDP axis on the wgrad output,
+        so the per-shard wgrad matches the per-shard kernel input. Both
+        rowwise (tensor scaling) and colwise (MXFP8 K-side) layouts are
+        supported; M-side MXFP8 is intentionally rejected because the
+        per-group scale-padding does not compose under all-gather.
     permutation_backend : str
         ``"pure_jax"`` (default) or ``"triton"``.
     align_size : int
@@ -413,6 +415,23 @@ class MoEBlock(TransformerEngineBase):
                 self.dtype,
             )
 
+        # Validate per-shard alignment on FSDP-sharded kernel dims when
+        # ``quantize_before_fsdp_ag`` is True. This is a no-op when the knob
+        # is False, no FSDP is configured, or the resolved FSDP size is 1;
+        # otherwise it surfaces alignment issues here, before any FFI.
+        wi_kernel_fsdp_info = self._derive_kernel_fsdp_info(self.wi_kernel_axes)
+        wo_kernel_fsdp_info = self._derive_kernel_fsdp_info(self.wo_kernel_axes)
+        self._assert_kernel_fsdp_alignment(
+            kernel_name="wi_0",
+            kernel_shape=wi_0.shape,
+            kernel_fsdp_info=wi_kernel_fsdp_info,
+        )
+        self._assert_kernel_fsdp_alignment(
+            kernel_name="wo",
+            kernel_shape=wo.shape,
+            kernel_fsdp_info=wo_kernel_fsdp_info,
+        )
+
         if self.expert_parallelism_axis is None:
             output, aux_loss = self._forward_no_ep(
                 inputs,
@@ -509,6 +528,57 @@ class MoEBlock(TransformerEngineBase):
                 "FSDP-sharded under quantize_before_fsdp_ag=True."
             )
         return matches[0]
+
+    def _assert_kernel_fsdp_alignment(
+        self,
+        *,
+        kernel_name: str,
+        kernel_shape: Tuple[int, ...],
+        kernel_fsdp_info: Tuple[Optional[str], int],
+    ) -> None:
+        """Validate per-shard size on the kernel's FSDP axis.
+
+        When :attr:`quantize_before_fsdp_ag` is True and a kernel dim is
+        FSDP-sharded, downstream code (``_grouped_dense_fwd_rule`` and
+        ``_all_gather_grouped_scaled_tensor_1x``) requires the per-shard
+        size on that dim to be a multiple of 128. This is the
+        ``block_size * alignment_y`` constant from the MXFP8 block layout
+        and ensures (a) no MXFP8 block straddles peers and (b) per-shard
+        ``n_block_y`` carries no alignment padding so scale_inv AG composes
+        cleanly. Tensor scaling does not need this constraint, but we
+        enforce it uniformly so that switching to MXFP8 at runtime never
+        triggers a confusing FFI-level error.
+
+        Raises
+        ------
+        ValueError
+            If ``kernel_shape[fsdp_dim] / mesh.shape[fsdp_axis]`` is not a
+            multiple of 128.
+        """
+        if not self.quantize_before_fsdp_ag:
+            return
+        fsdp_axis, fsdp_dim = kernel_fsdp_info
+        if fsdp_axis is None or self.mesh is None:
+            return
+        fsdp_size = self.mesh.shape.get(fsdp_axis)
+        if fsdp_size is None or fsdp_size <= 1:
+            return
+        full_size = kernel_shape[fsdp_dim]
+        if full_size % fsdp_size != 0:
+            raise ValueError(
+                f"{kernel_name}.shape[{fsdp_dim}]={full_size} is not divisible "
+                f"by FSDP size mesh.shape[{fsdp_axis!r}]={fsdp_size}"
+            )
+        per_shard = full_size // fsdp_size
+        if per_shard % 128 != 0:
+            raise ValueError(
+                f"quantize_before_fsdp_ag=True requires per-shard size on the "
+                f"FSDP axis to be a multiple of 128 (block_size * alignment_y "
+                f"for MXFP8 K-side AG); got {kernel_name}.shape[{fsdp_dim}]"
+                f"={full_size}, FSDP size={fsdp_size}, per-shard={per_shard}. "
+                f"Increase the kernel size, decrease FSDP, or disable "
+                f"quantize_before_fsdp_ag."
+            )
 
     @staticmethod
     def _build_kernel_in_spec(
