@@ -541,13 +541,16 @@ class MoEBlock(TransformerEngineBase):
         When :attr:`quantize_before_fsdp_ag` is True and a kernel dim is
         FSDP-sharded, downstream code (``_grouped_dense_fwd_rule`` and
         ``_all_gather_grouped_scaled_tensor_1x``) requires the per-shard
-        size on that dim to be a multiple of 128. This is the
-        ``block_size * alignment_y`` constant from the MXFP8 block layout
-        and ensures (a) no MXFP8 block straddles peers and (b) per-shard
-        ``n_block_y`` carries no alignment padding so scale_inv AG composes
-        cleanly. Tensor scaling does not need this constraint, but we
-        enforce it uniformly so that switching to MXFP8 at runtime never
-        triggers a confusing FFI-level error.
+        size on that dim to be a multiple of 128. ``128`` is the
+        ``block_x * alignment_x = block_y * alignment_y = 128`` constant
+        from the MXFP8 block layout and applies symmetrically to M-side
+        and K-side FSDP placements (and to both ``is_colwise=True`` and
+        ``False``). It guarantees: (a) no MXFP8 block straddles peers,
+        and (b) per-shard ``n_block_x`` / ``n_block_y`` carries no
+        alignment padding so the per-shard scale layout is exact and
+        ``scale_inv`` AG composes cleanly. Tensor scaling does not need
+        this constraint, but we enforce it uniformly so switching to
+        MXFP8 at runtime never triggers a confusing FFI-level error.
 
         Raises
         ------

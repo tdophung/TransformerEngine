@@ -56,28 +56,34 @@ def _psum_scatter_kernel(kernel, scattered_kernel_shape, mesh_axis, axis_idx):
 
 
 # MXFP8 block layout constants (mirrors BlockScalingModeMetadataImpl).
-# block_dims = (1, 32). block_alignment = (128, 4). For a 2D view
-# ``(n_block_x_M_side, n_block_y_K_side)``:
-#   * Rowwise (is_colwise=False): block_y=32 (per-block along K),
-#     alignment_y=4. Per-shard size on K-side FSDP axis must be a
-#     multiple of block_y*alignment_y = 32*4 = 128.
-#   * Colwise (is_colwise=True): block_y=1 (per-element along K),
-#     alignment_y=128. Per-shard size constraint = 1*128 = 128 -- same.
-# In both cases the per-shard mult-of-128 check ensures (a) no block
-# straddles peers and (b) per-shard n_block_y has no alignment padding,
-# so AG along the n_block_y axis composes cleanly.
+# block_dims = (1, 32). block_alignment = (128, 4). The 2D
+# ``(n_block_x_M_side, n_block_y_K_side)`` scale view layout is:
+#
+#                          block_x   alignment_x   block_y   alignment_y
+#   Rowwise (default)         1         128          32          4
+#   Colwise (transposed)     32           4           1        128
+#
+# In both cases ``block_x * alignment_x = 128`` and
+# ``block_y * alignment_y = 128``. So a single ``per-shard size %
+# 128 == 0`` guard on the FSDP-sharded axis covers both
+# ``is_colwise`` values AND both M-side / K-side FSDP placements. It
+# guarantees: (a) no block straddles peers (per-shard rows are a
+# multiple of block_x; per-shard cols are a multiple of block_y), and
+# (b) per-shard ``n_block_x`` / ``n_block_y`` carries no alignment
+# padding, so the per-shard scale layout is exactly
+# ``(G * M_per_shard/block_x, K_per_shard/block_y)`` and AG
+# composes cleanly.
 _MXFP8_PER_SHARD_MIN_ALIGN = 128
 
 
 def _mxfp8_block_y_alignment_y(is_colwise: bool) -> Tuple[int, int]:
-    """Return ``(block_y, alignment_y)`` for the K-side of MXFP8 scales.
-
-    These are the layout knobs that determine ``n_block_y_per_shard``
-    (= ``flattened_last_dim_per_shard // block_y``) and the per-shard
-    alignment padding (= ``DIVUP(n_block_y, alignment_y) * alignment_y``)
-    on the FSDP-shardable K side of the 2D scale view.
-    """
+    """Return ``(block_y, alignment_y)`` for the K-side of MXFP8 scales."""
     return (1, 128) if is_colwise else (32, 4)
+
+
+def _mxfp8_block_x_alignment_x(is_colwise: bool) -> Tuple[int, int]:
+    """Return ``(block_x, alignment_x)`` for the M-side of MXFP8 scales."""
+    return (32, 4) if is_colwise else (1, 128)
 
 
 def _all_gather_grouped_scaled_tensor_1x(t, mesh_axis, axis_idx):
@@ -104,26 +110,26 @@ def _all_gather_grouped_scaled_tensor_1x(t, mesh_axis, axis_idx):
 
     * **MXFP8 block scaling** (rowwise *and* colwise, since the forward
       GEMM consumes the colwise tensor as its RHS): per-block
-      ``scale_inv``. Two cases:
+      ``scale_inv``. The single per-shard ``size % 128 == 0`` guard
+      enforced by ``MoEBlock._assert_kernel_fsdp_alignment`` is the same
+      for both M-side and K-side FSDP placements (see the constants
+      block above for why), and unlocks both:
 
-      - **K-side FSDP** (``axis_idx >= flatten_axis``): the FSDP axis
-        is on the K side of the 2D scale view. Padding for groups
-        affects only ``n_block_x``, which is FSDP-invariant in this
-        case, so we reshape ``scale_inv`` to
-        ``(padded_n_block_x, n_block_y_per_shard)``, AG along axis 1,
-        and reflatten. The 2D layout is the same for rowwise and
-        colwise; only ``(block_y, alignment_y)`` differs (32/4 vs 1/128
-        respectively). Requires per-shard size on ``axis_idx`` to be a
-        multiple of 128 so per-shard ``n_block_y`` carries no alignment
-        padding in either layout.
+      - **K-side FSDP** (``axis_idx >= flatten_axis``): per-shard
+        ``n_block_y = K_per_shard/block_y`` carries no alignment
+        padding. Reshape ``scale_inv`` to
+        ``(G * M/block_x, n_block_y_per_shard)``, AG along axis 1,
+        reflatten.
 
-      - **M-side FSDP** (``axis_idx < flatten_axis``): worst-case group
-        padding (``(G-1) * 128`` for rowwise or ``(G-1) * 4`` for
-        colwise) is added on every peer's ``n_block_x_padded``, so a
-        naive AG-concatenate overshoots the full-shape padded layout.
-        Not currently implemented; raises ``NotImplementedError`` with
-        a pointer to follow-up options (un-pad / re-pad via the V2
-        int64 workspace, or scatter-and-psum).
+      - **M-side FSDP** (``axis_idx < flatten_axis``): per-shard
+        ``n_block_x = G * M_per_shard/block_x`` carries no per-group
+        padding (each group's ``M_per_shard`` is mult of
+        ``block_x * alignment_x = 128``). Reshape ``scale_inv`` to
+        ``(G, M_per_shard/block_x, n_block_y)``, AG along axis 1
+        (the per-group M sub-axis), reflatten. Restricted to the
+        single-non-G-M-dim layout ``(G, M, K_dims...)`` (i.e.
+        ``axis_idx == 1`` and ``flatten_axis == 2``); other layouts
+        require a non-trivial reshape and aren't yet implemented.
     """
     assert isinstance(t, GroupedScaledTensor1x)
     assert mesh_axis is not None
@@ -140,42 +146,23 @@ def _all_gather_grouped_scaled_tensor_1x(t, mesh_axis, axis_idx):
     if t.scaling_mode.is_tensor_scaling():
         gathered_scale_inv = t.scale_inv
     elif t.scaling_mode.is_mxfp8_scaling:
-        # K-side FSDP only (see docstring). Rowwise and colwise both
-        # produce a 2D scale view ``(padded_n_block_x, n_block_y)`` whose
-        # n_block_y axis aligns with the K side of the data; the only
-        # difference is which ``(block_y, alignment_y)`` constants we
-        # divide by. M-side FSDP is rejected because the worst-case
-        # ``(G-1)*alignment_x`` group padding does not compose under AG.
-        if axis_idx < t.flatten_axis:
-            raise NotImplementedError(
-                f"MXFP8 + FSDP AG along an M-side axis (axis_idx={axis_idx} "
-                f"< flatten_axis={t.flatten_axis}) is not implemented: "
-                "worst-case per-group scale padding does not compose under "
-                "all-gather. See dense.py:_all_gather_grouped_scaled_"
-                "tensor_1x docstring for follow-up options."
-            )
-
         per_shard_size = t.original_shape[axis_idx]
         assert per_shard_size % _MXFP8_PER_SHARD_MIN_ALIGN == 0, (
             f"MXFP8 + FSDP requires per-shard size on axis {axis_idx} to be "
-            f"a multiple of {_MXFP8_PER_SHARD_MIN_ALIGN} (= block_y * "
-            f"alignment_y on the K side: 32*4 for rowwise, 1*128 for "
-            f"colwise); got per-shard size {per_shard_size}. This "
-            "guarantees no block straddles peers AND per-shard n_block_y "
-            "has no alignment padding so the scale_inv AG composes cleanly."
+            f"a multiple of {_MXFP8_PER_SHARD_MIN_ALIGN} (= block_x * "
+            f"alignment_x on the M side, = block_y * alignment_y on the K "
+            f"side, both 128 for rowwise and colwise); got per-shard size "
+            f"{per_shard_size}. This guarantees no block straddles peers "
+            "AND per-shard n_block_x / n_block_y carries no alignment "
+            "padding so the scale_inv AG composes cleanly."
         )
 
-        # n_block_y for the per-shard slice on the flatten_axis side.
-        # original_shape[flatten_axis:] are the K-side dims; their
-        # product divided by block_y gives n_block_y_per_shard. With the
-        # per-shard mult-of-128 check above this is already a multiple
-        # of alignment_y for both is_colwise values, so no per-shard
-        # padding on n_block_y.
         block_y, _alignment_y = _mxfp8_block_y_alignment_y(t.is_colwise)
-        flattened_last_dim_per_shard = 1
+        block_x, _alignment_x = _mxfp8_block_x_alignment_x(t.is_colwise)
+        flattened_k_per_shard = 1
         for d in t.original_shape[t.flatten_axis :]:
-            flattened_last_dim_per_shard *= d
-        n_block_y_per_shard = flattened_last_dim_per_shard // block_y
+            flattened_k_per_shard *= d
+        n_block_y_per_shard = flattened_k_per_shard // block_y
 
         scale_total = t.scale_inv.shape[0]
         assert scale_total % n_block_y_per_shard == 0, (
@@ -186,16 +173,51 @@ def _all_gather_grouped_scaled_tensor_1x(t, mesh_axis, axis_idx):
         )
         padded_n_block_x = scale_total // n_block_y_per_shard
 
-        scale_2d = t.scale_inv.reshape((padded_n_block_x, n_block_y_per_shard))
-        gathered_scale_2d = jax.lax.all_gather(
-            scale_2d, mesh_axis, axis=1, tiled=True
-        )
-        gathered_scale_inv = gathered_scale_2d.reshape(-1)
+        if axis_idx >= t.flatten_axis:
+            # K-side: AG along the n_block_y axis of the 2D view.
+            scale_2d = t.scale_inv.reshape((padded_n_block_x, n_block_y_per_shard))
+            gathered_scale_2d = jax.lax.all_gather(
+                scale_2d, mesh_axis, axis=1, tiled=True
+            )
+            gathered_scale_inv = gathered_scale_2d.reshape(-1)
+        else:
+            # M-side: split the flattened n_block_x into (G, M_per_shard/block_x)
+            # so the AG concatenates per-group M slices in full-kernel row order.
+            # Restricted to single-non-G-M-dim layouts (G, M, K_dims...).
+            if axis_idx != 1 or t.flatten_axis != 2:
+                raise NotImplementedError(
+                    f"MXFP8 + FSDP M-side AG only supports the single-M-dim "
+                    f"layout (kernel.shape == (G, M, K_dims...) with FSDP on "
+                    f"axis 1). Got original_shape={t.original_shape}, "
+                    f"axis_idx={axis_idx}, flatten_axis={t.flatten_axis}. "
+                    "Multi-M-dim layouts need a non-trivial reshape (un-flatten "
+                    "the per-group M dims, AG on the FSDP-target dim, "
+                    "reflatten); not implemented yet."
+                )
+            g = t.original_shape[0]
+            m_per_shard = t.original_shape[1]
+            n_block_x_per_group_per_shard = m_per_shard // block_x
+            expected_scale_total = g * n_block_x_per_group_per_shard * n_block_y_per_shard
+            assert scale_total == expected_scale_total, (
+                f"per-shard scale_inv layout mismatch under MXFP8 M-side AG: "
+                f"got scale_total={scale_total}, expected G * "
+                f"(M_per_shard/block_x) * n_block_y = {g} * "
+                f"{n_block_x_per_group_per_shard} * {n_block_y_per_shard} = "
+                f"{expected_scale_total}. The MoEBlock-level mult-of-128 "
+                "alignment guard should have caught this; please file a bug."
+            )
+            scale_3d = t.scale_inv.reshape(
+                (g, n_block_x_per_group_per_shard, n_block_y_per_shard)
+            )
+            gathered_scale_3d = jax.lax.all_gather(
+                scale_3d, mesh_axis, axis=1, tiled=True
+            )
+            gathered_scale_inv = gathered_scale_3d.reshape(-1)
     else:
         raise NotImplementedError(
             f"FSDP all-gather for scaling_mode={t.scaling_mode} is not "
             "implemented. Currently supported: tensor scaling (CurrentScaling, "
-            "DelayedScaling) and MXFP8 (K-side FSDP only)."
+            "DelayedScaling) and MXFP8 (M-side and K-side FSDP)."
         )
 
     return GroupedScaledTensor1x(
