@@ -120,9 +120,7 @@ def _pure_jax_moe_reference(
 
     # Build a sparse routing_map [T, E] with weights at selected positions
     routing_weights_full = jnp.zeros_like(probs_full)
-    routing_weights_full = routing_weights_full.at[
-        jnp.arange(T)[:, None], selected
-    ].set(weights)
+    routing_weights_full = routing_weights_full.at[jnp.arange(T)[:, None], selected].set(weights)
 
     # Per-expert FFN: replicate each token K times, gather by expert,
     # run through wi_0 / wi_1 / wo, gather back, weighted-sum.
@@ -153,9 +151,8 @@ def _pure_jax_moe_reference(
         # aux_loss formula: (E * coeff / (k * T^2)) * sum_e
         # (sum_t aux_probs[t, e]) * tokens_per_expert[e]
         sum_probs_per_expert = jnp.sum(aux_probs, axis=0)  # [E]
-        aux_loss = (
-            (num_experts * aux_loss_coeff / (num_experts_per_tok * (T**2)))
-            * jnp.sum(sum_probs_per_expert * tokens_per_expert.astype(jnp.float32))
+        aux_loss = (num_experts * aux_loss_coeff / (num_experts_per_tok * (T**2))) * jnp.sum(
+            sum_probs_per_expert * tokens_per_expert.astype(jnp.float32)
         )
     else:
         aux_loss = jnp.zeros((), dtype=DTYPE)
@@ -236,7 +233,8 @@ class TestMoeVjpForward:
         x = _make_inputs(kx)
         out_te, _ = _run_te_moe(x, params, permutation_backend=backend)
         out_ref, _ = _pure_jax_moe_reference(
-            x, **params,
+            x,
+            **params,
             num_experts=NUM_EXPERTS,
             num_experts_per_tok=NUM_EXPERTS_PER_TOK,
         )
@@ -294,7 +292,8 @@ class TestMoeVjpBackward:
 
         def loss_ref(params, x):
             out, _ = _pure_jax_moe_reference(
-                x, **params,
+                x,
+                **params,
                 num_experts=NUM_EXPERTS,
                 num_experts_per_tok=NUM_EXPERTS_PER_TOK,
             )
@@ -353,14 +352,13 @@ class TestMoeVjpAuxLoss:
         x = _make_inputs(kx)
         _, aux_te = _run_te_moe(x, params, permutation_backend=backend, aux_loss_coeff=1e-2)
         _, aux_ref = _pure_jax_moe_reference(
-            x, **params,
+            x,
+            **params,
             num_experts=NUM_EXPERTS,
             num_experts_per_tok=NUM_EXPERTS_PER_TOK,
             aux_loss_coeff=1e-2,
         )
-        np.testing.assert_allclose(
-            float(aux_te), float(aux_ref), atol=1e-5, rtol=1e-5
-        )
+        np.testing.assert_allclose(float(aux_te), float(aux_ref), atol=1e-5, rtol=1e-5)
 
     @pytest.mark.parametrize("backend_name", ["pure_jax", "triton"])
     def test_aux_loss_grads_propagate_to_logits(self, backend_name):
@@ -379,9 +377,9 @@ class TestMoeVjpAuxLoss:
 
         g_gate = jax.grad(aux_only_loss)(params, x)["gate_kernel"]
         assert jnp.all(jnp.isfinite(g_gate))
-        assert jnp.any(g_gate != 0.0), (
-            "aux_loss bwd should propagate to gate_kernel via fused_topk bwd"
-        )
+        assert jnp.any(
+            g_gate != 0.0
+        ), "aux_loss bwd should propagate to gate_kernel via fused_topk bwd"
 
 
 # -----------------------------------------------------------------------------

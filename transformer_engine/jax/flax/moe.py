@@ -185,9 +185,9 @@ class _MoEBlock(TransformerEngineBase):
             Scalar load-balancing loss when ``aux_loss_coeff > 0``,
             else ``None``.
         """
-        assert inputs.ndim == 3, (
-            f"_MoEBlock expects [batch, sequence, hidden] input, got shape {inputs.shape}"
-        )
+        assert (
+            inputs.ndim == 3
+        ), f"_MoEBlock expects [batch, sequence, hidden] input, got shape {inputs.shape}"
         _, _, hidden_size = inputs.shape
 
         # Param registrations -- must run OUTSIDE any JAX transform that

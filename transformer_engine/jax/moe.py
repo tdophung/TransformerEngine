@@ -256,9 +256,7 @@ def _dispatch(
             ).astype(jnp.int32)
             pad_lengths = target_tokens_per_expert - tokens_per_expert
             cum_pad = jnp.cumsum(pad_lengths)
-            pad_offsets = jnp.concatenate(
-                [jnp.array([0], dtype=cum_pad.dtype), cum_pad[:-1]]
-            )
+            pad_offsets = jnp.concatenate([jnp.array([0], dtype=cum_pad.dtype), cum_pad[:-1]])
             worst_case_out_tokens = (
                 (num_out_tokens + num_experts * (align_size - 1)) // align_size
             ) * align_size
@@ -519,7 +517,10 @@ def _combine_bwd(
             d_unsort_intermediate = jnp.concatenate(
                 [
                     d_unsort_intermediate,
-                    jnp.zeros((padding, d_unsort_intermediate.shape[-1]), dtype=d_unsort_intermediate.dtype),
+                    jnp.zeros(
+                        (padding, d_unsort_intermediate.shape[-1]),
+                        dtype=d_unsort_intermediate.dtype,
+                    ),
                 ],
                 axis=0,
             )
@@ -536,18 +537,16 @@ def _combine_bwd(
         hidden = d_output_2d.shape[-1]
         num_out_tokens = expert_outputs.shape[0]
         if state["pad_offsets"] is not None:
-            d_expert_outputs_global, d_merging_probs = (
-                unpermute_bwd_with_merging_probs_and_unpad(
-                    d_output_2d,
-                    state["row_id_map"],
-                    expert_outputs,
-                    state["merging_probs"],
-                    state["pad_offsets"],
-                    num_tokens,
-                    n_experts,
-                    num_out_tokens,
-                    hidden,
-                )
+            d_expert_outputs_global, d_merging_probs = unpermute_bwd_with_merging_probs_and_unpad(
+                d_output_2d,
+                state["row_id_map"],
+                expert_outputs,
+                state["merging_probs"],
+                state["pad_offsets"],
+                num_tokens,
+                n_experts,
+                num_out_tokens,
+                hidden,
             )
             # The kernel only writes positions tokens map to; padded
             # positions may contain NaN. Replace with zeros (matches
@@ -577,7 +576,9 @@ def _combine_bwd(
     in_off_f, send_sz_f, out_off_f, recv_sz_f = compute_ragged_all_to_all_params(
         state["all_shards_tokens_per_expert"], shard_id, num_ep
     )
-    recv_buf_for_bwd = jnp.zeros(state["post_a2a_buffer_shape"], dtype=d_expert_outputs_global.dtype)
+    recv_buf_for_bwd = jnp.zeros(
+        state["post_a2a_buffer_shape"], dtype=d_expert_outputs_global.dtype
+    )
     d_x_send_back = jax.lax.ragged_all_to_all(
         d_expert_outputs_global,
         recv_buf_for_bwd,
@@ -772,9 +773,7 @@ def _body_fwd(
     # Pass an empty array sentinel when expert_bias is unused (the
     # underlying primitive expects a real ndarray, not None).
     eb_arg = (
-        full_expert_bias
-        if full_expert_bias is not None
-        else jnp.zeros((0,), dtype=jnp.float32)
+        full_expert_bias if full_expert_bias is not None else jnp.zeros((0,), dtype=jnp.float32)
     )
     sparse_probs, routing_map, saved_scores = tex.fused_topk_with_score_function_fwd(
         logits_2d,
@@ -1006,9 +1005,7 @@ def _body_bwd(
     """Per-shard backward body. Returns a dict of grads keyed identically
     to the ``captured`` dict consumed by :func:`_body_fwd`."""
     if not gate_inside_vjp:
-        raise NotImplementedError(
-            "gate_inside_vjp=False is deferred to a follow-up PR."
-        )
+        raise NotImplementedError("gate_inside_vjp=False is deferred to a follow-up PR.")
 
     d_output, d_aux_loss = dy_pair
     q_set_w0, q_set_w1, q_set_wo = quantizer_sets
@@ -1047,9 +1044,7 @@ def _body_bwd(
         contracting_dims=((0,), (0,)),
     )
     d_wo_bias = (
-        tex.grouped_dbias(d_expert_outputs, ctx["local_group_sizes"])
-        if has_wo_bias
-        else None
+        tex.grouped_dbias(d_expert_outputs, ctx["local_group_sizes"]) if has_wo_bias else None
     )
 
     # ---------------- Activation bwd ----------------
@@ -1075,9 +1070,7 @@ def _body_bwd(
         casted_d_layer_w1.get_tensor(usage=TensorUsage.RHS),
         contracting_dims=((0,), (0,)),
     )
-    d_wi_1_bias = (
-        tex.grouped_dbias(d_layer_w1, ctx["local_group_sizes"]) if has_wi_bias else None
-    )
+    d_wi_1_bias = tex.grouped_dbias(d_layer_w1, ctx["local_group_sizes"]) if has_wi_bias else None
 
     # ---------------- FFN bwd: GEMM 1 (wi_0) ----------------
     casted_d_layer_w0 = tex.grouped_quantize(
@@ -1093,9 +1086,7 @@ def _body_bwd(
         casted_d_layer_w0.get_tensor(usage=TensorUsage.RHS),
         contracting_dims=((0,), (0,)),
     )
-    d_wi_0_bias = (
-        tex.grouped_dbias(d_layer_w0, ctx["local_group_sizes"]) if has_wi_bias else None
-    )
+    d_wi_0_bias = tex.grouped_dbias(d_layer_w0, ctx["local_group_sizes"]) if has_wi_bias else None
 
     d_sorted_x = d_sorted_x_from_w0 + d_sorted_x_from_w1
 
@@ -1128,9 +1119,7 @@ def _body_bwd(
             # routing_map is bool (non-diff); the gradient of weights
             # w.r.t. sparse_probs is a scatter-into-zero along the
             # selected_experts indices.
-            selected_experts = jnp.argsort(ctx["routing_map"], axis=-1)[
-                ..., -num_experts_per_tok:
-            ]
+            selected_experts = jnp.argsort(ctx["routing_map"], axis=-1)[..., -num_experts_per_tok:]
             d_sparse_probs = jnp.zeros_like(ctx["saved_scores"]).astype(d_routing_weights.dtype)
             d_sparse_probs = jnp.take_along_axis(d_sparse_probs, selected_experts, axis=-1)
             # Actually scatter: build via jnp.zeros + .at[].set
@@ -1451,14 +1440,10 @@ def _moe_fwd_rule(
 
     mesh = _get_mesh()
     if mesh is None or mesh.empty:
-        raise ValueError(
-            "moe(...) requires an active jax.sharding.Mesh when ep_axis is set."
-        )
+        raise ValueError("moe(...) requires an active jax.sharding.Mesh when ep_axis is set.")
     num_ep = mesh.shape[ep_axis]
     if num_experts % num_ep != 0:
-        raise ValueError(
-            f"num_experts={num_experts} must be divisible by EP size={num_ep}"
-        )
+        raise ValueError(f"num_experts={num_experts} must be divisible by EP size={num_ep}")
     num_experts_local = num_experts // num_ep
 
     if not data_parallelism_axes:
@@ -1472,9 +1457,7 @@ def _moe_fwd_rule(
     global_batch_size, sequence_length, _hidden = x.shape
     topk = num_experts_per_tok
     if global_batch_size % (num_ep * dp_size) != 0:
-        raise ValueError(
-            f"batch={global_batch_size} not divisible by ep*dp={num_ep * dp_size}"
-        )
+        raise ValueError(f"batch={global_batch_size} not divisible by ep*dp={num_ep * dp_size}")
     recv_buffer_rows = (global_batch_size // dp_size) * sequence_length * topk
     if align_size > 0:
         recv_buffer_rows += num_experts * (align_size - 1)
