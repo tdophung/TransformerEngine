@@ -48,7 +48,6 @@ Implementation conventions
   bwd rule. None of these helpers form a custom_vjp boundary.
 """
 
-import os
 from enum import Enum
 from functools import partial
 from typing import Any, Callable, NewType, Optional, Tuple, Union
@@ -95,21 +94,6 @@ Array = NewType("Array", jnp.ndarray)
 
 
 __all__ = ["moe", "PermutationBackend"]
-
-
-# Experiment C: opt-in barrier between Triton custom_calls and downstream NCCL
-# collectives. See test_distributed_moe_vjp.py docstring for the bisection
-# record. Set NVTE_MOE_OPT_BARRIER=1 to enable. Default off so the workaround
-# stays purely env-controlled until experiment C is validated.
-def _read_moe_opt_barrier_flag() -> bool:
-    val = os.environ.get("NVTE_MOE_OPT_BARRIER", "0")
-    try:
-        return bool(int(val))
-    except ValueError as e:
-        raise ValueError(f"NVTE_MOE_OPT_BARRIER must be an integer (0 or 1), got: {val!r}") from e
-
-
-_NVTE_MOE_OPT_BARRIER = _read_moe_opt_barrier_flag()
 
 
 # =============================================================================
@@ -389,15 +373,6 @@ def _dispatch(
             )
             pad_offsets = None
             group_sizes = tokens_per_expert
-        # EXPERIMENT C: optimization_barrier between the Triton custom_call
-        # (with input_output_aliases on a pre-zeroed output buffer) and the
-        # downstream ragged_all_to_all. Without this, with the unified
-        # custom_vjp wrapping the entire MoE block, XLA mis-handles the
-        # cross-stream sync edge from the aliased custom_call to the NCCL
-        # collective and the bwd hangs. See test_distributed_moe_vjp.py
-        # docstring for the full bisection record.
-        if _NVTE_MOE_OPT_BARRIER:
-            sorted_inputs = jax.lax.optimization_barrier(sorted_inputs)
         state["row_id_map"] = row_id_map
         state["pad_offsets"] = pad_offsets
         state["merging_probs"] = sparse_probs
@@ -699,11 +674,6 @@ def _combine_bwd(
     if not ep_active:
         return d_expert_outputs_global, d_routing_weights
 
-    # EXPERIMENT C barrier: see comment in _dispatch. Bwd Triton kernel
-    # (unpermute_bwd_with_merging_probs[_and_unpad]) -> NCCL chain.
-    if _NVTE_MOE_OPT_BARRIER and backend is PermutationBackend.TRITON:
-        d_expert_outputs_global = jax.lax.optimization_barrier(d_expert_outputs_global)
-
     # Step 2 (EP) inverse: bwd of reverse ragged_all_to_all is a forward
     # ragged_all_to_all using the SAME forward parameters (sender /
     # receiver roles swap from the reverse direction back to forward).
@@ -774,10 +744,6 @@ def _dispatch_bwd(
             hidden,
             is_forward=False,
         )
-        # EXPERIMENT C barrier: bwd Triton kernel (sort_chunks_by_map) ->
-        # NCCL chain. See _dispatch comment.
-        if _NVTE_MOE_OPT_BARRIER and backend is PermutationBackend.TRITON:
-            d_x_recv = jax.lax.optimization_barrier(d_x_recv)
         # Step 3 inverse: bwd of forward ragged_a2a is the reverse-direction
         # ragged_a2a using the SAME params with sender/receiver swapped.
         in_off_r, send_sz_r, out_off_r, recv_sz_r = compute_reverse_ragged_all_to_all_params(
