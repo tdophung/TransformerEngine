@@ -458,6 +458,12 @@ JAX Triton Extensions
    :Default: ``0``
    :Description: Raise a ``RuntimeError`` when the installed JAX is too old to safely run ``TritonAutotunedKernelCall`` (`jax-ml/jax#35218 <https://github.com/jax-ml/jax/pull/35218>`_) instead of silently falling back to non-autotuned dispatch. Useful for CI or debugging to ensure Triton autotuning is active. When set to ``0`` (default), old JAX versions silently fall back to single-config (non-autotuned) kernel dispatch for compatibility.
 
+.. envvar:: NVTE_TRITON_PERMUTATION_BLOCK_SIZES
+
+   :Type: comma-separated list of ``int`` (e.g. ``"128"`` or ``"64,128,256"``)
+   :Default: ``"64,128,256,512,1024,2048,4096"`` (the full sweep)
+   :Description: Override the ``BLOCK_SIZE`` configs evaluated by ``triton.autotune`` for the MoE permutation kernels in ``transformer_engine/common/triton/permutation.py`` (``_permute_kernel``, ``_unpermute_kernel``, ``_unpermute_bwd_with_merging_probs_kernel``, ``_sort_chunks_by_map_kernel``). The default 7-config sweep yields the best runtime on production shapes but costs ~1-5 s of MLIR→LLVM→PTX→cubin compile per config-per-kernel on a cold start (≈2-5 min total per backend, serialized on a single GPU). Set to a single value (e.g. ``"128"``) to skip autotuning entirely for tests / CI where correctness -- not throughput -- is the goal. Must be a comma-separated list of positive ints; malformed values raise ``ValueError`` at kernel-registration time. **Do NOT set this in production runs** -- you will lose autotuned performance.
+
 Examples
 --------
 

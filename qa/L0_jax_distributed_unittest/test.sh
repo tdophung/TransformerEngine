@@ -37,6 +37,26 @@ wait
 TE_PATH=$TE_PATH bash $TE_PATH/examples/jax/collective_gemm/run_test_cgemm.sh || test_fail "run_test_cgemm.sh"
 wait
 
+# MoE custom_vjp distributed (Level 2 smoke + Level 3 perf). Single-host
+# multi-GPU; requires >=4 visible GPUs. The ``-p no:typeguard`` is REQUIRED:
+# jaxtyping's pytest plugin auto-loads typeguard, whose @typechecked import
+# hook materialises JAX tracers via isinstance() checks and deadlocks the
+# first ``block.apply`` of the triton backend inside shard_map +
+# ragged_all_to_all. See CLAUDE.md ("pytest + typeguard deadlocks
+# distributed Triton MoE tests") and tests/jax/test_distributed_moe_vjp.py
+# module docstring for the bisection record. Other jax tests must keep
+# typeguard active for type-hint validation, so we only disable it for this
+# specific invocation rather than in pytest.ini.
+#
+# XLA_PYTHON_CLIENT_PREALLOCATE=false ensures NCCL can allocate communicator
+# buffers (default 90% preallocation starves the EP all-to-all setup).
+XLA_PYTHON_CLIENT_PREALLOCATE=false XLA_PYTHON_CLIENT_MEM_FRACTION=0.5 \
+    python3 -m pytest -c $TE_PATH/tests/jax/pytest.ini -v -s \
+    -p no:typeguard \
+    --junitxml=$XML_LOG_DIR/pytest_test_distributed_moe_vjp.xml \
+    $TE_PATH/tests/jax/test_distributed_moe_vjp.py || test_fail "test_distributed_moe_vjp.py"
+wait
+
 if [ $RET -ne 0 ]; then
     echo "Error: some sub-tests failed: $FAILED_CASES"
     exit 1

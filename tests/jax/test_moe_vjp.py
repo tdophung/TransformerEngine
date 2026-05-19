@@ -30,6 +30,7 @@ that needs a multi-device setup and lives in
 ``tests/jax/test_distributed_moe_vjp.py`` (follow-up).
 """
 
+from functools import partial
 from typing import Optional, Tuple
 
 import jax
@@ -83,6 +84,10 @@ def _make_inputs(key: jax.Array, *, batch=BATCH_SIZE, seq=SEQUENCE_LENGTH) -> ja
 # fwd and bwd parity.
 
 
+@partial(
+    jax.jit,
+    static_argnames=("num_experts", "num_experts_per_tok", "aux_loss_coeff"),
+)
 def _pure_jax_moe_reference(
     x: jnp.ndarray,
     gate_kernel: jnp.ndarray,
@@ -176,6 +181,7 @@ def _init_params(key: jax.Array) -> dict:
     )
 
 
+@partial(jax.jit, static_argnames=("permutation_backend", "aux_loss_coeff"))
 def _run_te_moe(
     x: jnp.ndarray,
     params: dict,
@@ -200,6 +206,49 @@ def _run_te_moe(
         align_size=0,
         dtype=DTYPE,
     )
+
+
+@partial(jax.jit, static_argnames=("permutation_backend", "aux_loss_coeff"))
+def _grads_te_main_loss(params, x, *, permutation_backend, aux_loss_coeff: float = 0.0):
+    """jit'd grad of ``mean(out**2)`` w.r.t. params (no aux contribution)."""
+
+    def loss(params, x):
+        out, _ = _run_te_moe(
+            x, params, permutation_backend=permutation_backend, aux_loss_coeff=aux_loss_coeff
+        )
+        return jnp.mean(out**2)
+
+    return jax.grad(loss)(params, x)
+
+
+@partial(jax.jit, static_argnames=("num_experts", "num_experts_per_tok", "aux_loss_coeff"))
+def _grads_ref_main_loss(params, x, *, num_experts, num_experts_per_tok, aux_loss_coeff=0.0):
+    """jit'd grad of ``mean(out**2)`` w.r.t. params on the pure-JAX ref."""
+
+    def loss(params, x):
+        out, _ = _pure_jax_moe_reference(
+            x,
+            **params,
+            num_experts=num_experts,
+            num_experts_per_tok=num_experts_per_tok,
+            aux_loss_coeff=aux_loss_coeff,
+        )
+        return jnp.mean(out**2)
+
+    return jax.grad(loss)(params, x)
+
+
+@partial(jax.jit, static_argnames=("permutation_backend",))
+def _grad_te_aux_only(params, x, *, permutation_backend):
+    """jit'd grad of just the aux loss scalar (no main contribution)."""
+
+    def aux_only(params, x):
+        _, aux = _run_te_moe(
+            x, params, permutation_backend=permutation_backend, aux_loss_coeff=1e-2
+        )
+        return aux.astype(jnp.float32)
+
+    return jax.grad(aux_only)(params, x)
 
 
 # -----------------------------------------------------------------------------
@@ -267,12 +316,7 @@ class TestMoeVjpBackward:
         kp, kx = jax.random.split(key)
         params = _init_params(kp)
         x = _make_inputs(kx)
-
-        def loss_fn(params, x):
-            out, _ = _run_te_moe(x, params, permutation_backend=backend)
-            return jnp.mean(out**2)
-
-        grads = jax.grad(loss_fn)(params, x)
+        grads = _grads_te_main_loss(params, x, permutation_backend=backend)
         for name in ("gate_kernel", "wi_0", "wi_1", "wo"):
             g = grads[name]
             assert jnp.all(jnp.isfinite(g)), f"{name} grad has NaN/Inf"
@@ -285,22 +329,13 @@ class TestMoeVjpBackward:
         kp, kx = jax.random.split(key)
         params = _init_params(kp)
         x = _make_inputs(kx)
-
-        def loss_te(params, x):
-            out, _ = _run_te_moe(x, params, permutation_backend=backend)
-            return jnp.mean(out**2)
-
-        def loss_ref(params, x):
-            out, _ = _pure_jax_moe_reference(
-                x,
-                **params,
-                num_experts=NUM_EXPERTS,
-                num_experts_per_tok=NUM_EXPERTS_PER_TOK,
-            )
-            return jnp.mean(out**2)
-
-        grads_te = jax.grad(loss_te)(params, x)
-        grads_ref = jax.grad(loss_ref)(params, x)
+        grads_te = _grads_te_main_loss(params, x, permutation_backend=backend)
+        grads_ref = _grads_ref_main_loss(
+            params,
+            x,
+            num_experts=NUM_EXPERTS,
+            num_experts_per_tok=NUM_EXPERTS_PER_TOK,
+        )
         # Loose-ish tol on grads: routing path has discrete topk so the
         # softmax cotangent paths through the non-topk experts diverge
         # slightly between TE (which uses the fused topk bwd) and the
@@ -370,12 +405,7 @@ class TestMoeVjpAuxLoss:
         kp, kx = jax.random.split(key)
         params = _init_params(kp)
         x = _make_inputs(kx)
-
-        def aux_only_loss(params, x):
-            _, aux = _run_te_moe(x, params, permutation_backend=backend, aux_loss_coeff=1e-2)
-            return aux.astype(jnp.float32)
-
-        g_gate = jax.grad(aux_only_loss)(params, x)["gate_kernel"]
+        g_gate = _grad_te_aux_only(params, x, permutation_backend=backend)["gate_kernel"]
         assert jnp.all(jnp.isfinite(g_gate))
         assert jnp.any(
             g_gate != 0.0
@@ -402,12 +432,16 @@ class TestMoEBlockFlaxWrapper:
         key = jax.random.PRNGKey(8)
         ki, kx = jax.random.split(key)
         x = _make_inputs(kx)
-        variables = block.init(ki, x)
-        out, aux = block.apply(variables, x)
+        variables = jax.jit(block.init)(ki, x)
+        out, aux = jax.jit(block.apply)(variables, x)
         assert out.shape == x.shape
         assert aux is None
-        # Backward end-to-end
-        grads = jax.grad(lambda v, x: jnp.mean(block.apply(v, x)[0] ** 2))(variables, x)
+
+        @jax.jit
+        def grad_fn(variables, x):
+            return jax.grad(lambda v, x: jnp.mean(block.apply(v, x)[0] ** 2))(variables, x)
+
+        grads = grad_fn(variables, x)
         for name in ("gate_kernel", "wi_0", "wi_1", "wo"):
             g = grads["params"][name]
             g = g.value if hasattr(g, "value") else g

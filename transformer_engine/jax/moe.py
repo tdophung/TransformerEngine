@@ -72,7 +72,7 @@ from .quantize import (
     noop_quantizer_set,
     with_sharding_constraint_by_logical_axes,
 )
-from .router import ScoreFunction
+from .router import ScoreFunction, _validate_score_function
 from .sharding import _get_mesh
 from .triton_extensions.permutation import (
     make_chunk_sort_map,
@@ -137,8 +137,6 @@ class PermutationBackend(Enum):
 #                                             alongside)
 #   PURE_JAX backend:
 #     "sorted_indices"          [num_real + padding] argsort indices
-#     "num_real_tokens"         int (compile-time scalar)
-#     "padding_size"            int (compile-time scalar)
 #     "routing_weights"         [num_tokens, topk]   per-token-per-expert weights
 #   TRITON backend:
 #     "row_id_map"              [num_tokens, 2*E + 1]
@@ -148,8 +146,15 @@ class PermutationBackend(Enum):
 #     "all_shards_tokens_per_expert" [num_ep, E]
 #     "local_perm_row_id_map"   [recv_buffer_rows]
 #     "local_perm_inv_row_id_map" [recv_buffer_rows]
-#     "post_a2a_buffer_shape"   tuple[int, int] -- shape of recv_buf for fwd a2a
-#     "pre_a2a_buffer_shape"    tuple[int, int] -- shape of send buf before fwd a2a
+#
+# NOTE: per-shard compile-time-constant shapes (num_real_tokens,
+# padding_size, pre/post_a2a_buffer_shape) are NOT stored in this
+# dict; they are recomputed in _body_fwd/_body_bwd via
+# _compute_static_shape_info and passed as Python ints / int tuples to
+# the dispatch/combine helpers. Storing them in the dict would cause
+# JAX's pytree-flatten across the shard_map boundary to coerce them
+# into JitTracer 0-d arrays, which breaks Python-level control flow
+# (e.g. ``if padding > 0``) and ``jnp.zeros(shape)`` in the bwd.
 #
 # MoECtx (dict): values are jnp.ndarray / ScaledTensor unless noted
 #   Always present:
@@ -182,6 +187,86 @@ class PermutationBackend(Enum):
 #     "aux_logits_for_score"    [global_T, E] -- ditto, may be the
 #                                                gathered global logits
 #                                                or the local logits
+
+
+# =============================================================================
+# Static shape helper
+# =============================================================================
+#
+# A set of per-shard shape/size values that the dispatch and combine
+# helpers (both fwd and bwd) need. They're all derivable from existing
+# static args, so we recompute them in both ``_body_fwd`` and
+# ``_body_bwd`` and pass them as Python ints / int-tuples through
+# explicit kwargs. We MUST NOT stash them inside the dynamic
+# ``state`` / ``ctx`` dict: when the dict crosses the EP shard_map's
+# out_specs/in_specs boundary, JAX's pytree-flatten coerces any Python
+# int leaves into traced 0-d arrays, which then breaks dependent Python
+# code in the bwd (e.g. ``if padding > 0`` and ``jnp.zeros(shape)``).
+
+
+def _compute_static_shape_info(
+    *,
+    batch_size: int,
+    sequence_length: int,
+    hidden: int,
+    num_experts: int,
+    num_experts_per_tok: int,
+    align_size: int,
+    ep_active: bool,
+    num_ep: int = 1,
+    fsdp_sizes: Tuple[int, ...] = (),
+    recv_buffer_rows: int = 0,
+    batch_is_per_shard: bool = True,
+) -> dict:
+    """Compute per-shard compile-time-constant shape info used by both
+    dispatch/combine fwd and dispatch/combine bwd.
+
+    Returned dict has Python ints / int tuples (NOT jnp arrays) so the
+    caller can pass them as ordinary static keyword args. See the
+    module-level comment above for why this matters.
+
+    ``batch_is_per_shard`` controls whether ``batch_size`` is already
+    sharded (True -- e.g. when this is called from inside a shard_map
+    body, where ``x.shape[0]`` reports the per-shard batch size) or
+    global (False -- e.g. when computing from x.shape outside the
+    shard_map body).
+
+    Keys
+    ----
+    num_real_tokens : int
+        Per-shard count of real (non-padding) permuted tokens, i.e.
+        ``per_shard_num_tokens * num_experts_per_tok``.
+    padding_size : int
+        Per-shard number of alignment-padding tokens appended to the
+        sort buffer (``num_experts * (align_size - 1)`` when
+        ``align_size > 0``, else ``0``). Matches the convention used
+        by ``pure_jax_token_dispatch``.
+    pre_a2a_buffer_shape : tuple[int, int]
+        ``(num_real_tokens + padding_size, hidden)`` -- the per-shard
+        shape of the sorted-inputs buffer that is sent over the EP
+        ragged_all_to_all in the fwd direction.
+    post_a2a_buffer_shape : Optional[tuple[int, int]]
+        ``(recv_buffer_rows, hidden)`` when EP is active, ``None``
+        otherwise.
+    """
+    import math
+
+    if ep_active and not batch_is_per_shard:
+        dp_size = math.prod(fsdp_sizes) if fsdp_sizes else 1
+        per_shard_batch = batch_size // (num_ep * dp_size)
+    else:
+        per_shard_batch = batch_size
+    per_shard_num_tokens = per_shard_batch * sequence_length
+    num_real_tokens = per_shard_num_tokens * num_experts_per_tok
+    padding_size = num_experts * (align_size - 1) if align_size > 0 else 0
+    pre_a2a_buffer_shape = (num_real_tokens + padding_size, hidden)
+    post_a2a_buffer_shape = (recv_buffer_rows, hidden) if ep_active else None
+    return dict(
+        num_real_tokens=num_real_tokens,
+        padding_size=padding_size,
+        pre_a2a_buffer_shape=pre_a2a_buffer_shape,
+        post_a2a_buffer_shape=post_a2a_buffer_shape,
+    )
 
 
 # =============================================================================
@@ -239,9 +324,13 @@ def _dispatch(
             num_experts_per_tok=topk,
             align_size=align_size,
         )
+        # NOTE: ``perm_state.num_real_tokens`` and ``perm_state.padding_size``
+        # are compile-time Python ints; intentionally NOT stored in
+        # ``state`` (would be coerced to JitTracer 0-d arrays under
+        # the EP shard_map's pytree flatten). Recompute via
+        # ``_compute_static_shape_info`` in the bwd / EP-combine
+        # call sites that need them.
         state["sorted_indices"] = perm_state.sorted_indices
-        state["num_real_tokens"] = perm_state.num_real_tokens
-        state["padding_size"] = perm_state.padding_size
         state["routing_weights"] = routing_weights
     else:
         # TRITON backend -- inline the underlying primitive sequence
@@ -354,8 +443,11 @@ def _dispatch(
 
     state["all_shards_tokens_per_expert"] = all_shards_tokens_per_expert
     state["local_perm_row_id_map"] = local_perm_row_id_map
-    state["pre_a2a_buffer_shape"] = pre_a2a_buffer_shape
-    state["post_a2a_buffer_shape"] = post_a2a_buffer_shape
+    # NOTE: pre_a2a_buffer_shape and post_a2a_buffer_shape are compile-
+    # time int tuples; intentionally NOT stored in ``state`` (would be
+    # coerced to JitTracer 0-d arrays under the EP shard_map's pytree
+    # flatten). Recompute via ``_compute_static_shape_info`` in the
+    # bwd call sites that need them.
     # For EP, we override ``group_sizes`` to be the per-local-expert
     # counts (the FFN runs over E_local groups, not E). The original
     # global ``group_sizes`` lives inside ``all_shards_tokens_per_expert``
@@ -375,6 +467,12 @@ def _combine(
     sequence_length: int,
     dtype: jnp.dtype,
     num_experts_per_tok: int,
+    # Per-shard compile-time-constant shape info (Python ints / int tuples).
+    # Computed by _compute_static_shape_info in the caller, passed here
+    # rather than stored in ``state`` to survive shard_map crossings.
+    num_real_tokens: int,
+    padding_size: int,
+    pre_a2a_buffer_shape: Tuple[int, int],
     # EP-only:
     ep_axis: Optional[str],
     shard_id: Optional[jnp.ndarray] = None,
@@ -399,7 +497,7 @@ def _combine(
         in_off_r, send_sz_r, out_off_r, recv_sz_r = compute_reverse_ragged_all_to_all_params(
             state["all_shards_tokens_per_expert"], shard_id, num_ep
         )
-        send_back_buf = jnp.zeros(state["pre_a2a_buffer_shape"], dtype=expert_outputs.dtype)
+        send_back_buf = jnp.zeros(pre_a2a_buffer_shape, dtype=expert_outputs.dtype)
         expert_outputs = jax.lax.ragged_all_to_all(
             x_send_back,
             send_back_buf,
@@ -416,8 +514,8 @@ def _combine(
         # custom_vjp on its outer surface so we can call it freely.
         perm_state = PureJaxPermState(
             sorted_indices=state["sorted_indices"],
-            num_real_tokens=state["num_real_tokens"],
-            padding_size=state["padding_size"],
+            num_real_tokens=num_real_tokens,
+            padding_size=padding_size,
         )
         return pure_jax_token_combine(
             expert_outputs,
@@ -467,6 +565,12 @@ def _combine_bwd(
     dtype: jnp.dtype,
     num_experts: int,
     num_experts_per_tok: int,
+    # Per-shard compile-time-constant shape info (Python ints / int tuples).
+    # See ``_compute_static_shape_info`` and the note in ``_dispatch``
+    # for why these are kwargs rather than state-dict entries.
+    num_real_tokens: int,
+    padding_size: int,
+    post_a2a_buffer_shape: Optional[Tuple[int, int]],
     # EP-only:
     ep_axis: Optional[str],
     shard_id: Optional[jnp.ndarray] = None,
@@ -491,8 +595,8 @@ def _combine_bwd(
         # Hand-derive the bwd in plain JAX (no custom_vjp involved):
         unsort_indices = jnp.argsort(state["sorted_indices"])
         topk = num_experts_per_tok
-        num_real = state["num_real_tokens"]
-        padding = state["padding_size"]
+        num_real = num_real_tokens
+        padding = padding_size
         # Recover the unsorted intermediate that the fwd produced (we
         # need it for the d_routing_weights pullback). Apply the same
         # gather the fwd did.
@@ -576,9 +680,7 @@ def _combine_bwd(
     in_off_f, send_sz_f, out_off_f, recv_sz_f = compute_ragged_all_to_all_params(
         state["all_shards_tokens_per_expert"], shard_id, num_ep
     )
-    recv_buf_for_bwd = jnp.zeros(
-        state["post_a2a_buffer_shape"], dtype=d_expert_outputs_global.dtype
-    )
+    recv_buf_for_bwd = jnp.zeros(post_a2a_buffer_shape, dtype=d_expert_outputs_global.dtype)
     d_x_send_back = jax.lax.ragged_all_to_all(
         d_expert_outputs_global,
         recv_buf_for_bwd,
@@ -611,6 +713,12 @@ def _dispatch_bwd(
     ep_active: bool,
     num_experts: int,
     num_experts_per_tok: int,
+    # Per-shard compile-time-constant shape info (Python ints / int tuples).
+    # See ``_compute_static_shape_info`` and the note in ``_dispatch``
+    # for why these are kwargs rather than state-dict entries.
+    num_real_tokens: int,
+    padding_size: int,
+    pre_a2a_buffer_shape: Tuple[int, int],
     # EP-only:
     ep_axis: Optional[str],
     shard_id: Optional[jnp.ndarray] = None,
@@ -641,7 +749,7 @@ def _dispatch_bwd(
         in_off_r, send_sz_r, out_off_r, recv_sz_r = compute_reverse_ragged_all_to_all_params(
             state["all_shards_tokens_per_expert"], shard_id, num_ep
         )
-        recv_buf_pre = jnp.zeros(state["pre_a2a_buffer_shape"], dtype=d_x_recv.dtype)
+        recv_buf_pre = jnp.zeros(pre_a2a_buffer_shape, dtype=d_x_recv.dtype)
         d_sorted_x = jax.lax.ragged_all_to_all(
             d_x_recv,
             recv_buf_pre,
@@ -662,8 +770,8 @@ def _dispatch_bwd(
         #          d_replicated = d_padded[:num_real]
         #          d_inputs_2d  = d_replicated.reshape(T, topk, H).sum(axis=1)
         sorted_indices = state["sorted_indices"]
-        num_real = state["num_real_tokens"]
-        padding = state["padding_size"]
+        num_real = num_real_tokens
+        padding = padding_size
         topk = num_experts_per_tok
         unsort_indices = jnp.argsort(sorted_indices)
         d_padded = d_sorted_x[unsort_indices]
@@ -730,6 +838,7 @@ def _body_fwd(
     ep_active: bool,
     ep_axis: Optional[str],
     data_parallelism_axes: Tuple[str, ...],
+    fsdp_sizes: Tuple[int, ...],
     num_ep: int,
     num_experts_local: int,
     recv_buffer_rows: int,
@@ -923,6 +1032,22 @@ def _body_fwd(
         casted_wo_rhs_trans = casted_wo_rhs_trans.checkpoint(q_set_wo.kernel)
 
     # ---------------- Stage 5: combine ----------------
+    # Compute per-shard static shape info once and pass through both
+    # _combine and (later) the bwd helpers via kwargs -- never via the
+    # state dict, which gets pytree-flattened across shard_map and would
+    # coerce Python ints into JitTracer 0-d arrays.
+    _static_shape = _compute_static_shape_info(
+        batch_size=batch_size,
+        sequence_length=sequence_length,
+        hidden=hidden,
+        num_experts=num_experts,
+        num_experts_per_tok=num_experts_per_tok,
+        align_size=align_size,
+        ep_active=ep_active,
+        num_ep=num_ep,
+        fsdp_sizes=fsdp_sizes,
+        recv_buffer_rows=recv_buffer_rows,
+    )
     output = _combine(
         expert_outputs,
         dispatch_state,
@@ -932,6 +1057,9 @@ def _body_fwd(
         sequence_length=sequence_length,
         dtype=dtype,
         num_experts_per_tok=num_experts_per_tok,
+        num_real_tokens=_static_shape["num_real_tokens"],
+        padding_size=_static_shape["padding_size"],
+        pre_a2a_buffer_shape=_static_shape["pre_a2a_buffer_shape"],
         ep_axis=ep_axis,
         shard_id=shard_id,
         num_ep=num_ep,
@@ -1012,6 +1140,42 @@ def _body_bwd(
     batch_size, sequence_length, hidden = x_shape
     shard_id = jax.lax.axis_index(ep_axis) if ep_active else None
 
+    # Recompute per-shard static shape info from existing statics
+    # (Python ints / int tuples). Plumbed via kwargs to _combine_bwd
+    # and _dispatch_bwd -- NOT through the ctx dict, because the
+    # dict gets pytree-flattened across the bwd shard_map's in_specs
+    # and Python ints would be coerced into JitTracer 0-d arrays
+    # (breaking ``if padding > 0`` and ``jnp.zeros(shape)`` callsites).
+    # ``batch_size`` here is the GLOBAL batch size (captured in
+    # ``x_shape`` by the outer fwd rule), hence ``batch_is_per_shard=False``.
+    _static_shape = _compute_static_shape_info(
+        batch_size=batch_size,
+        sequence_length=sequence_length,
+        hidden=hidden,
+        num_experts=num_experts,
+        num_experts_per_tok=num_experts_per_tok,
+        align_size=align_size,
+        ep_active=ep_active,
+        num_ep=num_ep,
+        fsdp_sizes=fsdp_sizes,
+        recv_buffer_rows=recv_buffer_rows,
+        batch_is_per_shard=False,
+    )
+
+    # Compute per-shard input shape: under the EP shard_map body, the
+    # gradient tensors live at per-shard shape, so the dispatch_bwd
+    # reshape target and ``d_x_from_dispatch.reshape(x_shape)`` below
+    # must use the per-shard shape rather than the captured global
+    # ``x_shape``.
+    if ep_active:
+        import math as _math  # local import keeps the no-EP path zero-overhead.
+
+        dp_size = _math.prod(fsdp_sizes) if fsdp_sizes else 1
+        per_shard_batch = batch_size // (num_ep * dp_size)
+        per_shard_x_shape: Tuple[int, ...] = (per_shard_batch, sequence_length, hidden)
+    else:
+        per_shard_x_shape = x_shape
+
     # ---------------- Combine bwd ----------------
     d_expert_outputs, d_routing_weights = _combine_bwd(
         d_output,
@@ -1024,6 +1188,9 @@ def _body_bwd(
         dtype=dtype,
         num_experts=num_experts,
         num_experts_per_tok=num_experts_per_tok,
+        num_real_tokens=_static_shape["num_real_tokens"],
+        padding_size=_static_shape["padding_size"],
+        post_a2a_buffer_shape=_static_shape["post_a2a_buffer_shape"],
         ep_axis=ep_axis,
         shard_id=shard_id,
         num_ep=num_ep,
@@ -1091,7 +1258,7 @@ def _body_bwd(
     d_sorted_x = d_sorted_x_from_w0 + d_sorted_x_from_w1
 
     # ---------------- Dispatch bwd ----------------
-    inputs_2d_shape = (x_shape[0] * x_shape[1], hidden)
+    inputs_2d_shape = (per_shard_x_shape[0] * per_shard_x_shape[1], hidden)
     d_inputs_2d = _dispatch_bwd(
         d_sorted_x,
         ctx["dispatch"],
@@ -1100,11 +1267,14 @@ def _body_bwd(
         ep_active=ep_active,
         num_experts=num_experts,
         num_experts_per_tok=num_experts_per_tok,
+        num_real_tokens=_static_shape["num_real_tokens"],
+        padding_size=_static_shape["padding_size"],
+        pre_a2a_buffer_shape=_static_shape["pre_a2a_buffer_shape"],
         ep_axis=ep_axis,
         shard_id=shard_id,
         num_ep=num_ep,
     )
-    d_x_from_dispatch = d_inputs_2d.reshape(x_shape)
+    d_x_from_dispatch = d_inputs_2d.reshape(per_shard_x_shape)
 
     # ---------------- Routing bwd ----------------
     # The probs cotangent comes from _combine_bwd. For PURE_JAX it's the
@@ -1196,7 +1366,7 @@ def _body_bwd(
         d_logits_2d = d_logits_2d_main
 
     # ---------------- Gate bwd ----------------
-    d_gate_logits = d_logits_2d.reshape(x_shape[0], x_shape[1], num_experts)
+    d_gate_logits = d_logits_2d.reshape(per_shard_x_shape[0], per_shard_x_shape[1], num_experts)
     gate_kernel_cast = ctx["gate_kernel"].astype(ctx["x"].dtype)
     d_x_from_gate = jnp.einsum("bse,he->bsh", d_gate_logits, gate_kernel_cast)
     d_gate_kernel = jnp.einsum("bsh,bse->he", ctx["x"], d_gate_logits).astype(
@@ -1265,9 +1435,6 @@ def _build_dispatch_specs(
     if backend is PermutationBackend.PURE_JAX:
         specs["sorted_indices"] = P()
         specs["routing_weights"] = P()
-        # Python-side scalars come back via the dict too; declare them P().
-        specs["num_real_tokens"] = P()
-        specs["padding_size"] = P()
     else:
         specs["row_id_map"] = P()
         specs["pad_offsets"] = P()
@@ -1275,8 +1442,9 @@ def _build_dispatch_specs(
     if ep_active:
         specs["all_shards_tokens_per_expert"] = P()
         specs["local_perm_row_id_map"] = P()
-        specs["pre_a2a_buffer_shape"] = P()
-        specs["post_a2a_buffer_shape"] = P()
+    # NOTE: per-shard compile-time-constant shape info
+    # (num_real_tokens, padding_size, pre/post_a2a_buffer_shape)
+    # is intentionally NOT in the state dict; see _compute_static_shape_info.
     return specs
 
 
@@ -1347,6 +1515,20 @@ def _build_grads_specs(
 
 
 def _moe_fwd_rule(
+    # IMPORTANT — calling convention for jax.custom_vjp fwd rule.
+    #
+    # JAX uses ``_argnums_partial`` (jax/_src/api_util.py) when wiring up
+    # the fwd rule. That helper preserves the ORIGINAL positional order
+    # of the decorated function: dyn (= diff) args sit at their original
+    # positions and static (= nondiff) args fill the remaining slots in
+    # nondiff_argnums order. So the fwd rule MUST take args in the
+    # SAME positional order as ``_moe`` -- diff first (positions 0..8),
+    # then nondiff (positions 9..28), all POSITIONAL (no ``*,`` -- they
+    # arrive as positional, not as kwargs).
+    #
+    # NOTE: this is the OPPOSITE convention from ``_moe_bwd_rule``, which
+    # uses ``prepend_static_args`` -- there the static args come FIRST,
+    # followed by ``ctx`` and ``dy_pair``.
     x,
     gate_kernel,
     wi_0,
@@ -1356,7 +1538,6 @@ def _moe_fwd_rule(
     wi_1_bias,
     wo_bias,
     expert_bias,
-    *,
     num_experts,
     num_experts_per_tok,
     activation_type,
@@ -1419,6 +1600,7 @@ def _moe_fwd_rule(
             captured,
             **body_kwargs,
             ep_active=False,
+            fsdp_sizes=(),
             num_ep=1,
             num_experts_local=num_experts,
             recv_buffer_rows=0,
@@ -1480,11 +1662,14 @@ def _moe_fwd_rule(
         aux_loss_enabled=(aux_loss_coeff > 0.0),
     )
 
+    _fsdp_sizes: Tuple[int, ...] = tuple(mesh.shape[ax] for ax in data_parallelism_axes)
+
     def _shardmap_body(captured_local):
         return _body_fwd(
             captured_local,
             **body_kwargs,
             ep_active=True,
+            fsdp_sizes=_fsdp_sizes,
             num_ep=num_ep,
             num_experts_local=num_experts_local,
             recv_buffer_rows=recv_buffer_rows,
@@ -1679,6 +1864,10 @@ def _moe(
     quantizer_sets,
     dtype,
 ):
+    # Call in `_moe`'s own signature order to match what JAX will pass
+    # the fwd rule via ``_argnums_partial``. See the comment block at
+    # the top of ``_moe_fwd_rule`` for why this differs from
+    # ``_moe_bwd_rule``'s convention.
     output_pair, _ = _moe_fwd_rule(
         x,
         gate_kernel,
@@ -1689,26 +1878,26 @@ def _moe(
         wi_1_bias,
         wo_bias,
         expert_bias,
-        num_experts=num_experts,
-        num_experts_per_tok=num_experts_per_tok,
-        activation_type=activation_type,
-        score_function=score_function,
-        use_pre_softmax=use_pre_softmax,
-        num_groups=num_groups,
-        group_topk=group_topk,
-        scaling_factor=scaling_factor,
-        aux_loss_coeff=aux_loss_coeff,
-        permutation_backend=permutation_backend,
-        align_size=align_size,
-        gate_inside_vjp=gate_inside_vjp,
-        ep_axis=ep_axis,
-        data_parallelism_axes=data_parallelism_axes,
-        input_axes=input_axes,
-        gate_kernel_axes=gate_kernel_axes,
-        wi_kernel_axes=wi_kernel_axes,
-        wo_kernel_axes=wo_kernel_axes,
-        quantizer_sets=quantizer_sets,
-        dtype=dtype,
+        num_experts,
+        num_experts_per_tok,
+        activation_type,
+        score_function,
+        use_pre_softmax,
+        num_groups,
+        group_topk,
+        scaling_factor,
+        aux_loss_coeff,
+        permutation_backend,
+        align_size,
+        gate_inside_vjp,
+        ep_axis,
+        data_parallelism_axes,
+        input_axes,
+        gate_kernel_axes,
+        wi_kernel_axes,
+        wo_kernel_axes,
+        quantizer_sets,
+        dtype,
     )
     return output_pair
 
@@ -1768,6 +1957,12 @@ def moe(
         raise TypeError(
             f"permutation_backend must be a PermutationBackend, got {permutation_backend!r}"
         )
+    # Normalize string score_function ("softmax" / "sigmoid") to the
+    # ScoreFunction enum once here. The underlying primitive
+    # ``tex.fused_topk_with_score_function_fwd`` expects an int-coercible
+    # value (the enum has integer .value), and the public router wrapper
+    # we bypass also normalizes here.
+    score_function = _validate_score_function(score_function)
 
     output, aux_loss = _moe(
         x,

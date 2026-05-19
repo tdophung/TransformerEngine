@@ -4,12 +4,53 @@
 
 """Efficient Permutation kernels written with OpenAI Triton."""
 
+import os
+
 import triton
 import triton.language as tl
 
 from triton.language import core
 from triton.language.standard import _log2
 from packaging import version
+
+
+_PERMUTATION_AUTOTUNE_BLOCK_SIZES = (64, 128, 256, 512, 1024, 2048, 4096)
+
+
+def _permutation_autotune_configs():
+    """Build the autotune ``configs`` list shared by every permutation
+    Triton kernel below.
+
+    Honours the ``NVTE_TRITON_PERMUTATION_BLOCK_SIZES`` environment
+    variable (comma-separated list of ints) so callers can shrink the
+    autotune space for tests / CI. With a single value the kernel
+    effectively skips autotuning entirely -- useful for the MoE VJP
+    smoke suite, which only cares about correctness and would otherwise
+    pay several minutes of cold-start MLIR->LLVM->PTX->cubin compile per
+    config-per-kernel. The default (unset) preserves the original
+    7-config sweep used in production.
+
+    Raises ``ValueError`` on a malformed env var so silent typos can't
+    accidentally pin everyone to a single suboptimal config in
+    production.
+    """
+    override = os.environ.get("NVTE_TRITON_PERMUTATION_BLOCK_SIZES")
+    if override:
+        try:
+            block_sizes = tuple(int(s) for s in override.split(",") if s.strip())
+        except ValueError as e:
+            raise ValueError(
+                "NVTE_TRITON_PERMUTATION_BLOCK_SIZES must be a comma-"
+                f"separated list of ints, got: {override!r}"
+            ) from e
+        if not block_sizes:
+            raise ValueError(
+                "NVTE_TRITON_PERMUTATION_BLOCK_SIZES is set but parsed empty;"
+                f" raw value was {override!r}"
+            )
+    else:
+        block_sizes = _PERMUTATION_AUTOTUNE_BLOCK_SIZES
+    return [triton.Config({"BLOCK_SIZE": bs}) for bs in block_sizes]
 
 
 # The following three argsort related kernels are adapted from
@@ -295,15 +336,7 @@ def _permute_kernel(
 
 try:
     _permute_kernel = triton.autotune(
-        configs=[
-            triton.Config({"BLOCK_SIZE": 64}),
-            triton.Config({"BLOCK_SIZE": 128}),
-            triton.Config({"BLOCK_SIZE": 256}),
-            triton.Config({"BLOCK_SIZE": 512}),
-            triton.Config({"BLOCK_SIZE": 1024}),
-            triton.Config({"BLOCK_SIZE": 2048}),
-            triton.Config({"BLOCK_SIZE": 4096}),
-        ],
+        configs=_permutation_autotune_configs(),
         key=["hidden_size"],
     )(_permute_kernel)
 except RuntimeError:
@@ -416,15 +449,7 @@ def _unpermute_kernel(
 
 try:
     _unpermute_kernel = triton.autotune(
-        configs=[
-            triton.Config({"BLOCK_SIZE": 64}),
-            triton.Config({"BLOCK_SIZE": 128}),
-            triton.Config({"BLOCK_SIZE": 256}),
-            triton.Config({"BLOCK_SIZE": 512}),
-            triton.Config({"BLOCK_SIZE": 1024}),
-            triton.Config({"BLOCK_SIZE": 2048}),
-            triton.Config({"BLOCK_SIZE": 4096}),
-        ],
+        configs=_permutation_autotune_configs(),
         key=["hidden_size"],
     )(_unpermute_kernel)
 except RuntimeError:
@@ -525,15 +550,7 @@ def _unpermute_bwd_with_merging_probs_kernel(
 
 try:
     _unpermute_bwd_with_merging_probs_kernel = triton.autotune(
-        configs=[
-            triton.Config({"BLOCK_SIZE": 64}),
-            triton.Config({"BLOCK_SIZE": 128}),
-            triton.Config({"BLOCK_SIZE": 256}),
-            triton.Config({"BLOCK_SIZE": 512}),
-            triton.Config({"BLOCK_SIZE": 1024}),
-            triton.Config({"BLOCK_SIZE": 2048}),
-            triton.Config({"BLOCK_SIZE": 4096}),
-        ],
+        configs=_permutation_autotune_configs(),
         key=["hidden_size"],
     )(_unpermute_bwd_with_merging_probs_kernel)
 except RuntimeError:
@@ -643,15 +660,7 @@ def _sort_chunks_by_map_kernel(
 
 try:
     _sort_chunks_by_map_kernel = triton.autotune(
-        configs=[
-            triton.Config({"BLOCK_SIZE": 64}),
-            triton.Config({"BLOCK_SIZE": 128}),
-            triton.Config({"BLOCK_SIZE": 256}),
-            triton.Config({"BLOCK_SIZE": 512}),
-            triton.Config({"BLOCK_SIZE": 1024}),
-            triton.Config({"BLOCK_SIZE": 2048}),
-            triton.Config({"BLOCK_SIZE": 4096}),
-        ],
+        configs=_permutation_autotune_configs(),
         key=["hidden_size"],
     )(_sort_chunks_by_map_kernel)
 except RuntimeError:
