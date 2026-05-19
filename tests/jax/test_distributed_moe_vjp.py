@@ -193,9 +193,7 @@ if _compile_cache_dir:
     # autotune + compile artifacts also survive across runs. Massive
     # win on cold-start because every triton.autotune kernel evaluates
     # ~7 BLOCK_SIZE configs by compiling and timing each on the GPU.
-    os.environ.setdefault(
-        "TRITON_CACHE_DIR", os.path.join(_compile_cache_dir, "triton")
-    )
+    os.environ.setdefault("TRITON_CACHE_DIR", os.path.join(_compile_cache_dir, "triton"))
 
 
 NUM_DEVICES_REQUIRED = 4

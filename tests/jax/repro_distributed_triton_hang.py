@@ -104,11 +104,13 @@ def main():
         sort_chunks_by_map,
         make_chunk_sort_map,
     )
+
     _log("imports done")
 
     def _make_block(backend):
         return MoEBlock(
-            num_experts=E, num_experts_per_tok=K,
+            num_experts=E,
+            num_experts_per_tok=K,
             intermediate_size=INTER,
             permutation_backend=backend,
             data_parallelism_axes=(FSDP_AXIS,),
@@ -151,17 +153,12 @@ def main():
     # -----------------------------------------------------------------
     T_per_shard = (BATCH // (EP * FSDP)) * SEQ  # 2*32 = 64
     NUM_OUT_PER_SHARD = T_per_shard * K  # 128
-    _log(
-        f"phase 3 prep: per-shard T={T_per_shard} num_out={NUM_OUT_PER_SHARD} "
-        f"H={HIDDEN} E={E}"
-    )
+    _log(f"phase 3 prep: per-shard T={T_per_shard} num_out={NUM_OUT_PER_SHARD} H={HIDDEN} E={E}")
 
     rng = jax.random.PRNGKey(42)
     rng_r, rng_x = jax.random.split(rng)
     # Build a fake routing map sharded over batch.
-    routing_map_full = jax.random.bernoulli(
-        rng_r, p=K / E, shape=(BATCH * SEQ, E)
-    )
+    routing_map_full = jax.random.bernoulli(rng_r, p=K / E, shape=(BATCH * SEQ, E))
     x_2d_full = jax.random.normal(rng_x, (BATCH * SEQ, HIDDEN), dtype=DTYPE)
 
     spec_batch = P((EP_AXIS, FSDP_AXIS), None)
@@ -172,9 +169,7 @@ def main():
         routing_map_full = jax.lax.with_sharding_constraint(
             routing_map_full, NamedSharding(mesh, spec_batch)
         )
-        x_2d_full = jax.lax.with_sharding_constraint(
-            x_2d_full, NamedSharding(mesh, spec_batch)
-        )
+        x_2d_full = jax.lax.with_sharding_constraint(x_2d_full, NamedSharding(mesh, spec_batch))
 
         # --- 3a: make_row_id_map per shard ---
         _log("phase 3a: make_row_id_map under shard_map (jit'd)")
@@ -183,10 +178,13 @@ def main():
         def _fn_3a(rmap):
             def body(rmap_local):
                 return make_row_id_map(rmap_local, T_per_shard, E)
+
             return shard_map(
-                body, mesh=mesh,
+                body,
+                mesh=mesh,
                 in_specs=(spec_batch,),
-                out_specs=spec_batch, check_rep=False,
+                out_specs=spec_batch,
+                check_rep=False,
             )(rmap)
 
         row_id_map_full = _fn_3a(routing_map_full)
@@ -200,14 +198,22 @@ def main():
         def _fn_3b(x2d, rmap_ids):
             def body(x2d_l, rmap_ids_l):
                 sorted_x, _ = permute_with_mask_map(
-                    x2d_l, rmap_ids_l, None,
-                    T_per_shard, E, NUM_OUT_PER_SHARD, HIDDEN,
+                    x2d_l,
+                    rmap_ids_l,
+                    None,
+                    T_per_shard,
+                    E,
+                    NUM_OUT_PER_SHARD,
+                    HIDDEN,
                 )
                 return sorted_x
+
             return shard_map(
-                body, mesh=mesh,
+                body,
+                mesh=mesh,
                 in_specs=(spec_batch, spec_batch),
-                out_specs=spec_batch, check_rep=False,
+                out_specs=spec_batch,
+                check_rep=False,
             )(x2d, rmap_ids)
 
         sorted_x_full = _fn_3b(x_2d_full, row_id_map_full)
@@ -231,12 +237,18 @@ def main():
             def body(sx_l):
                 recv = jnp.zeros((recv_rows, HIDDEN), dtype=sx_l.dtype)
                 return jax.lax.ragged_all_to_all(
-                    sx_l, recv,
-                    send_offsets, send_sizes, recv_offsets, recv_sizes,
+                    sx_l,
+                    recv,
+                    send_offsets,
+                    send_sizes,
+                    recv_offsets,
+                    recv_sizes,
                     axis_name=EP_AXIS,
                 )
+
             return shard_map(
-                body, mesh=mesh,
+                body,
+                mesh=mesh,
                 in_specs=spec_batch,
                 out_specs=P((EP_AXIS, FSDP_AXIS), None),
                 check_rep=False,
@@ -276,7 +288,10 @@ def main():
             x, NamedSharding(mesh, P((EP_AXIS, FSDP_AXIS), None, None))
         )
         variables_tr = jax.jit(block_tr.init)(jax.random.PRNGKey(1), x_sh)
-        jax.tree.map(lambda v: v.value.block_until_ready() if hasattr(v, "value") else v.block_until_ready(), variables_tr)
+        jax.tree.map(
+            lambda v: v.value.block_until_ready() if hasattr(v, "value") else v.block_until_ready(),
+            variables_tr,
+        )
     _log("phase 4b: done")
 
     # -----------------------------------------------------------------

@@ -41,6 +41,7 @@ def main():
         unpermute_with_mask_map,
     )
     from transformer_engine.jax import cpp_extensions as tex
+
     _log("imports: done")
 
     key = jax.random.PRNGKey(0)
@@ -90,6 +91,7 @@ def main():
     # -----------------------------------------------------------------
     _log("phase 4: grouped_quantize + grouped_gemm (eager)")
     from transformer_engine.jax.quantize import noop_quantizer_set, TensorUsage
+
     group_sizes = jnp.full((E,), T * K // E, dtype=jnp.int32)
     cs = tex.grouped_quantize(sorted_x, noop_quantizer_set.x, group_sizes, flatten_axis=-1)
     cw = tex.grouped_quantize(wi_0, noop_quantizer_set.kernel, flatten_axis=-1)
@@ -106,12 +108,21 @@ def main():
     # -----------------------------------------------------------------
     _log("phase 5: full triton forward (eager, no jit, no grad)")
     out_te, _ = moe(
-        x, gate_kernel, wi_0, wi_1, wo,
-        num_experts=E, num_experts_per_tok=K,
-        activation_type="silu", score_function="softmax",
-        use_pre_softmax=False, scaling_factor=1.0, aux_loss_coeff=0.0,
+        x,
+        gate_kernel,
+        wi_0,
+        wi_1,
+        wo,
+        num_experts=E,
+        num_experts_per_tok=K,
+        activation_type="silu",
+        score_function="softmax",
+        use_pre_softmax=False,
+        scaling_factor=1.0,
+        aux_loss_coeff=0.0,
         permutation_backend=PermutationBackend.TRITON,
-        align_size=0, dtype=DTYPE,
+        align_size=0,
+        dtype=DTYPE,
     )
     out_te.block_until_ready()
     _log(f"phase 5: done -- out_te.shape={out_te.shape}")
@@ -120,15 +131,25 @@ def main():
     # Phase 6: jit'd forward.
     # -----------------------------------------------------------------
     _log("phase 6: full triton forward (jit'd)")
+
     @jax.jit
     def _fwd(x, gate_kernel, wi_0, wi_1, wo):
         return moe(
-            x, gate_kernel, wi_0, wi_1, wo,
-            num_experts=E, num_experts_per_tok=K,
-            activation_type="silu", score_function="softmax",
-            use_pre_softmax=False, scaling_factor=1.0, aux_loss_coeff=0.0,
+            x,
+            gate_kernel,
+            wi_0,
+            wi_1,
+            wo,
+            num_experts=E,
+            num_experts_per_tok=K,
+            activation_type="silu",
+            score_function="softmax",
+            use_pre_softmax=False,
+            scaling_factor=1.0,
+            aux_loss_coeff=0.0,
             permutation_backend=PermutationBackend.TRITON,
-            align_size=0, dtype=DTYPE,
+            align_size=0,
+            dtype=DTYPE,
         )
 
     out_te2, _ = _fwd(x, gate_kernel, wi_0, wi_1, wo)
@@ -139,18 +160,24 @@ def main():
     # Phase 7: jit'd grad (this is what test_grads_finite_and_nonzero hits).
     # -----------------------------------------------------------------
     _log("phase 7: jit'd grad of mean(out**2)")
+
     @jax.jit
     def _grad_loss(x, gate_kernel, wi_0, wi_1, wo):
         def loss(*args):
             o, _ = moe(
                 *args,
-                num_experts=E, num_experts_per_tok=K,
-                activation_type="silu", score_function="softmax",
-                use_pre_softmax=False, scaling_factor=1.0, aux_loss_coeff=0.0,
+                num_experts=E,
+                num_experts_per_tok=K,
+                activation_type="silu",
+                score_function="softmax",
+                use_pre_softmax=False,
+                scaling_factor=1.0,
+                aux_loss_coeff=0.0,
                 permutation_backend=PermutationBackend.TRITON,
-                align_size=0, dtype=DTYPE,
+                align_size=0,
+                dtype=DTYPE,
             )
-            return jnp.mean(o ** 2)
+            return jnp.mean(o**2)
 
         return jax.grad(loss, argnums=(1, 2, 3, 4))(x, gate_kernel, wi_0, wi_1, wo)
 
