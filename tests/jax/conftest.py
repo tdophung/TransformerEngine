@@ -86,6 +86,20 @@ class TestTimingPlugin:
         print("=" * 80)
 
 
+def pytest_addoption(parser):
+    """CLI options for multiprocess JAX tests.
+
+    Mirrors examples/jax/encoder/conftest.py so multiprocess tests in
+    tests/jax/ can be launched one-process-per-GPU via a sibling shell
+    script. Required by tests/jax/test_multiprocess_moe_vjp.py to work
+    around the JAX/XLA + lazy Triton kernel load + active NCCL deadlock
+    documented in past_JAX_XLA_deadlock.txt and nvbug/5564750. Harmless
+    for other tests; defaults to 0 (= "not a multiprocess launch").
+    """
+    parser.addoption("--num-process", action="store", default=0)
+    parser.addoption("--process-id", action="store", default=0)
+
+
 def pytest_configure(config):
     config.addinivalue_line(
         "markers",
