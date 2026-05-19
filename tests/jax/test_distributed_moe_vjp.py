@@ -179,12 +179,12 @@ except (AttributeError, ValueError):
 
 _WATCHDOG_SECS = int(os.environ.get("MOE_VJP_WATCHDOG_SECS", "0") or "0")
 if _WATCHDOG_SECS > 0:
-    # all_threads=True dumps Python frames for every thread, not just
-    # MainThread. JAX/XLA spawns a backing ThreadPool for async dispatch
-    # (and one per device for stream coordination); when MainThread is
-    # parked in _pjit_call_impl_python those worker threads are exactly
-    # where the hang lives.
-    faulthandler.dump_traceback_later(_WATCHDOG_SECS, repeat=True, all_threads=True)
+    # dump_traceback_later already dumps every Python thread by default
+    # (the keyword arg `all_threads` does NOT exist on this function --
+    # don't be fooled by faulthandler.register which has one). XLA's
+    # worker threads are C++ only and won't appear here; for those use
+    # py-spy or gdb if a future hang needs deeper investigation.
+    faulthandler.dump_traceback_later(_WATCHDOG_SECS, repeat=True)
 
 import jax
 import jax.numpy as jnp
