@@ -77,6 +77,23 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 export XLA_PYTHON_CLIENT_PREALLOCATE="${XLA_PYTHON_CLIENT_PREALLOCATE:-false}"
 export XLA_PYTHON_CLIENT_MEM_FRACTION="${XLA_PYTHON_CLIENT_MEM_FRACTION:-0.5}"
 
+# CUDA_LAUNCH_BLOCKING=1 forces every CUDA launch synchronous. Without
+# this the bwd of the triton backend hangs: MainThread parks in
+# _pjit_call_impl_python, one GPU pinned at 100%, no NCCL ops enqueued.
+# The root cause is an XLA dependency edge that is mis-tracked between
+# our Triton kernels (which use input_output_aliases on a pre-zeroed
+# output buffer) and the downstream NCCL ragged_all_to_all -- the
+# all_to_all launches before the triton kernel finishes writing
+# sorted_inputs, and different ranks then read different versions of
+# the per-expert token counts, deadlocking NCCL. Empirically:
+# CUDA_LAUNCH_BLOCKING=1 makes the smoke suite pass in <1 min across 3
+# consecutive runs; without it, all triton experiments hang at 300+ s.
+# Slowdown for these correctness tests is ~negligible (small shapes).
+# TODO(teddy/moe_block): replace this workaround with a fix in
+# triton_call_lowering (or moe.py inserting an explicit data-dep edge)
+# and remove this export.
+export CUDA_LAUNCH_BLOCKING="${CUDA_LAUNCH_BLOCKING:-1}"
+
 echo "============================================================"
 echo "MoE VJP distributed tests (dev wrapper; CI: qa/L0_jax_distributed_unittest/test.sh)"
 echo "  mode                : $mode"
@@ -86,6 +103,7 @@ echo "  CUDA_VISIBLE_DEVICES: $CUDA_VISIBLE_DEVICES"
 echo "  test file           : $TEST_FILE"
 echo "  XLA_PYTHON_CLIENT_PREALLOCATE: $XLA_PYTHON_CLIENT_PREALLOCATE"
 echo "  XLA_PYTHON_CLIENT_MEM_FRACTION: $XLA_PYTHON_CLIENT_MEM_FRACTION"
+echo "  CUDA_LAUNCH_BLOCKING: $CUDA_LAUNCH_BLOCKING"
 echo "  PYTEST_EXTRA_ARGS   : ${PYTEST_EXTRA_ARGS:-<unset>}"
 echo "============================================================"
 

@@ -38,19 +38,26 @@ TE_PATH=$TE_PATH bash $TE_PATH/examples/jax/collective_gemm/run_test_cgemm.sh ||
 wait
 
 # MoE custom_vjp distributed (Level 2 smoke + Level 3 perf). Single-host
-# multi-GPU; requires >=4 visible GPUs. The ``-p no:typeguard`` is REQUIRED:
-# jaxtyping's pytest plugin auto-loads typeguard, whose @typechecked import
-# hook materialises JAX tracers via isinstance() checks and deadlocks the
-# first ``block.apply`` of the triton backend inside shard_map +
-# ragged_all_to_all. See CLAUDE.md ("pytest + typeguard deadlocks
-# distributed Triton MoE tests") and tests/jax/test_distributed_moe_vjp.py
-# module docstring for the bisection record. Other jax tests must keep
-# typeguard active for type-hint validation, so we only disable it for this
-# specific invocation rather than in pytest.ini.
+# multi-GPU; requires >=4 visible GPUs.
 #
-# XLA_PYTHON_CLIENT_PREALLOCATE=false ensures NCCL can allocate communicator
-# buffers (default 90% preallocation starves the EP all-to-all setup).
+# Flags required for this file (mirrored in tests/jax/run_distributed_moe_vjp.sh):
+#
+# * ``-p no:typeguard`` — jaxtyping's pytest plugin auto-loads typeguard,
+#   whose @typechecked import hook materialises JAX tracers via isinstance()
+#   checks during shard_map tracing. We disable it only here (other jax tests
+#   need it for type-hint validation).
+# * ``XLA_PYTHON_CLIENT_PREALLOCATE=false`` + ``MEM_FRACTION=0.5`` —
+#   prevents NCCL OOM during EP all-to-all communicator setup (default 90%
+#   preallocation leaves no room).
+# * ``CUDA_LAUNCH_BLOCKING=1`` — workaround for an async-dispatch hang
+#   between Triton custom_calls with ``input_output_aliases`` and the
+#   downstream NCCL ragged_all_to_all in this test's bwd path. Without it,
+#   MainThread parks in _pjit_call_impl_python and one GPU pins at 100%
+#   forever. With it, the smoke suite passes in <1 min. See
+#   ``tests/jax/test_distributed_moe_vjp.py`` module docstring for the
+#   bisection record and TODO for the proper fix.
 XLA_PYTHON_CLIENT_PREALLOCATE=false XLA_PYTHON_CLIENT_MEM_FRACTION=0.5 \
+    CUDA_LAUNCH_BLOCKING=1 \
     python3 -m pytest -c $TE_PATH/tests/jax/pytest.ini -v -s \
     -p no:typeguard \
     --junitxml=$XML_LOG_DIR/pytest_test_distributed_moe_vjp.xml \
