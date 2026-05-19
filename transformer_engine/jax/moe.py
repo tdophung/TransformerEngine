@@ -106,9 +106,7 @@ def _read_moe_opt_barrier_flag() -> bool:
     try:
         return bool(int(val))
     except ValueError as e:
-        raise ValueError(
-            f"NVTE_MOE_OPT_BARRIER must be an integer (0 or 1), got: {val!r}"
-        ) from e
+        raise ValueError(f"NVTE_MOE_OPT_BARRIER must be an integer (0 or 1), got: {val!r}") from e
 
 
 _NVTE_MOE_OPT_BARRIER = _read_moe_opt_barrier_flag()
