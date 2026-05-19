@@ -35,12 +35,14 @@ Dev-loop invocation (thin shim around the same pytest command):
 
     bash tests/jax/run_distributed_moe_vjp.sh smoke
 
-Both scripts apply ``-p no:typeguard`` -- see "CRITICAL" below.
+Both scripts apply ``-p no:typeguard`` AND ``CUDA_LAUNCH_BLOCKING=1`` --
+see "CRITICAL" below.
 
 Raw pytest invocation (do NOT use this in CI; only for one-off dev
-work where you understand the typeguard gotcha):
+work where you understand the gotchas):
 
-    XLA_PYTHON_CLIENT_PREALLOCATE=false XLA_PYTHON_CLIENT_MEM_FRACTION=0.5 \
+    CUDA_LAUNCH_BLOCKING=1 \
+        XLA_PYTHON_CLIENT_PREALLOCATE=false XLA_PYTHON_CLIENT_MEM_FRACTION=0.5 \
         python -m pytest -c tests/jax/pytest.ini -v -s \
         -p no:typeguard \
         tests/jax/test_distributed_moe_vjp.py
@@ -48,52 +50,69 @@ work where you understand the typeguard gotcha):
 The combination of ``XLA_PYTHON_CLIENT_PREALLOCATE=false`` (set at the
 top of this file) and tests deliberately structured so each
 parametrize variant only compiles the MoE custom_vjp once means a
-single process runs the entire smoke suite in well under a minute.
+single process runs the entire smoke suite in well under a minute,
+even with CUDA_LAUNCH_BLOCKING=1.
 
-CRITICAL: ``-p no:typeguard`` is REQUIRED
------------------------------------------
+CRITICAL: ``CUDA_LAUNCH_BLOCKING=1`` is REQUIRED
+------------------------------------------------
 
-If pytest's typeguard plugin is active (it is auto-loaded via
-``jaxtyping``'s pytest entry point on most TE dev environments), the
-runtime ``@typechecked`` shim that wraps every TE / jax / flax
-callable will deadlock the first ``block.apply`` of the triton
-backend: one GPU pins at 100%, three GPUs sit idle, no NCCL ops are
-ever enqueued, and the Python MainThread parks in
-``_pjit_call_impl_python``. The typeguard wrapper appears to either
-materialise JAX tracers via ``isinstance`` checks during shard_map
-tracing, or holds the GIL long enough to break the async-dispatch
-pipeline that the MoE custom_vjp + Triton kernels +
-``ragged_all_to_all`` rely on. The standalone equivalent of this test
-(``tests/jax/standalone_smoke_triton.py``) runs in ~3s with no
-pytest plugins active; under pytest with typeguard it hangs forever.
+Without ``CUDA_LAUNCH_BLOCKING=1`` the bwd of the triton backend hangs
+forever: MainThread parks in ``_pjit_call_impl_python``, one GPU pins
+at 100%, three GPUs sit idle, no NCCL ops are ever enqueued.
+
+Root cause: an async-dispatch race between our Triton custom_calls and
+the downstream NCCL collectives in the same shard_map body. Our
+permute/unpermute Triton kernels use ``input_output_aliases`` on a
+pre-zeroed output buffer (see
+``transformer_engine/jax/triton_extensions/permutation.py`` ::
+``PermuteWithMaskMapPrimitive`` / ``SortChunksByMapPrimitive``).
+XLA's dependency tracker mis-handles the cross-stream sync edge
+between such an aliased custom_call and the immediately-following
+``jax.lax.ragged_all_to_all`` -- the all_to_all is launched on the
+NCCL communicator stream before the Triton kernel finishes writing
+sorted_inputs on the compute stream, so different ranks read different
+versions of the per-expert token counts and NCCL deadlocks.
+
+Empirically confirmed on dlcluster (GB200, jaxlib 0.10.1.dev20260519):
+* CUDA_LAUNCH_BLOCKING unset -> triton smoke + bwd hang at 300 s
+  (watchdog stacks identical every interval, only MainThread visible
+  in Python -- the XLA worker threads are in C++)
+* CUDA_LAUNCH_BLOCKING=1 -> smoke suite passes in <1 min across 3
+  consecutive runs.
+
+Workaround: ``CUDA_LAUNCH_BLOCKING=1`` is exported by both
+``qa/L0_jax_distributed_unittest/test.sh`` and
+``tests/jax/run_distributed_moe_vjp.sh``. The runtime cost for these
+correctness shapes is negligible. The proper fix is to either (a)
+teach ``triton_call_lowering`` to emit the right stream-sync edges,
+or (b) file an upstream JAX FFI bug for ``operand_output_aliases``
+with ``api_version=2`` interacting with NCCL collectives. TODO when
+the team prioritises a clean fix.
+
+``-p no:typeguard`` is also passed defensively
+---------------------------------------------
+
+A separate historical issue: jaxtyping's pytest plugin auto-loads
+typeguard, whose @typechecked import hook wraps every annotated TE /
+JAX / Flax callable and can perform isinstance() checks on JAX
+tracers during shard_map tracing. We've never been able to fully
+rule out an interaction with the async-dispatch path, so the wrappers
+disable typeguard for this file only (other jax tests still rely on
+it for type-hint validation). After the proper fix for the
+async-dispatch race lands, ``-p no:typeguard`` may become redundant,
+but for now we keep it.
 
 This is the first TE test that combines (a) Triton autotuned kernels
-with input_output_aliases, (b) ``shard_map`` body, (c) NCCL
+with ``input_output_aliases``, (b) ``shard_map`` body, (c) NCCL
 collectives (``ragged_all_to_all``, ``all_gather``), (d) ``custom_vjp``,
 and (e) JAX async dispatch. None of the previous JAX tests exercised
-this combination, which is why the typeguard interaction was not
-observed before.
-
-Both ``qa/L0_jax_distributed_unittest/test.sh`` and
-``tests/jax/run_distributed_moe_vjp.sh`` pass ``-p no:typeguard``. We
-do NOT disable typeguard in ``tests/jax/pytest.ini`` because other
-jax tests rely on it for type-hint validation.
+this combination, which is why the interaction was not observed
+before.
 
 Heavier opt-in: pass ``--forked`` (requires ``pip install --user
 pytest-forked``) to fork a fresh Python/JAX/XLA process per test
-variant. This is rarely necessary now that preallocation is disabled,
-but is still useful for diagnosing a flake suspected to come from
-leftover state across tests in the same process. The
-``run_distributed_moe_vjp.sh`` wrapper exposes both modes via
-``FORKED=1``.
-
-Why we previously needed ``--forked``: prior to the
-``PREALLOCATE=false`` switch, JAX's default 90% HBM preallocation left
-no headroom for NCCL to set up the EP communicator when a SECOND
-custom_vjp executable was loaded in the same process (the typical
-parametrize sweep ``[pure_jax, triton]`` did this). Now that
-preallocation is off, JAX grows its pool on demand and NCCL always
-finds room, so a single process handles the full sweep cleanly.
+variant. Rarely needed now, useful for bisecting suspected
+cross-test state leakage.
 """
 
 import os
