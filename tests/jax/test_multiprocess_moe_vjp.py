@@ -270,26 +270,23 @@ def _unwrap(x):
     return x.value if hasattr(x, "value") else x
 
 
-def _to_host(x):
-    """Materialize a sharded JAX array to a numpy array on the local host.
+def _local_shard(x):
+    """Return the local (this-process) shard of a global JAX Array as numpy.
 
-    In a multi-host setup, calling ``arr.item()`` or ``jnp.any(arr).item()``
-    on a globally sharded array implicitly triggers a cross-process
-    collective (all-gather + reduce), and if two hosts disagree on the
-    order in which they emit those collectives they deadlock. The
-    distributed_moe_vjp.py (single-process) variant gets away with naive
-    ``.item()`` because all four shards live in the same process.
+    Every assertion in this file is structural ("is this finite", "is this
+    non-zero", "is parity within 5e-2"). For all of these, checking the
+    *local* shard on each process is just as valid as gathering everything
+    to the host -- if any rank has NaN, that rank's assertion fires; if
+    any rank's parity diverges, that rank's assertion fires. We avoid
+    triggering a cross-process collective, which under JAX multi-host can
+    deadlock if procs disagree on the order in which they emit it (we hit
+    this on a first attempt with ``multihost_utils.process_allgather``).
 
-    Here we explicitly gather the array to *each* host's local copy with
-    ``multihost_utils.process_allgather`` (preferred), and run our finite-
-    ness / nonzero assertions in numpy on the host. Every process runs
-    the same gather, so they stay in lockstep without surprising
-    JAX-graph-triggered collectives.
+    ``arr.addressable_data(0)`` returns the local-device view of the
+    sharded array. With one GPU per process (which is the whole point of
+    this multiprocess launcher), there is exactly one addressable shard.
     """
-    # Lazy import: only needed when the multiprocess module is active.
-    from jax.experimental import multihost_utils
-
-    return np.asarray(multihost_utils.process_allgather(x, tiled=True))
+    return np.asarray(jax.device_get(x.addressable_data(0)))
 
 
 # -----------------------------------------------------------------------------
@@ -328,17 +325,16 @@ class TestMoeVjpMultiprocessSmoke:
             dtype=jnp.bfloat16,
         )
         variables, output, aux = _init_apply(block, mesh, x, jax.random.PRNGKey(1))
-        # Host-side checks via numpy (see _to_host docstring for why).
-        out_host = _to_host(output)
-        assert out_host.shape == x.shape
+        # Local-shard checks (see _local_shard docstring for why).
+        out_local = _local_shard(output)
         assert output.dtype == x.dtype
-        assert np.all(np.isfinite(out_host))
+        assert np.all(np.isfinite(out_local)), "output has NaN/Inf"
         assert aux is None
         grads = _grad_step(block, variables, mesh, x)
         for name in ("gate_kernel", "wi_0", "wi_1", "wo"):
-            g_host = _to_host(_unwrap(grads["params"][name]))
-            assert np.all(np.isfinite(g_host)), f"{name} grad has NaN/Inf"
-            assert np.any(g_host != 0.0), f"{name} grad is identically zero"
+            g_local = _local_shard(_unwrap(grads["params"][name]))
+            assert np.all(np.isfinite(g_local)), f"{name} grad has NaN/Inf"
+            assert np.any(g_local != 0.0), f"{name} grad is identically zero"
 
     @pytest.mark.parametrize("backend_name", ["pure_jax", "triton"])
     def test_aux_loss_smoke(self, mesh, backend_name):
@@ -356,15 +352,15 @@ class TestMoeVjpMultiprocessSmoke:
             dtype=jnp.bfloat16,
         )
         variables, output, aux = _init_apply(block, mesh, x, jax.random.PRNGKey(5))
-        out_host = _to_host(output)
-        assert out_host.shape == x.shape
+        out_local = _local_shard(output)
+        assert np.all(np.isfinite(out_local)), "output has NaN/Inf under aux"
         assert aux is not None
         assert aux.shape == ()
-        aux_host = _to_host(aux)
-        assert np.isfinite(aux_host)
+        aux_local = _local_shard(aux)
+        assert np.isfinite(aux_local), "aux is NaN/Inf"
         grads = _grad_step(block, variables, mesh, x)
-        g_gate_host = _to_host(_unwrap(grads["params"]["gate_kernel"]))
-        assert np.all(np.isfinite(g_gate_host)), "gate grad NaN/Inf under aux"
+        g_gate_local = _local_shard(_unwrap(grads["params"]["gate_kernel"]))
+        assert np.all(np.isfinite(g_gate_local)), "gate grad NaN/Inf under aux"
 
     def test_pure_jax_triton_parity(self, mesh):
         block_pj = _make_block(
@@ -391,15 +387,15 @@ class TestMoeVjpMultiprocessSmoke:
             x_sh = _shard_inputs(x, mesh)
             out_tr, _ = jax.jit(block_tr.apply)(variables, x_sh)
 
-        out_pj_host = _to_host(out_pj)
-        out_tr_host = _to_host(out_tr)
-        diff = float(np.max(np.abs(out_pj_host - out_tr_host)))
+        out_pj_local = _local_shard(out_pj)
+        out_tr_local = _local_shard(out_tr)
+        diff = float(np.max(np.abs(out_pj_local - out_tr_local)))
         assert diff < 5e-2, f"forward parity breach: max_abs_diff={diff}"
 
         grads_pj = _grad_step(block_pj, variables, mesh, x)
         grads_tr = _grad_step(block_tr, variables, mesh, x)
         for name in ("gate_kernel", "wi_0", "wi_1", "wo"):
-            g_pj = _to_host(_unwrap(grads_pj["params"][name]))
-            g_tr = _to_host(_unwrap(grads_tr["params"][name]))
+            g_pj = _local_shard(_unwrap(grads_pj["params"][name]))
+            g_tr = _local_shard(_unwrap(grads_tr["params"][name]))
             d = float(np.max(np.abs(g_pj - g_tr)))
             assert d < 5e-2, f"grad parity breach on {name}: max_abs_diff={d}"
