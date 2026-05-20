@@ -57,7 +57,15 @@ echo "  XLA_PYTHON_CLIENT_PREALLOCATE: $XLA_PYTHON_CLIENT_PREALLOCATE"
 echo "  XLA_PYTHON_CLIENT_MEM_FRACTION: $XLA_PYTHON_CLIENT_MEM_FRACTION"
 echo "============================================================"
 
-LOG_DIR=$(mktemp -d -t moe_vjp_mp_XXXXXX)
+# Per-process logs. MOE_VJP_MP_LOG_DIR can be set to a host-mounted dir
+# (e.g. when running inside a container that throws away /tmp on exit)
+# so logs survive for postmortem inspection. Defaults to a fresh /tmp.
+if [ -n "${MOE_VJP_MP_LOG_DIR:-}" ]; then
+    LOG_DIR="$MOE_VJP_MP_LOG_DIR"
+    mkdir -p "$LOG_DIR"
+else
+    LOG_DIR=$(mktemp -d -t moe_vjp_mp_XXXXXX)
+fi
 echo "Per-process logs: $LOG_DIR"
 
 PIDS=()
@@ -132,7 +140,9 @@ done
 echo
 if [ "$FAILED" -eq 0 ]; then
     echo "[run_multiprocess_moe_vjp.sh] all processes PASSED"
-    rm -rf "$LOG_DIR"
+    if [ -z "${MOE_VJP_MP_LOG_DIR:-}" ]; then
+        rm -rf "$LOG_DIR"
+    fi
     exit 0
 fi
 

@@ -85,6 +85,7 @@ if _WATCHDOG_SECS > 0:
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 
 from jax.experimental import mesh_utils
@@ -269,6 +270,28 @@ def _unwrap(x):
     return x.value if hasattr(x, "value") else x
 
 
+def _to_host(x):
+    """Materialize a sharded JAX array to a numpy array on the local host.
+
+    In a multi-host setup, calling ``arr.item()`` or ``jnp.any(arr).item()``
+    on a globally sharded array implicitly triggers a cross-process
+    collective (all-gather + reduce), and if two hosts disagree on the
+    order in which they emit those collectives they deadlock. The
+    distributed_moe_vjp.py (single-process) variant gets away with naive
+    ``.item()`` because all four shards live in the same process.
+
+    Here we explicitly gather the array to *each* host's local copy with
+    ``multihost_utils.process_allgather`` (preferred), and run our finite-
+    ness / nonzero assertions in numpy on the host. Every process runs
+    the same gather, so they stay in lockstep without surprising
+    JAX-graph-triggered collectives.
+    """
+    # Lazy import: only needed when the multiprocess module is active.
+    from jax.experimental import multihost_utils
+
+    return np.asarray(multihost_utils.process_allgather(x, tiled=True))
+
+
 # -----------------------------------------------------------------------------
 # Smoke shapes (identical to the single-process file's SMOKE_* constants).
 # -----------------------------------------------------------------------------
@@ -305,15 +328,17 @@ class TestMoeVjpMultiprocessSmoke:
             dtype=jnp.bfloat16,
         )
         variables, output, aux = _init_apply(block, mesh, x, jax.random.PRNGKey(1))
-        assert output.shape == x.shape
+        # Host-side checks via numpy (see _to_host docstring for why).
+        out_host = _to_host(output)
+        assert out_host.shape == x.shape
         assert output.dtype == x.dtype
-        assert jnp.all(jnp.isfinite(output)).item()
+        assert np.all(np.isfinite(out_host))
         assert aux is None
         grads = _grad_step(block, variables, mesh, x)
         for name in ("gate_kernel", "wi_0", "wi_1", "wo"):
-            g = _unwrap(grads["params"][name])
-            assert jnp.all(jnp.isfinite(g)).item(), f"{name} grad has NaN/Inf"
-            assert jnp.any(g != 0.0).item(), f"{name} grad is identically zero"
+            g_host = _to_host(_unwrap(grads["params"][name]))
+            assert np.all(np.isfinite(g_host)), f"{name} grad has NaN/Inf"
+            assert np.any(g_host != 0.0), f"{name} grad is identically zero"
 
     @pytest.mark.parametrize("backend_name", ["pure_jax", "triton"])
     def test_aux_loss_smoke(self, mesh, backend_name):
@@ -331,13 +356,15 @@ class TestMoeVjpMultiprocessSmoke:
             dtype=jnp.bfloat16,
         )
         variables, output, aux = _init_apply(block, mesh, x, jax.random.PRNGKey(5))
-        assert output.shape == x.shape
+        out_host = _to_host(output)
+        assert out_host.shape == x.shape
         assert aux is not None
         assert aux.shape == ()
-        assert jnp.isfinite(aux).item()
+        aux_host = _to_host(aux)
+        assert np.isfinite(aux_host)
         grads = _grad_step(block, variables, mesh, x)
-        g_gate = _unwrap(grads["params"]["gate_kernel"])
-        assert jnp.all(jnp.isfinite(g_gate)).item(), "gate grad NaN/Inf under aux"
+        g_gate_host = _to_host(_unwrap(grads["params"]["gate_kernel"]))
+        assert np.all(np.isfinite(g_gate_host)), "gate grad NaN/Inf under aux"
 
     def test_pure_jax_triton_parity(self, mesh):
         block_pj = _make_block(
@@ -364,13 +391,15 @@ class TestMoeVjpMultiprocessSmoke:
             x_sh = _shard_inputs(x, mesh)
             out_tr, _ = jax.jit(block_tr.apply)(variables, x_sh)
 
-        diff = float(jnp.max(jnp.abs(out_pj - out_tr)))
+        out_pj_host = _to_host(out_pj)
+        out_tr_host = _to_host(out_tr)
+        diff = float(np.max(np.abs(out_pj_host - out_tr_host)))
         assert diff < 5e-2, f"forward parity breach: max_abs_diff={diff}"
 
         grads_pj = _grad_step(block_pj, variables, mesh, x)
         grads_tr = _grad_step(block_tr, variables, mesh, x)
         for name in ("gate_kernel", "wi_0", "wi_1", "wo"):
-            g_pj = _unwrap(grads_pj["params"][name])
-            g_tr = _unwrap(grads_tr["params"][name])
-            d = float(jnp.max(jnp.abs(g_pj - g_tr)))
+            g_pj = _to_host(_unwrap(grads_pj["params"][name]))
+            g_tr = _to_host(_unwrap(grads_tr["params"][name]))
+            d = float(np.max(np.abs(g_pj - g_tr)))
             assert d < 5e-2, f"grad parity breach on {name}: max_abs_diff={d}"
