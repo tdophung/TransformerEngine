@@ -1374,6 +1374,42 @@ def _body_bwd(
     )
     d_x = d_x_from_gate + d_x_from_dispatch
 
+    # Cross-shard reductions to match the out_specs declared by
+    # _build_grads_specs (== _build_in_specs):
+    #
+    #   gate_kernel  : P()              -> fully replicated
+    #   wi_0/wi_1/wo : P(ep_axis,...)   -> sharded on EP, replicated on FSDP
+    #   inputs       : P((ep,fsdp),...) -> sharded on (EP,FSDP); no reduction
+    #
+    # Inside the shard_map body each rank only computes its local
+    # contribution to these gradients (the einsum sums over the rank's
+    # local token slice; the grouped_gemm for wi/wo sums over the
+    # rank's local dispatched tokens). For replicated dimensions we
+    # must psum across the mesh axes that the rank is sharded over,
+    # otherwise different ranks hold different values for what the
+    # out_spec claims is the same array. In single-process this is
+    # invisible (all four "ranks" share the same Python process and
+    # JAX picks one rank's view); in true multi-process each process
+    # holds only its local addressable shard and the partial sums
+    # become visible (gate_kernel ends up with NaN columns in some
+    # ranks because the bwd value used downstream by other parts of
+    # the rule reflects only that rank's local view).
+    if ep_active:
+        # Replicated -> psum across every mesh axis the array doesn't shard on.
+        replicate_all = (ep_axis,) + tuple(data_parallelism_axes)
+        d_gate_kernel = jax.lax.psum(d_gate_kernel, axis_name=replicate_all)
+        # Sharded on EP, replicated on FSDP -> psum across FSDP only.
+        if data_parallelism_axes:
+            replicate_fsdp = tuple(data_parallelism_axes)
+            d_wi_0 = jax.lax.psum(d_wi_0, axis_name=replicate_fsdp)
+            d_wi_1 = jax.lax.psum(d_wi_1, axis_name=replicate_fsdp)
+            d_wo = jax.lax.psum(d_wo, axis_name=replicate_fsdp)
+            if has_wi_bias:
+                d_wi_0_bias = jax.lax.psum(d_wi_0_bias, axis_name=replicate_fsdp)
+                d_wi_1_bias = jax.lax.psum(d_wi_1_bias, axis_name=replicate_fsdp)
+            if has_wo_bias:
+                d_wo_bias = jax.lax.psum(d_wo_bias, axis_name=replicate_fsdp)
+
     grads: dict = {
         "inputs": d_x,
         "gate_kernel": d_gate_kernel,
