@@ -289,6 +289,29 @@ def _local_shard(x):
     return np.asarray(jax.device_get(x.addressable_data(0)))
 
 
+def _describe_arr(name: str, x):
+    """Print a one-line summary of a JAX Array on this process: global
+    shape, sharding spec, local (addressable) shape, and whether the
+    local shard contains any NaN/Inf. Used to determine, on first
+    multiprocess run, whether ``addressable_data(0)`` is returning the
+    correct slice or the global buffer with garbage outside the local
+    window.
+    """
+    full_shape = tuple(x.shape) if hasattr(x, "shape") else None
+    sharding = getattr(x, "sharding", None)
+    local = x.addressable_data(0)
+    local_np = np.asarray(jax.device_get(local))
+    n_nan = int(np.isnan(local_np).sum())
+    n_inf = int(np.isinf(local_np).sum())
+    print(
+        f"  [DESC pid={_MP_PROCESS_ID}] {name}: global={full_shape} "
+        f"sharding={sharding} local_shape={local_np.shape} "
+        f"local_nan={n_nan} local_inf={n_inf} local_size={local_np.size}",
+        flush=True,
+    )
+    return local_np
+
+
 # -----------------------------------------------------------------------------
 # Smoke shapes (identical to the single-process file's SMOKE_* constants).
 # -----------------------------------------------------------------------------
@@ -325,16 +348,32 @@ class TestMoeVjpMultiprocessSmoke:
             dtype=jnp.bfloat16,
         )
         variables, output, aux = _init_apply(block, mesh, x, jax.random.PRNGKey(1))
-        # Local-shard checks (see _local_shard docstring for why).
-        out_local = _local_shard(output)
+        # First-time diagnostic dump: print sharding + local shape +
+        # local NaN/Inf count for the forward output and every named
+        # gradient. Critical for telling apart "real multiprocess bwd
+        # bug" from "addressable_data returning the wrong shape".
+        _describe_arr("output", output)
         assert output.dtype == x.dtype
-        assert np.all(np.isfinite(out_local)), "output has NaN/Inf"
         assert aux is None
         grads = _grad_step(block, variables, mesh, x)
+        # Print diagnostics on EVERY proc for EVERY gradient before we
+        # raise any assertion. This keeps all procs synchronized at
+        # this code point (no early-exit divergence) and gives us the
+        # full picture across ranks. We then collect failures and
+        # raise at the end if any.
+        gradient_problems = []
         for name in ("gate_kernel", "wi_0", "wi_1", "wo"):
-            g_local = _local_shard(_unwrap(grads["params"][name]))
-            assert np.all(np.isfinite(g_local)), f"{name} grad has NaN/Inf"
-            assert np.any(g_local != 0.0), f"{name} grad is identically zero"
+            g = _unwrap(grads["params"][name])
+            g_local = _describe_arr(f"grad/{name}", g)
+            if not np.all(np.isfinite(g_local)):
+                gradient_problems.append(f"{name}: local shard has NaN/Inf")
+            elif not np.any(g_local != 0.0):
+                gradient_problems.append(f"{name}: local shard is all zero")
+        if gradient_problems:
+            raise AssertionError(
+                "Per-rank gradient checks failed (one or more local shards):\n  "
+                + "\n  ".join(gradient_problems)
+            )
 
     @pytest.mark.parametrize("backend_name", ["pure_jax", "triton"])
     def test_aux_loss_smoke(self, mesh, backend_name):
