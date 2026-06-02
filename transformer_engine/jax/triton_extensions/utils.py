@@ -630,7 +630,16 @@ def triton_call_lowering(
         ffi_operand_output_aliases = None
 
     compressed_call_proto = zlib.compress(call_proto)
-    if jax_version_meet_requirement(TRITON_EXTENSION_CUDA_GRAPH_MIN_JAX_VERSION):
+    # Route autotuned kernels through the legacy "triton_kernel_call" FFI even on
+    # JAX versions that support the newer "triton_kernel_call_ffi" path: the new
+    # path produces CUDA_ERROR_ILLEGAL_ADDRESS for autotuned kernels (e.g.
+    # _permute_kernel) on JAX 0.10.x.  Non-autotuned kernels still use the new
+    # FFI so CUDA graph capture continues to work where supported.
+    use_new_ffi = (
+        jax_version_meet_requirement(TRITON_EXTENSION_CUDA_GRAPH_MIN_JAX_VERSION)
+        and not is_autotuned
+    )
+    if use_new_ffi:
         rule = jax.ffi.ffi_lowering(
             "triton_kernel_call_ffi",
             backend_config={"opaque": ir.StringAttr.get(compressed_call_proto)},
