@@ -173,7 +173,11 @@ def _make_launcher(
         cluster_shape_mn=cluster_shape,
         vector_f32=False,
         generate_sfd=True,
-        discrete_col_sfd=False,
+        # TE's grouped colwise tensor stores an independently padded scale
+        # segment for every expert.  The kernel's default colwise SFD layout
+        # treats the concatenated M dimension as one matrix, which makes the
+        # FC2 wgrad read another expert's scales (and eventually emit NaNs).
+        discrete_col_sfd=True,
         expert_cnt=expert_count,
         use_mono_increase_expert_idx=True,
     )
