@@ -33,6 +33,7 @@ semantics as :mod:`transformer_engine.jax.dense`.
 
 from functools import partial
 from typing import Any, Optional, Tuple, Union
+import os
 import warnings
 
 import flax.struct
@@ -63,6 +64,87 @@ __all__ = ["moe"]
 # TE grouped-GEMM recipes (bf16/fp16/fp8/mxfp8) are satisfied by the
 # same 128-token tile, so a single constant covers every supported path.
 _ALIGN_SIZE = 128
+_CUDNN_CUTEDSL_ALIGN_SIZE = 256
+_CUDNN_CUTEDSL_ENV = "NVTE_JAX_MOE_USE_CUDNN_CUTEDSL_FUSION"
+
+
+def _use_cudnn_cutedsl_fusion_from_env() -> bool:
+    value = os.getenv(_CUDNN_CUTEDSL_ENV, "0")
+    if value not in ("0", "1"):
+        raise ValueError(f"{_CUDNN_CUTEDSL_ENV} must be '0' or '1', got {value!r}")
+    return value == "1"
+
+
+def _validate_cudnn_cutedsl_fusion(
+    x,
+    wi_0,
+    wi_1,
+    wi_0_bias,
+    wi_1_bias,
+    fc1_quantizer_set,
+    fc2_quantizer_set,
+    *,
+    num_experts,
+    activation_type,
+    ep_axis,
+) -> None:
+    """Validate the intentionally narrow first supported fusion surface."""
+    from transformer_engine_jax import get_device_compute_capability
+
+    from .cutedsl_extensions.moe import load_grouped_gemm_swiglu_kernel
+    from .quantize import GroupedQuantizer, ScalingMode
+
+    errors = []
+    if get_device_compute_capability(0) < 100:
+        errors.append("requires an SM100+ GPU")
+    if str(activation_type).lower() != "silu":
+        errors.append("requires activation_type='silu'")
+    if wi_0_bias is not None or wi_1_bias is not None:
+        errors.append("does not support FC1 gate/up bias")
+    if wi_0.shape != wi_1.shape or wi_0.ndim != 3:
+        errors.append(f"requires matching rank-3 wi_0/wi_1, got {wi_0.shape}/{wi_1.shape}")
+    elif wi_0.shape[-1] % 32:
+        errors.append(f"requires intermediate size divisible by 32, got {wi_0.shape[-1]}")
+    if x.dtype not in (jnp.bfloat16, jnp.float16):
+        errors.append(f"requires BF16 or FP16 activations, got {x.dtype}")
+
+    required_quantizers = {
+        "fc1.x": fc1_quantizer_set.x,
+        "fc1.kernel": fc1_quantizer_set.kernel,
+        "fc2.x": fc2_quantizer_set.x,
+    }
+    for name, quantizer in required_quantizers.items():
+        if not isinstance(quantizer, GroupedQuantizer):
+            errors.append(f"requires a grouped MXFP8 quantizer for {name}")
+        elif quantizer.scaling_mode != ScalingMode.MXFP8_1D_SCALING:
+            errors.append(f"requires MXFP8_1D_SCALING for {name}")
+        elif not quantizer.q_layout.is_rowwise_colwise:
+            errors.append(f"requires rowwise+colwise quantization for {name}")
+
+    if all(isinstance(q, GroupedQuantizer) for q in required_quantizers.values()):
+        if fc1_quantizer_set.x.q_dtype != fc1_quantizer_set.kernel.q_dtype:
+            errors.append("requires identical FC1 activation and weight MXFP8 payload dtypes")
+        supported = (jnp.float8_e4m3fn, jnp.float8_e5m2)
+        if fc1_quantizer_set.x.q_dtype not in supported:
+            errors.append(f"unsupported FC1 MXFP8 payload dtype {fc1_quantizer_set.x.q_dtype}")
+        if fc2_quantizer_set.x.q_dtype not in supported:
+            errors.append(f"unsupported FC2 MXFP8 payload dtype {fc2_quantizer_set.x.q_dtype}")
+
+    mesh = _get_mesh()
+    if mesh is not None and not mesh.empty and ep_axis in mesh.shape:
+        num_local_experts = num_experts // mesh.shape[ep_axis]
+        if num_local_experts > 1024:
+            errors.append(f"requires at most 1024 local experts, got {num_local_experts}")
+
+    try:
+        load_grouped_gemm_swiglu_kernel()
+    except (ImportError, ModuleNotFoundError, RuntimeError) as exc:
+        errors.append(f"could not load the cuDNN frontend CuTeDSL kernel: {exc}")
+
+    if errors:
+        raise ValueError(
+            f"{_CUDNN_CUTEDSL_ENV}=1 is unsupported for this moe() call:\n- " + "\n- ".join(errors)
+        )
 
 
 def _with_sharding_constraint_cast_bwd(x: jnp.ndarray, sharding) -> jnp.ndarray:
@@ -232,14 +314,10 @@ def _pack_grouped_tensor(tensor):
     else:
         scale_inv = tensor.scale_inv
     first_dims = (
-        tensor.first_dims
-        if tensor.first_dims is not None
-        else jnp.empty((0,), dtype=jnp.int32)
+        tensor.first_dims if tensor.first_dims is not None else jnp.empty((0,), dtype=jnp.int32)
     )
     last_dims = (
-        tensor.last_dims
-        if tensor.last_dims is not None
-        else jnp.empty((0,), dtype=jnp.int32)
+        tensor.last_dims if tensor.last_dims is not None else jnp.empty((0,), dtype=jnp.int32)
     )
     return tensor.data, scale_inv, tensor.amax, first_dims, last_dims
 
@@ -311,6 +389,7 @@ def _ffn_fwd_per_shard(
     num_local_experts: int,
     activation_type: str,
     apply_topk_weights_early: bool,
+    use_cudnn_cutedsl_fusion: bool,
 ):
     """Per-shard FFN forward.
 
@@ -334,28 +413,78 @@ def _ffn_fwd_per_shard(
     wi_1 = wi_1.astype(sorted_x.dtype)
     wo = wo.astype(sorted_x.dtype)
 
-    # Concat wi_0/wi_1 along the trailing axis (NOT stack on a new
-    # axis). grouped_gemm requires the 3D (G, K, N) weight layout with
-    # contracting_dims=((1,), (1,)); a 4D stack variant walks off the
-    # end of the RHS and returns NaN.
-    wi_combined = jnp.concatenate([wi_0, wi_1], axis=-1)
+    # The cuDNN frontend kernel consumes alternating 32-column gate/up
+    # blocks. The existing TE grouped-GEMM path consumes the two full
+    # projections concatenated along N.
+    if use_cudnn_cutedsl_fusion:
+        from .cutedsl_extensions.moe import pack_swiglu_pair
+
+        wi_combined = pack_swiglu_pair(wi_0, wi_1)
+    else:
+        # Concat along the trailing axis (NOT stack on a new axis).
+        # grouped_gemm requires the 3D (G, K, N) weight layout with
+        # contracting_dims=((1,), (1,)).
+        wi_combined = jnp.concatenate([wi_0, wi_1], axis=-1)
     wi_combined_bias = (
         jnp.concatenate([wi_0_bias, wi_1_bias], axis=-1) if wi_0_bias is not None else None
     )
 
+    if use_cudnn_cutedsl_fusion:
+        # The EP receive buffer is intentionally overallocated and padded.
+        # Zero inactive rows before block quantization so padding cannot
+        # contaminate generated columnwise output scales.
+        active_rows = (recv_w_flat != 0)[:, None]
+        sorted_x_for_quant = jnp.where(active_rows, sorted_x, jnp.zeros_like(sorted_x))
+    else:
+        sorted_x_for_quant = sorted_x
     casted_sorted_x = tex.grouped_quantize(
-        sorted_x, fc1_quantizer_set.x, local_group_sizes, flatten_axis=-1
+        sorted_x_for_quant, fc1_quantizer_set.x, local_group_sizes, flatten_axis=-1
     )
-    casted_wi = tex.grouped_quantize(
-        wi_combined, fc1_quantizer_set.kernel, flatten_axis=-1
-    )
-    combined_out = tex.grouped_gemm(
-        casted_sorted_x.get_tensor(usage=TensorUsage.LHS),
-        casted_wi.get_tensor(usage=TensorUsage.RHS),
-        contracting_dims=((1,), (1,)),
-        bias=wi_combined_bias,
-    )
-    gate_proj_out, up_proj_out = jnp.split(combined_out, 2, axis=-1)
+    casted_wi = tex.grouped_quantize(wi_combined, fc1_quantizer_set.kernel, flatten_axis=-1)
+    if use_cudnn_cutedsl_fusion:
+        from .cutedsl_extensions.moe import (
+            grouped_gemm_swiglu_mxfp8,
+            unpack_swiglu_pair,
+        )
+
+        casted_sorted_x_lhs = casted_sorted_x.get_tensor(usage=TensorUsage.LHS)
+        casted_wi_rhs = casted_wi.get_tensor(usage=TensorUsage.RHS)
+        padded_offsets = jnp.cumsum(local_group_sizes, dtype=jnp.int32)
+        prob = (
+            recv_w_flat[:, None, None]
+            if apply_topk_weights_early
+            else jnp.ones((sorted_x.shape[0], 1, 1), dtype=jnp.float32)
+        )
+        (
+            combined_out_3d,
+            intermediate_3d,
+            _intermediate_secondary,
+        ) = grouped_gemm_swiglu_mxfp8(
+            casted_sorted_x_lhs.data.reshape(sorted_x.shape[0], hidden, 1),
+            # TE stores the colwise payload in logical [E,K,N] order even
+            # though its values were quantized along K. Materialize the
+            # K-major [E,N,K] layout consumed by the CuTeDSL kernel.
+            casted_wi_rhs.data.reshape(num_local_experts, hidden, wi_combined.shape[-1]).transpose(
+                0, 2, 1
+            ),
+            casted_sorted_x_lhs.scale_inv,
+            casted_wi_rhs.scale_inv,
+            padded_offsets,
+            prob,
+            compute_dtype=sorted_x.dtype,
+            output_dtype=sorted_x.dtype,
+        )
+        combined_out = combined_out_3d.reshape(sorted_x.shape[0], wi_combined.shape[-1])
+        gate_proj_out, up_proj_out = unpack_swiglu_pair(combined_out)
+        intermediate = intermediate_3d.reshape(sorted_x.shape[0], gate_proj_out.shape[-1])
+    else:
+        combined_out = tex.grouped_gemm(
+            casted_sorted_x.get_tensor(usage=TensorUsage.LHS),
+            casted_wi.get_tensor(usage=TensorUsage.RHS),
+            contracting_dims=((1,), (1,)),
+            bias=wi_combined_bias,
+        )
+        gate_proj_out, up_proj_out = jnp.split(combined_out, 2, axis=-1)
     casted_sorted_x_lhs_trans = casted_sorted_x.get_tensor(usage=TensorUsage.LHS_TRANS)
     casted_sorted_x_lhs_trans = (
         casted_sorted_x_lhs_trans.checkpoint(fc1_quantizer_set.x)
@@ -375,9 +504,10 @@ def _ffn_fwd_per_shard(
     # that's all bf16; for FP8/FP4 the downstream grouped_quantize is what
     # transitions to the target precision.
     act_fn = _convert_to_activation_function(activation_type)
-    intermediate = act_fn(gate_proj_out) * up_proj_out
+    if not use_cudnn_cutedsl_fusion:
+        intermediate = act_fn(gate_proj_out) * up_proj_out
 
-    if apply_topk_weights_early:
+    if apply_topk_weights_early and not use_cudnn_cutedsl_fusion:
         # Fold the per-token combine weights into the FFN intermediate;
         # the downstream wo GEMM is linear so this is equivalent to the
         # late-weighting path. Padded recv slots can contain uninitialized
@@ -445,6 +575,7 @@ def _ffn_bwd_per_shard(
     activation_type: str,
     apply_topk_weights_early: bool,
     has_bias: bool,
+    use_cudnn_cutedsl_fusion: bool,
 ):
     """Per-shard FFN backward.
 
@@ -549,7 +680,12 @@ def _ffn_bwd_per_shard(
     # grouped_quantize + two grouped_gemm pair (one dgrad, one wgrad)
     # against the fused casted_wi_rhs_trans residual, then split the
     # wgrad result back into d_wi_0 / d_wi_1 halves with jnp.split.
-    d_combined = jnp.concatenate([d_gate_proj_out, d_up_proj_out], axis=-1)
+    if use_cudnn_cutedsl_fusion:
+        from .cutedsl_extensions.moe import pack_swiglu_pair
+
+        d_combined = pack_swiglu_pair(d_gate_proj_out, d_up_proj_out)
+    else:
+        d_combined = jnp.concatenate([d_gate_proj_out, d_up_proj_out], axis=-1)
     casted_d_combined = tex.grouped_quantize(
         d_combined, fc1_quantizer_set.dgrad, local_group_sizes, flatten_axis=-1
     )
@@ -564,7 +700,12 @@ def _ffn_bwd_per_shard(
         contracting_dims=((0,), (0,)),
     )
     d_wi_combined = jnp.where(wgrad_group_active, d_wi_combined, jnp.zeros_like(d_wi_combined))
-    d_wi_0, d_wi_1 = jnp.split(d_wi_combined, 2, axis=-1)
+    if use_cudnn_cutedsl_fusion:
+        from .cutedsl_extensions.moe import unpack_swiglu_pair
+
+        d_wi_0, d_wi_1 = unpack_swiglu_pair(d_wi_combined)
+    else:
+        d_wi_0, d_wi_1 = jnp.split(d_wi_combined, 2, axis=-1)
     if has_bias:
         d_wi_combined_bias = tex.grouped_dbias(d_combined, local_group_sizes)
         d_wi_0_bias, d_wi_1_bias = jnp.split(d_wi_combined_bias, 2, axis=-1)
@@ -620,6 +761,7 @@ def _moe_fwd_rule(
     wo_kernel_axes,
     dtype,
     apply_topk_weights_early,
+    use_cudnn_cutedsl_fusion,
 ):
     """Forward: gate -> topk -> ep_dispatch -> shard_map(FFN) -> ep_combine.
 
@@ -659,10 +801,15 @@ def _moe_fwd_rule(
     tokens_per_ep_group = num_ep * max_tokens_per_rank
     max_local_assignments = tokens_per_ep_group * min(K, num_local_experts)
     max_nonempty_experts = min(num_local_experts, max_local_assignments)
-    padded_total_bound = max_local_assignments + (_ALIGN_SIZE - 1) * max_nonempty_experts
-    aligned_total_bound = ((padded_total_bound + _ALIGN_SIZE - 1) // _ALIGN_SIZE) * _ALIGN_SIZE
+    dispatch_alignment = _CUDNN_CUTEDSL_ALIGN_SIZE if use_cudnn_cutedsl_fusion else _ALIGN_SIZE
+    padded_total_bound = max_local_assignments + (dispatch_alignment - 1) * max_nonempty_experts
+    aligned_total_bound = (
+        (padded_total_bound + dispatch_alignment - 1) // dispatch_alignment
+    ) * dispatch_alignment
     per_expert_bound = (
-        num_local_experts * ((tokens_per_ep_group + _ALIGN_SIZE - 1) // _ALIGN_SIZE) * _ALIGN_SIZE
+        num_local_experts
+        * ((tokens_per_ep_group + dispatch_alignment - 1) // dispatch_alignment)
+        * dispatch_alignment
     )
     recv_pr = min(per_expert_bound, aligned_total_bound)
 
@@ -780,7 +927,7 @@ def _moe_fwd_rule(
     # ---------------- TE EP dispatch (global view) ----------------
     cfg = tex.EpLayerConfig(
         top_k=K,
-        dispatch_output_per_expert_alignment=_ALIGN_SIZE,
+        dispatch_output_per_expert_alignment=dispatch_alignment,
     )
     token_counts, handle_mem = tex.ep_prepare(cfg, topk_idx_3d)
     recv_tokens, recv_topk_weights = tex.ep_dispatch_fwd(
@@ -869,6 +1016,7 @@ def _moe_fwd_rule(
             num_local_experts=num_local_experts,
             activation_type=activation_type,
             apply_topk_weights_early=apply_topk_weights_early,
+            use_cudnn_cutedsl_fusion=use_cudnn_cutedsl_fusion,
         )
 
     expert_outputs, ffn_residuals = shard_map(
@@ -965,6 +1113,7 @@ def _moe_bwd_rule(
     wo_kernel_axes,
     dtype,
     apply_topk_weights_early,
+    use_cudnn_cutedsl_fusion,
     residuals,
     cotangents,
 ):
@@ -1076,6 +1225,7 @@ def _moe_bwd_rule(
             activation_type=activation_type,
             apply_topk_weights_early=apply_topk_weights_early,
             has_bias=has_bias,
+            use_cudnn_cutedsl_fusion=use_cudnn_cutedsl_fusion,
         )
         # Weight grads accumulate per-DP-shard inside the body; psum across
         # DP axes so each replica sees the full sum (matches out_specs
@@ -1224,7 +1374,7 @@ def _moe_bwd_rule(
 # =============================================================================
 
 
-@partial(jax.custom_vjp, nondiff_argnums=tuple(range(11, 28)))
+@partial(jax.custom_vjp, nondiff_argnums=tuple(range(11, 29)))
 def _moe(
     x,
     gate_kernel,
@@ -1254,6 +1404,7 @@ def _moe(
     wo_kernel_axes,
     dtype,
     apply_topk_weights_early,
+    use_cudnn_cutedsl_fusion,
 ):
     primal, _ = _moe_fwd_rule(
         x,
@@ -1284,6 +1435,7 @@ def _moe(
         wo_kernel_axes,
         dtype,
         apply_topk_weights_early,
+        use_cudnn_cutedsl_fusion,
     )
     return primal
 
@@ -1342,9 +1494,11 @@ def moe(
         ``fused_moe_aux_loss`` kernel sees a global ``[T_global, E]``
         view; this lives off the dispatch critical path.
 
-    Note that the per-expert dispatch-slot alignment is fixed internally
-    at 128 tokens (``_ALIGN_SIZE``); see that constant's docstring for
-    rationale and how to extend if a future recipe needs >128.
+    The default per-expert dispatch-slot alignment is 128 tokens. Setting
+    ``NVTE_JAX_MOE_USE_CUDNN_CUTEDSL_FUSION=1`` opts an eligible MXFP8
+    SwiGLU call into the cuDNN frontend CuTeDSL FC1 fusion and raises the
+    alignment to the kernel-required 256 tokens. Unsupported opt-in calls
+    fail rather than silently falling back.
 
     Axis-name parameters:
 
@@ -1375,6 +1529,20 @@ def moe(
     surrounding design rationale.
     """
     score_function = _validate_score_function(score_function)
+    use_cudnn_cutedsl_fusion = _use_cudnn_cutedsl_fusion_from_env()
+    if use_cudnn_cutedsl_fusion:
+        _validate_cudnn_cutedsl_fusion(
+            x,
+            wi_0,
+            wi_1,
+            wi_0_bias,
+            wi_1_bias,
+            fc1_quantizer_set,
+            fc2_quantizer_set,
+            num_experts=num_experts,
+            activation_type=activation_type,
+            ep_axis=ep_axis,
+        )
 
     # Enforce ((outer_dp..., ep), None, None) on inbound activations. The
     # EP comm groups consecutive global ranks (dp_color = rank // ep_size),
@@ -1433,6 +1601,7 @@ def moe(
         wo_kernel_axes,
         dtype,
         apply_topk_weights_early,
+        use_cudnn_cutedsl_fusion,
     )
     if aux_loss_coeff <= 0.0:
         aux_loss = None

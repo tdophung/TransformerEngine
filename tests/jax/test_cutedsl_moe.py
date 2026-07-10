@@ -1,0 +1,127 @@
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+#
+# See LICENSE for license information.
+"""Tests for the JAX binding to cuDNN frontend's CuTeDSL MoE kernel."""
+
+import sys
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+import pytest
+
+from transformer_engine.jax import cpp_extensions as tex
+from transformer_engine.jax.moe import _use_cudnn_cutedsl_fusion_from_env
+from transformer_engine.jax.cutedsl_extensions.moe import (
+    grouped_gemm_swiglu_mxfp8,
+    load_grouped_gemm_swiglu_kernel,
+    pack_swiglu_pair,
+    unpack_swiglu_pair,
+)
+from transformer_engine.jax.quantize import (
+    QuantizerFactory,
+    ScalingMode,
+    TensorUsage,
+)
+
+
+def test_swiglu_block_pack_round_trip():
+    """Gate/up packing alternates 32-column blocks and is reversible."""
+    gate = jnp.arange(2 * 3 * 64, dtype=jnp.float32).reshape(2, 3, 64)
+    up = gate + 1000
+    interleaved = pack_swiglu_pair(gate, up)
+
+    np.testing.assert_array_equal(interleaved[..., :32], gate[..., :32])
+    np.testing.assert_array_equal(interleaved[..., 32:64], up[..., :32])
+    unpacked_gate, unpacked_up = unpack_swiglu_pair(interleaved)
+    np.testing.assert_array_equal(unpacked_gate, gate)
+    np.testing.assert_array_equal(unpacked_up, up)
+
+
+def test_direct_kernel_loader_bypasses_torch_api():
+    """The direct source loader must not execute cuDNN's Torch API package."""
+    kernel_cls = load_grouped_gemm_swiglu_kernel()
+    assert kernel_cls.__name__ == "BlockScaledContiguousGroupedGemmKernel"
+    assert "cudnn.grouped_gemm.grouped_gemm_swiglu.api" not in sys.modules
+    # cuDNN frontend 1.25's shared utility source imports torch only for an
+    # unused annotation. The loader supplies a non-executable sentinel rather
+    # than importing the Torch package.
+    torch_module = sys.modules.get("torch")
+    assert torch_module is None or getattr(
+        torch_module, "__transformer_engine_cutedsl_stub__", False
+    )
+
+
+def test_cutedsl_fusion_env_is_strict(monkeypatch):
+    """The opt-in environment variable accepts only explicit boolean integers."""
+    monkeypatch.delenv("NVTE_JAX_MOE_USE_CUDNN_CUTEDSL_FUSION", raising=False)
+    assert not _use_cudnn_cutedsl_fusion_from_env()
+    monkeypatch.setenv("NVTE_JAX_MOE_USE_CUDNN_CUTEDSL_FUSION", "1")
+    assert _use_cudnn_cutedsl_fusion_from_env()
+    monkeypatch.setenv("NVTE_JAX_MOE_USE_CUDNN_CUTEDSL_FUSION", "true")
+    with pytest.raises(ValueError, match="must be '0' or '1'"):
+        _use_cudnn_cutedsl_fusion_from_env()
+
+
+def test_grouped_gemm_swiglu_cutlass_call_raw_projection_parity():
+    """The CUTLASS call sees the same MXFP8 projection as TE grouped GEMM."""
+    try:
+        from transformer_engine_jax import get_device_compute_capability
+
+        if get_device_compute_capability(0) < 100:
+            pytest.skip("cuDNN frontend grouped GEMM SwiGLU requires SM100+")
+        load_grouped_gemm_swiglu_kernel()
+        import cutlass.jax  # noqa: F401  # pylint: disable=unused-import,import-outside-toplevel
+    except (ImportError, RuntimeError) as exc:
+        pytest.skip(f"CuTeDSL JAX dependencies are unavailable: {exc}")
+
+    experts, rows, hidden, intermediate = 1, 256, 128, 128
+    key = jax.random.PRNGKey(123)
+    x = jax.random.normal(key, (rows, hidden), dtype=jnp.bfloat16)
+    wi_0 = jax.random.normal(
+        jax.random.fold_in(key, 1), (experts, hidden, intermediate), dtype=jnp.bfloat16
+    )
+    wi_1 = jax.random.normal(
+        jax.random.fold_in(key, 2), (experts, hidden, intermediate), dtype=jnp.bfloat16
+    )
+    wi = pack_swiglu_pair(wi_0, wi_1)
+    group_sizes = jnp.asarray([rows], dtype=jnp.int32)
+    quantizers = QuantizerFactory.create_set(
+        scaling_mode=ScalingMode.MXFP8_1D_SCALING,
+        fwd_dtype=jnp.float8_e4m3fn,
+        bwd_dtype=jnp.float8_e5m2,
+        is_2x2x=True,
+        n_groups=experts,
+    )
+
+    @jax.jit
+    def run(x_arg, wi_arg):
+        casted_x = tex.grouped_quantize(
+            x_arg, quantizers.x, group_sizes, flatten_axis=-1
+        ).get_tensor(TensorUsage.LHS)
+        casted_wi = tex.grouped_quantize(wi_arg, quantizers.kernel, flatten_axis=-1).get_tensor(
+            TensorUsage.RHS
+        )
+        reference = tex.grouped_gemm(
+            casted_x,
+            casted_wi,
+            contracting_dims=((1,), (1,)),
+        )
+        physical_wi = casted_wi.data.reshape(experts, hidden, 2 * intermediate).transpose(0, 2, 1)
+        combined, swiglu, _ = grouped_gemm_swiglu_mxfp8(
+            casted_x.data.reshape(rows, hidden, 1),
+            physical_wi,
+            casted_x.scale_inv,
+            casted_wi.scale_inv,
+            jnp.cumsum(group_sizes),
+            jnp.ones((rows, 1, 1), dtype=jnp.float32),
+            compute_dtype=jnp.bfloat16,
+            output_dtype=jnp.bfloat16,
+        )
+        return reference, combined.reshape(rows, 2 * intermediate), swiglu
+
+    reference, combined, swiglu = run(x, wi)
+    jax.block_until_ready((reference, combined, swiglu))
+    np.testing.assert_array_equal(combined, reference)
+    assert swiglu.shape == (rows, intermediate, 1)
+    assert np.all(np.isfinite(np.asarray(swiglu, dtype=np.float32)))
