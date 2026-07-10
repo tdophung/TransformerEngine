@@ -143,6 +143,10 @@ def unpack_swiglu_pair(interleaved: jax.Array) -> tuple[jax.Array, jax.Array]:
     )
 
 
+def _ceil_div(x: int, y: int) -> int:
+    return (x + y - 1) // y
+
+
 @lru_cache(maxsize=None)
 def _make_launcher(
     expert_count: int,
@@ -168,7 +172,7 @@ def _make_launcher(
         mma_tiler_mn=(mma_tiler_m, mma_tiler_n),
         cluster_shape_mn=cluster_shape,
         vector_f32=False,
-        generate_sfd=False,
+        generate_sfd=True,
         discrete_col_sfd=False,
         expert_cnt=expert_count,
         use_mono_increase_expert_idx=True,
@@ -187,9 +191,12 @@ def _make_launcher(
         padded_offsets,
         alpha,
         prob,
+        norm_const,
         c,
         d,
         d_col,
+        sfd_row,
+        sfd_col,
     ):
         kernel(
             a,
@@ -199,10 +206,10 @@ def _make_launcher(
             d_col,
             sfa,
             sfb,
+            sfd_row,
+            sfd_col,
             None,
-            None,
-            None,
-            None,
+            norm_const,
             padded_offsets,
             alpha,
             prob,
@@ -223,8 +230,8 @@ def grouped_gemm_swiglu_mxfp8(
     *,
     compute_dtype: Any,
     output_dtype: Any,
-) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """Call cuDNN frontend's grouped MXFP8 GEMM+SwiGLU kernel.
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Call cuDNN frontend's grouped MXFP8 GEMM+SwiGLU+quant kernel.
 
     Args:
         a: Quantized activation payload with physical shape ``[M, K, 1]``.
@@ -234,12 +241,11 @@ def grouped_gemm_swiglu_mxfp8(
         padded_offsets: Exclusive, 256-aligned end offset for each expert.
         prob: Per-row multiplier, physical shape ``[M, 1, 1]``.
         compute_dtype: Unquantized combined-projection dtype.
-        output_dtype: Unquantized SwiGLU output dtype. The caller applies
-            TE's grouped output quantizer so its backward ABI is preserved.
+        output_dtype: MXFP8 payload dtype for the quantized SwiGLU output.
 
     Returns:
-        Raw combined projection, SwiGLU output, and the kernel's secondary
-        output buffer (unused by the MoE integration).
+        Raw combined projection, rowwise payload, colwise payload, rowwise
+        inverse scales, and colwise inverse scales.
     """
     try:
         from cutlass.jax import TensorSpec, cutlass_call
@@ -266,10 +272,18 @@ def grouped_gemm_swiglu_mxfp8(
         raise ValueError(f"Padded activation rows M={m} must be divisible by 256")
 
     sf_vec_size = 32
+    row_scale_size = (
+        32 * 4 * _ceil_div(m, 128) * 4 * _ceil_div(_ceil_div(intermediate, sf_vec_size), 4)
+    )
+    col_scale_size = (
+        32 * 4 * _ceil_div(intermediate, 128) * 4 * _ceil_div(_ceil_div(m, sf_vec_size), 4)
+    )
     outputs = (
         jax.ShapeDtypeStruct((m, n, 1), compute_dtype),
         jax.ShapeDtypeStruct((m, intermediate, 1), output_dtype),
         jax.ShapeDtypeStruct((m, intermediate, 1), output_dtype),
+        jax.ShapeDtypeStruct((row_scale_size,), jnp.float8_e8m0fnu),
+        jax.ShapeDtypeStruct((col_scale_size,), jnp.float8_e8m0fnu),
     )
     launcher = _make_launcher(expert_count, sf_vec_size, 256, 256)
     call = cutlass_call(
@@ -286,15 +300,21 @@ def grouped_gemm_swiglu_mxfp8(
             TensorSpec(),
             TensorSpec(),
             TensorSpec(),
+            TensorSpec(),
         ),
         output_spec=(
             TensorSpec(layout=(1, 0, 2)),
             TensorSpec(layout=(1, 0, 2)),
             TensorSpec(layout=(1, 0, 2)),
+            TensorSpec(),
+            TensorSpec(),
         ),
         allow_cuda_graph=True,
     )
     alpha = jnp.ones((expert_count,), dtype=jnp.float32)
+    # With norm_const=1 the generated E8M0 factors are directly the
+    # scale-inverse values expected by TE's MXFP8 tensor representation.
+    norm_const = jnp.ones((1,), dtype=jnp.float32)
     return call(
         a,
         b,
@@ -303,6 +323,7 @@ def grouped_gemm_swiglu_mxfp8(
         padded_offsets.astype(jnp.int32),
         alpha,
         prob.astype(jnp.float32),
+        norm_const,
     )
 
 

@@ -118,7 +118,14 @@ if get_device_compute_capability(0) < 100:
     )
 
 from transformer_engine.jax.flax import _MoEBlock as MoEBlock
-from transformer_engine.jax.moe import _ALIGN_SIZE, moe, record_ep_bootstrap_signature_for_moe
+from transformer_engine.common.recipe import MXFP8BlockScaling
+from transformer_engine.jax import autocast
+from transformer_engine.jax.moe import (
+    _ALIGN_SIZE,
+    _CUDNN_CUTEDSL_ALIGN_SIZE,
+    moe,
+    record_ep_bootstrap_signature_for_moe,
+)
 from transformer_engine.jax.ep import ep_bootstrap
 from transformer_engine.jax.sharding import MeshResource, global_shard_guard
 
@@ -180,7 +187,7 @@ AUX_RTOL = 1e-3
 # -----------------------------------------------------------------------------
 
 
-def _compute_worst_case_recv_pr():
+def _compute_worst_case_recv_pr(alignment=_ALIGN_SIZE):
     """Per-rank recv buffer the bootstrap must reserve.
 
     NCCL EP HT expert-major uses one flat recv buffer with variable
@@ -194,10 +201,10 @@ def _compute_worst_case_recv_pr():
     tokens_per_ep_group = EP_SIZE * max_tokens_per_rank
     max_local_assignments = tokens_per_ep_group * min(TOPK, num_local_experts)
     max_nonempty_experts = min(num_local_experts, max_local_assignments)
-    padded_total_bound = max_local_assignments + (_ALIGN_SIZE - 1) * max_nonempty_experts
-    aligned_total_bound = ((padded_total_bound + _ALIGN_SIZE - 1) // _ALIGN_SIZE) * _ALIGN_SIZE
+    padded_total_bound = max_local_assignments + (alignment - 1) * max_nonempty_experts
+    aligned_total_bound = ((padded_total_bound + alignment - 1) // alignment) * alignment
     per_expert_bound = (
-        num_local_experts * ((tokens_per_ep_group + _ALIGN_SIZE - 1) // _ALIGN_SIZE) * _ALIGN_SIZE
+        num_local_experts * ((tokens_per_ep_group + alignment - 1) // alignment) * alignment
     )
     return min(per_expert_bound, aligned_total_bound)
 
@@ -217,7 +224,9 @@ def mesh():
 
     num_procs = jax.process_count()
     max_tokens_per_rank = (BATCH // num_procs) * SEQ
-    recv_capacity_per_rank = _compute_worst_case_recv_pr()
+    fusion_enabled = os.getenv("NVTE_JAX_MOE_USE_CUDNN_CUTEDSL_FUSION", "0") == "1"
+    alignment = _CUDNN_CUTEDSL_ALIGN_SIZE if fusion_enabled else _ALIGN_SIZE
+    recv_capacity_per_rank = _compute_worst_case_recv_pr(alignment)
 
     # Eager bootstrap: ep_bootstrap does a host-side NCCL UID allgather
     # and cannot run from inside jax.jit. Sized to the worst-case recv_pr
@@ -677,6 +686,59 @@ class TestTeEpMoeBackward:
             rtol=GRAD_FFN_RTOL,
             err_msg=f"d_x parity breach [config={config}]",
         )
+
+
+class TestTeEpMoeCudnnCutedslFusion:
+    """End-to-end MXFP8 coverage for the opt-in FC1+SwiGLU+quant fusion."""
+
+    @pytest.mark.parametrize("apply_topk_weights_early", [False, True])
+    def test_mxfp8_forward_and_backward(self, mesh, apply_topk_weights_early):
+        if os.getenv("NVTE_JAX_MOE_USE_CUDNN_CUTEDSL_FUSION", "0") != "1":
+            pytest.skip("run separately with NVTE_JAX_MOE_USE_CUDNN_CUTEDSL_FUSION=1")
+        block = _make_block(apply_topk_weights_early=apply_topk_weights_early)
+        x = _make_inputs(jax.random.PRNGKey(30))
+        mesh_resource = MeshResource(ep_resource=EP_AXIS, fsdp_resource=FSDP_AXIS)
+
+        with _ctx(mesh), autocast(
+            enabled=True,
+            recipe=MXFP8BlockScaling(),
+            mesh_resource=mesh_resource,
+        ):
+            x_sh = _shard_inputs(x, mesh)
+            variables = jax.jit(block.init)(jax.random.PRNGKey(31), x_sh)
+            fused, _ = jax.jit(block.apply)(variables, x_sh)
+
+            def loss_fn(vars_arg, x_arg):
+                output, _ = block.apply(vars_arg, x_arg)
+                return jnp.mean(output.astype(jnp.float32) ** 2)
+
+            grads, grad_x = jax.jit(jax.grad(loss_fn, argnums=(0, 1)))(variables, x_sh)
+            jax.block_until_ready((fused, grads, grad_x))
+
+        fused_np = _to_global_numpy(fused, mesh).astype(np.float32)
+        assert np.all(np.isfinite(fused_np))
+
+        params_np = _params_global_numpy(variables, mesh)
+        reference, _ = _pure_jax_moe_reference(
+            jnp.asarray(jax.device_get(x)),
+            jnp.asarray(params_np["gate_kernel"]),
+            jnp.asarray(params_np["wi_0"]),
+            jnp.asarray(params_np["wi_1"]),
+            jnp.asarray(params_np["wo"]),
+            num_experts=NUM_EXPERTS,
+            num_experts_per_tok=TOPK,
+        )
+        reference_np = np.asarray(jax.device_get(reference), dtype=np.float32)
+        relative_error = np.linalg.norm(fused_np - reference_np) / np.linalg.norm(reference_np)
+        assert relative_error < 0.2
+
+        for name in ("gate_kernel", "wi_0", "wi_1", "wo"):
+            grad = _to_global_numpy(_unwrap(grads["params"][name]), mesh).astype(np.float32)
+            assert np.all(np.isfinite(grad)), f"{name} fused MXFP8 grad has NaN/Inf"
+            assert np.any(grad != 0), f"{name} fused MXFP8 grad is identically zero"
+        grad_x_np = _to_global_numpy(grad_x, mesh).astype(np.float32)
+        assert np.all(np.isfinite(grad_x_np))
+        assert np.any(grad_x_np != 0)
 
 
 class TestTeEpMoeAuxLoss:

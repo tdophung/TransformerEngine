@@ -20,6 +20,7 @@ from transformer_engine.jax.cutedsl_extensions.moe import (
 )
 from transformer_engine.jax.quantize import (
     QuantizerFactory,
+    ScaledTensorFactory,
     ScalingMode,
     TensorUsage,
 )
@@ -108,7 +109,7 @@ def test_grouped_gemm_swiglu_cutlass_call_raw_projection_parity():
             contracting_dims=((1,), (1,)),
         )
         physical_wi = casted_wi.data.reshape(experts, hidden, 2 * intermediate).transpose(0, 2, 1)
-        combined, swiglu, _ = grouped_gemm_swiglu_mxfp8(
+        combined, swiglu_row, swiglu_col, scale_row, scale_col = grouped_gemm_swiglu_mxfp8(
             casted_x.data.reshape(rows, hidden, 1),
             physical_wi,
             casted_x.scale_inv,
@@ -118,10 +119,42 @@ def test_grouped_gemm_swiglu_cutlass_call_raw_projection_parity():
             compute_dtype=jnp.bfloat16,
             output_dtype=jnp.bfloat16,
         )
-        return reference, combined.reshape(rows, 2 * intermediate), swiglu
+        return (
+            reference,
+            combined.reshape(rows, 2 * intermediate),
+            swiglu_row,
+            swiglu_col,
+            scale_row,
+            scale_col,
+        )
 
-    reference, combined, swiglu = run(x, wi)
-    jax.block_until_ready((reference, combined, swiglu))
+    reference, combined, swiglu_row, swiglu_col, scale_row, scale_col = run(x, wi)
+    jax.block_until_ready((reference, combined, swiglu_row, swiglu_col))
     np.testing.assert_array_equal(combined, reference)
-    assert swiglu.shape == (rows, intermediate, 1)
-    assert np.all(np.isfinite(np.asarray(swiglu, dtype=np.float32)))
+    assert swiglu_row.shape == swiglu_col.shape == (rows, intermediate, 1)
+    assert scale_row.dtype == scale_col.dtype == jnp.float8_e8m0fnu
+
+    gate, up = unpack_swiglu_pair(combined)
+    swiglu_reference = np.asarray(jax.nn.silu(gate) * up, dtype=np.float32)
+    for is_colwise, payload, scale in (
+        (False, swiglu_row, scale_row),
+        (True, swiglu_col, scale_col),
+    ):
+        scaled = ScaledTensorFactory.create_1x(
+            payload.reshape(-1),
+            scale,
+            scaling_mode=ScalingMode.MXFP8_1D_SCALING,
+            dq_dtype=jnp.bfloat16,
+            is_colwise=is_colwise,
+            data_layout="N",
+            flatten_axis=1,
+            first_dims=group_sizes,
+            original_shape=(rows, intermediate),
+            pre_swizzled=True,
+        )
+        dequantized = np.asarray(scaled.dequantize()[0], dtype=np.float32)
+        assert np.all(np.isfinite(dequantized))
+        relative_error = np.linalg.norm(dequantized - swiglu_reference) / np.linalg.norm(
+            swiglu_reference
+        )
+        assert relative_error < 0.05

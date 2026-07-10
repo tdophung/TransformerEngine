@@ -39,7 +39,7 @@ from jax.sharding import PartitionSpec as P  # noqa: F401  # pylint: disable=unu
 
 from ..moe import moe
 from ..router import ScoreFunction
-from ..sharding import get_active_resource_axis
+from ..sharding import get_active_resource_axis, get_mesh_axis_size
 from .module import TransformerEngineBase
 
 PRNGKey = Any
@@ -105,10 +105,9 @@ class _MoEBlock(TransformerEngineBase):
         *inside* each shard before ``ep_combine`` (saves one global
         reduction at the cost of an extra broadcast). Default ``False``.
 
-    The per-expert dispatch-slot alignment is fixed internally at 128
-    tokens (see ``moe._ALIGN_SIZE``) -- the value required by NCCL EP
-    HT and satisfied by every current TE grouped-GEMM recipe -- and is
-    therefore not exposed as a per-instance knob.
+    The default per-expert dispatch-slot alignment is 128 tokens. The
+    opt-in cuDNN CuTeDSL MXFP8 fusion uses its required 256-token
+    alignment; neither value is exposed as a per-instance knob.
 
     dtype : jnp.dtype
         Compute / parameter dtype.
@@ -190,6 +189,11 @@ class _MoEBlock(TransformerEngineBase):
         ), f"_MoEBlock expects [batch, sequence, hidden] input, got shape {inputs.shape}"
         _, _, hidden_size = inputs.shape
 
+        ep_axis = get_active_resource_axis("ep_resource")
+        num_local_experts = self.num_experts // get_mesh_axis_size(ep_axis)
+        fc1_quantizer_set = self.generate_quantizer_set("_moe_fc1", n_groups=num_local_experts)
+        fc2_quantizer_set = self.generate_quantizer_set("_moe_fc2", n_groups=num_local_experts)
+
         # Param registrations -- must run OUTSIDE any JAX transform that
         # alters the variable scope (e.g. shard_map). The functional
         # ``moe(...)`` opens its own shard_map internally for the EP
@@ -249,8 +253,6 @@ class _MoEBlock(TransformerEngineBase):
                 jnp.float32,
             )
 
-        ep_axis = get_active_resource_axis("ep_resource")
-
         return moe(
             inputs,
             gate_kernel,
@@ -261,6 +263,8 @@ class _MoEBlock(TransformerEngineBase):
             wi_1_bias,
             wo_bias,
             expert_bias,
+            fc1_quantizer_set,
+            fc2_quantizer_set,
             num_experts=self.num_experts,
             num_experts_per_tok=self.num_experts_per_tok,
             activation_type=self.activation_type,

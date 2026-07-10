@@ -441,6 +441,7 @@ def _ffn_fwd_per_shard(
         sorted_x_for_quant, fc1_quantizer_set.x, local_group_sizes, flatten_axis=-1
     )
     casted_wi = tex.grouped_quantize(wi_combined, fc1_quantizer_set.kernel, flatten_axis=-1)
+    casted_intermediate = None
     if use_cudnn_cutedsl_fusion:
         from .cutedsl_extensions.moe import (
             grouped_gemm_swiglu_mxfp8,
@@ -457,8 +458,10 @@ def _ffn_fwd_per_shard(
         )
         (
             combined_out_3d,
-            intermediate_3d,
-            _intermediate_secondary,
+            intermediate_row,
+            intermediate_col,
+            intermediate_scale_row,
+            intermediate_scale_col,
         ) = grouped_gemm_swiglu_mxfp8(
             casted_sorted_x_lhs.data.reshape(sorted_x.shape[0], hidden, 1),
             # TE stores the colwise payload in logical [E,K,N] order even
@@ -472,11 +475,49 @@ def _ffn_fwd_per_shard(
             padded_offsets,
             prob,
             compute_dtype=sorted_x.dtype,
-            output_dtype=sorted_x.dtype,
+            output_dtype=fc2_quantizer_set.x.q_dtype,
         )
         combined_out = combined_out_3d.reshape(sorted_x.shape[0], wi_combined.shape[-1])
         gate_proj_out, up_proj_out = unpack_swiglu_pair(combined_out)
-        intermediate = intermediate_3d.reshape(sorted_x.shape[0], gate_proj_out.shape[-1])
+
+        intermediate_shape = (sorted_x.shape[0], gate_proj_out.shape[-1])
+        scaling_mode = fc2_quantizer_set.x.scaling_mode
+        row_scale_size = scaling_mode.get_grouped_scale_shape(
+            intermediate_shape,
+            num_local_experts,
+            False,
+            is_padded=True,
+            flatten_axis=1,
+        )[0]
+        col_scale_size = scaling_mode.get_grouped_scale_shape(
+            intermediate_shape,
+            num_local_experts,
+            True,
+            is_padded=True,
+            flatten_axis=1,
+        )[0]
+        intermediate_scale_row = jnp.pad(
+            intermediate_scale_row,
+            (0, row_scale_size - intermediate_scale_row.size),
+        )
+        intermediate_scale_col = jnp.pad(
+            intermediate_scale_col,
+            (0, col_scale_size - intermediate_scale_col.size),
+        )
+        casted_intermediate = ScaledTensorFactory.create(
+            data=intermediate_row.reshape(-1),
+            scale_inv=intermediate_scale_row,
+            colwise_data=intermediate_col.reshape(-1),
+            colwise_scale_inv=intermediate_scale_col,
+            scaling_mode=scaling_mode,
+            dq_dtype=sorted_x.dtype,
+            data_layout=fc2_quantizer_set.x.data_layout,
+            q_layout=fc2_quantizer_set.x.q_layout,
+            flatten_axis=1,
+            first_dims=local_group_sizes,
+            original_shape=intermediate_shape,
+            pre_swizzled=True,
+        )
     else:
         combined_out = tex.grouped_gemm(
             casted_sorted_x.get_tensor(usage=TensorUsage.LHS),
@@ -519,9 +560,11 @@ def _ffn_fwd_per_shard(
         active = (recv_w_flat != 0)[:, None]
         intermediate = jnp.where(active, intermediate * w_b, jnp.zeros_like(intermediate))
 
-    casted_intermediate = tex.grouped_quantize(
-        intermediate, fc2_quantizer_set.x, local_group_sizes, flatten_axis=-1
-    )
+    if not use_cudnn_cutedsl_fusion:
+        casted_intermediate = tex.grouped_quantize(
+            intermediate, fc2_quantizer_set.x, local_group_sizes, flatten_axis=-1
+        )
+    assert casted_intermediate is not None
     casted_wo = tex.grouped_quantize(wo, fc2_quantizer_set.kernel, flatten_axis=-1)
     expert_outputs = tex.grouped_gemm(
         casted_intermediate.get_tensor(usage=TensorUsage.LHS),
