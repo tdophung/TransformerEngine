@@ -75,7 +75,7 @@ def _use_cudnn_cutedsl_fusion_from_env() -> bool:
     return value == "1"
 
 
-def _validate_cudnn_cutedsl_fusion(
+def _can_use_cudnn_cutedsl_fusion(
     x,
     wi_0,
     wi_1,
@@ -87,16 +87,21 @@ def _validate_cudnn_cutedsl_fusion(
     num_experts,
     activation_type,
     ep_axis,
-) -> None:
-    """Validate the intentionally narrow first supported fusion surface."""
+) -> bool:
+    """Return whether this call matches the narrow first supported fusion surface."""
     from transformer_engine_jax import get_device_compute_capability
 
-    from .cutedsl_extensions.moe import load_grouped_gemm_swiglu_kernel
+    from .cutedsl_extensions.moe import cudnn_cutedsl_runtime_error
     from .quantize import GroupedQuantizer, ScalingMode
 
     errors = []
-    if get_device_compute_capability(0) < 100:
-        errors.append("requires an SM100+ GPU")
+    try:
+        compute_capability = get_device_compute_capability(0)
+    except RuntimeError as exc:
+        errors.append(f"could not query GPU compute capability: {exc}")
+    else:
+        if compute_capability != 100:
+            errors.append(f"requires an SM100 GPU, got SM{compute_capability}")
     if str(activation_type).lower() != "silu":
         errors.append("requires activation_type='silu'")
     if wi_0_bias is not None or wi_1_bias is not None:
@@ -136,15 +141,11 @@ def _validate_cudnn_cutedsl_fusion(
         if num_local_experts > 1024:
             errors.append(f"requires at most 1024 local experts, got {num_local_experts}")
 
-    try:
-        load_grouped_gemm_swiglu_kernel()
-    except (ImportError, ModuleNotFoundError, RuntimeError) as exc:
-        errors.append(f"could not load the cuDNN frontend CuTeDSL kernel: {exc}")
+    runtime_error = cudnn_cutedsl_runtime_error()
+    if runtime_error is not None:
+        errors.append(runtime_error)
 
-    if errors:
-        raise ValueError(
-            f"{_CUDNN_CUTEDSL_ENV}=1 is unsupported for this moe() call:\n- " + "\n- ".join(errors)
-        )
+    return not errors
 
 
 def _with_sharding_constraint_cast_bwd(x: jnp.ndarray, sharding) -> jnp.ndarray:
@@ -1538,10 +1539,10 @@ def moe(
         view; this lives off the dispatch critical path.
 
     The default per-expert dispatch-slot alignment is 128 tokens. Setting
-    ``NVTE_JAX_MOE_USE_CUDNN_CUTEDSL_FUSION=1`` opts an eligible MXFP8
-    SwiGLU call into the cuDNN frontend CuTeDSL FC1 fusion and raises the
-    alignment to the kernel-required 256 tokens. Unsupported opt-in calls
-    fail rather than silently falling back.
+    ``NVTE_JAX_MOE_USE_CUDNN_CUTEDSL_FUSION=1`` lets eligible MXFP8 SwiGLU
+    calls use the cuDNN frontend CuTeDSL FC1 fusion and raises dispatch
+    alignment to the kernel-required 256 tokens. Calls outside that narrow
+    surface fall back to the existing CUDA C++ grouped-GEMM path.
 
     Axis-name parameters:
 
@@ -1572,9 +1573,9 @@ def moe(
     surrounding design rationale.
     """
     score_function = _validate_score_function(score_function)
-    use_cudnn_cutedsl_fusion = _use_cudnn_cutedsl_fusion_from_env()
-    if use_cudnn_cutedsl_fusion:
-        _validate_cudnn_cutedsl_fusion(
+    use_cudnn_cutedsl_fusion = False
+    if _use_cudnn_cutedsl_fusion_from_env():
+        use_cudnn_cutedsl_fusion = _can_use_cudnn_cutedsl_fusion(
             x,
             wi_0,
             wi_1,
