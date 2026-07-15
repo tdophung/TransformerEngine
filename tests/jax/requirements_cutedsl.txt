@@ -1,0 +1,4 @@
+# Known-good baseline for the JAX CuTeDSL MoE pipeclean.
+jax[cuda13]>=0.9.1
+nvidia-cudnn-frontend==1.25.0
+nvidia-cutlass-dsl[cu13]==4.5.2

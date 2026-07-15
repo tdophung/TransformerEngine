@@ -148,7 +148,9 @@ def _cudnn_cutedsl_fusion_rejection_reasons(
     else:
         try:
             if not cutlass_jax.is_available():
-                errors.append("cutlass.jax.is_available() is false; check cute_dsl_runtime.so discovery")
+                errors.append(
+                    "cutlass.jax.is_available() is false; check cute_dsl_runtime.so discovery"
+                )
         except (AttributeError, RuntimeError) as exc:
             errors.append(f"CUTLASS JAX runtime check failed: {exc}")
 

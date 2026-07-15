@@ -123,6 +123,7 @@ from transformer_engine.jax import autocast
 from transformer_engine.jax.moe import (
     _ALIGN_SIZE,
     _CUDNN_CUTEDSL_ALIGN_SIZE,
+    _use_cudnn_cutedsl_fusion_from_env,
     moe,
     record_ep_bootstrap_signature_for_moe,
 )
@@ -238,7 +239,7 @@ def mesh():
 
     num_procs = jax.process_count()
     max_tokens_per_rank = (BATCH // num_procs) * SEQ
-    fusion_enabled = os.getenv("NVTE_JAX_MOE_USE_CUDNN_CUTEDSL_FUSION", "0") == "1"
+    fusion_enabled = _use_cudnn_cutedsl_fusion_from_env()
     alignment = _CUDNN_CUTEDSL_ALIGN_SIZE if fusion_enabled else _ALIGN_SIZE
     recv_capacity_per_rank = _compute_worst_case_recv_pr(alignment)
 
@@ -708,8 +709,8 @@ class TestTeEpMoeCudnnCutedslFusion:
     """End-to-end MXFP8 coverage for the opt-in FC1+SwiGLU+quant fusion."""
 
     @pytest.mark.parametrize("apply_topk_weights_early", [False, True])
-    def test_mxfp8_forward_and_backward(self, mesh, apply_topk_weights_early):
-        if os.getenv("NVTE_JAX_MOE_USE_CUDNN_CUTEDSL_FUSION", "0") != "1":
+    def test_mxfp8_forward_and_backward(self, mesh, apply_topk_weights_early, monkeypatch):
+        if not _use_cudnn_cutedsl_fusion_from_env():
             pytest.skip("run separately with NVTE_JAX_MOE_USE_CUDNN_CUTEDSL_FUSION=1")
         block = _make_block(apply_topk_weights_early=apply_topk_weights_early)
         x = _make_inputs(jax.random.PRNGKey(30))
@@ -731,8 +732,35 @@ class TestTeEpMoeCudnnCutedslFusion:
             grads, grad_x = jax.jit(jax.grad(loss_fn, argnums=(0, 1)))(variables, x_sh)
             jax.block_until_ready((fused, grads, grad_x))
 
+        # Compile the same block and parameters through the ordinary
+        # grouped_gemm + SwiGLU + grouped_quantize path. The 256-aligned
+        # bootstrap allocation used by the fused run is also wide enough for
+        # the unfused 128-aligned dispatch.
+        monkeypatch.setenv("NVTE_JAX_MOE_USE_CUDNN_CUTEDSL_FUSION", "0")
+        with _ctx(mesh), autocast(
+            enabled=True,
+            recipe=MXFP8BlockScaling(),
+            mesh_resource=mesh_resource,
+        ):
+            unfused, _ = jax.jit(block.apply)(variables, _shard_inputs(x, mesh))
+
+            def unfused_loss_fn(vars_arg, x_arg):
+                output, _ = block.apply(vars_arg, x_arg)
+                return jnp.mean(output.astype(jnp.float32) ** 2)
+
+            unfused_grads, unfused_grad_x = jax.jit(jax.grad(unfused_loss_fn, argnums=(0, 1)))(
+                variables, _shard_inputs(x, mesh)
+            )
+            jax.block_until_ready((unfused, unfused_grads, unfused_grad_x))
+        monkeypatch.setenv("NVTE_JAX_MOE_USE_CUDNN_CUTEDSL_FUSION", "1")
+
         fused_np = _to_global_numpy(fused, mesh).astype(np.float32)
+        unfused_np = _to_global_numpy(unfused, mesh).astype(np.float32)
         assert np.all(np.isfinite(fused_np))
+        relative_error = np.linalg.norm(fused_np - unfused_np) / max(
+            np.linalg.norm(unfused_np), 1e-12
+        )
+        assert relative_error < 0.2, f"fused/unfused forward relative error {relative_error:.4f}"
 
         params_np = _params_global_numpy(variables, mesh)
         reference, _ = _pure_jax_moe_reference(
@@ -753,8 +781,25 @@ class TestTeEpMoeCudnnCutedslFusion:
             assert np.all(np.isfinite(grad)), f"{name} fused MXFP8 grad has NaN/Inf"
             assert np.any(grad != 0), f"{name} fused MXFP8 grad is identically zero"
         grad_x_np = _to_global_numpy(grad_x, mesh).astype(np.float32)
+        unfused_grad_x_np = _to_global_numpy(unfused_grad_x, mesh).astype(np.float32)
         assert np.all(np.isfinite(grad_x_np))
         assert np.any(grad_x_np != 0)
+        relative_error = np.linalg.norm(grad_x_np - unfused_grad_x_np) / max(
+            np.linalg.norm(unfused_grad_x_np), 1e-12
+        )
+        assert relative_error < 0.35, f"d_x fused/unfused relative error {relative_error:.4f}"
+
+        for name in ("gate_kernel", "wi_0", "wi_1", "wo"):
+            fused_grad = _to_global_numpy(_unwrap(grads["params"][name]), mesh).astype(np.float32)
+            unfused_grad = _to_global_numpy(_unwrap(unfused_grads["params"][name]), mesh).astype(
+                np.float32
+            )
+            relative_error = np.linalg.norm(fused_grad - unfused_grad) / max(
+                np.linalg.norm(unfused_grad), 1e-12
+            )
+            assert (
+                relative_error < 0.35
+            ), f"{name} fused/unfused VJP relative error {relative_error:.4f} exceeds 0.35"
 
         # A finite gradient is not sufficient: a layout error can produce a
         # finite but numerically invalid VJP that corrupts parameters on the
@@ -807,7 +852,7 @@ class TestTeEpMoeCudnnCutedslFusion:
 
     def test_maxtext_shape_vjp_update_stays_finite(self, mesh):
         """Regression for the NaN observed after MaxText's first update."""
-        if os.getenv("NVTE_JAX_MOE_USE_CUDNN_CUTEDSL_FUSION", "0") != "1":
+        if not _use_cudnn_cutedsl_fusion_from_env():
             pytest.skip("run separately with NVTE_JAX_MOE_USE_CUDNN_CUTEDSL_FUSION=1")
         if not _MAXTEXT_CUTEDSL_REGRESSION:
             pytest.skip("set TE_EP_MOE_MAXTEXT_CUTEDSL_REGRESSION=1 for the large regression")

@@ -498,6 +498,16 @@ JAX-Specific Variables
    :Default: None
    :Description: Test level for JAX unit tests (``"L0"``, ``"L1"``, ``"L2"``). Used internally by the test suite.
 
+.. envvar:: NVTE_JAX_MOE_USE_CUDNN_CUTEDSL_FUSION
+
+   :Type: ``int`` (0 or 1)
+   :Default: ``0``
+   :Description: **(JAX only)** Enable the experimental cuDNN frontend CuTeDSL fusion
+      for MXFP8 MoE FC1 grouped GEMM, SwiGLU, and grouped quantization. Explicit
+      opt-in requires an eligible SM100 SwiGLU MXFP8 MoE call and the optional
+      CUTLASS/cuDNN frontend JAX runtime packages; unsupported calls fail with the
+      full validation reason list.
+
 JAX Triton Extensions
 ^^^^^^^^^^^^^^^^^^^^^
 

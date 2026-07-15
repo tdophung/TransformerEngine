@@ -93,3 +93,4 @@ Conventions used across these documents
    jax/collective_gemm
    jax/attention
    jax/expert_parallelism
+   jax/cutedsl_moe_pipeclean

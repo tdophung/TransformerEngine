@@ -69,8 +69,8 @@ def test_grouped_gemm_swiglu_cutlass_call_raw_projection_parity():
     try:
         from transformer_engine_jax import get_device_compute_capability
 
-        if get_device_compute_capability(0) < 100:
-            pytest.skip("cuDNN frontend grouped GEMM SwiGLU requires SM100+")
+        if get_device_compute_capability(0) != 100:
+            pytest.skip("cuDNN frontend grouped GEMM SwiGLU requires SM100")
         load_grouped_gemm_swiglu_kernel()
         import cutlass.jax  # noqa: F401  # pylint: disable=unused-import,import-outside-toplevel
     except (ImportError, RuntimeError) as exc:
@@ -117,7 +117,7 @@ def test_grouped_gemm_swiglu_cutlass_call_raw_projection_parity():
             jnp.cumsum(group_sizes),
             jnp.ones((rows, 1, 1), dtype=jnp.float32),
             compute_dtype=jnp.bfloat16,
-            output_dtype=jnp.bfloat16,
+            output_dtype=jnp.float8_e4m3fn,
         )
         return (
             reference,
@@ -132,6 +132,7 @@ def test_grouped_gemm_swiglu_cutlass_call_raw_projection_parity():
     jax.block_until_ready((reference, combined, swiglu_row, swiglu_col))
     np.testing.assert_array_equal(combined, reference)
     assert swiglu_row.shape == swiglu_col.shape == (rows, intermediate, 1)
+    assert swiglu_row.dtype == swiglu_col.dtype == jnp.float8_e4m3fn
     assert scale_row.dtype == scale_col.dtype == jnp.float8_e8m0fnu
 
     gate, up = unpack_swiglu_pair(combined)

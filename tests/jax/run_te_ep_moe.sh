@@ -33,6 +33,9 @@ echo "  test file          : $TEST_FILE"
 echo "  coordinator        : $TE_EP_MOE_COORDINATOR_ADDRESS"
 echo "  XLA_PYTHON_CLIENT_PREALLOCATE: $XLA_PYTHON_CLIENT_PREALLOCATE"
 echo "  XLA_PYTHON_CLIENT_MEM_FRACTION: $XLA_PYTHON_CLIENT_MEM_FRACTION"
+if [ "$#" -gt 0 ]; then
+    echo "  extra pytest args  : $*"
+fi
 echo "============================================================"
 
 if [ -n "${TE_EP_MOE_MP_LOG_DIR:-}" ]; then
@@ -69,6 +72,7 @@ for i in $(seq 0 $((NUM_GPUS - 1))); do
         -v -s
         --num-process="$NUM_GPUS"
         --process-id="$i"
+        "$@"
     )
     if [ "$i" -eq 0 ]; then
         echo "=== Live output from process 0 ==="
