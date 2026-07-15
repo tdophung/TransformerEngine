@@ -75,7 +75,7 @@ def _use_cudnn_cutedsl_fusion_from_env() -> bool:
     return value == "1"
 
 
-def _can_use_cudnn_cutedsl_fusion(
+def _cudnn_cutedsl_fusion_rejection_reasons(
     x,
     wi_0,
     wi_1,
@@ -87,8 +87,8 @@ def _can_use_cudnn_cutedsl_fusion(
     num_experts,
     activation_type,
     ep_axis,
-) -> bool:
-    """Return whether this call matches the narrow first supported fusion surface."""
+) -> list[str]:
+    """Return reasons this call cannot use the CuTeDSL fusion, or an empty list."""
     from transformer_engine_jax import get_device_compute_capability
 
     from .cutedsl_extensions.moe import cudnn_cutedsl_runtime_error
@@ -145,7 +145,7 @@ def _can_use_cudnn_cutedsl_fusion(
     if runtime_error is not None:
         errors.append(runtime_error)
 
-    return not errors
+    return errors
 
 
 def _with_sharding_constraint_cast_bwd(x: jnp.ndarray, sharding) -> jnp.ndarray:
@@ -1539,10 +1539,10 @@ def moe(
         view; this lives off the dispatch critical path.
 
     The default per-expert dispatch-slot alignment is 128 tokens. Setting
-    ``NVTE_JAX_MOE_USE_CUDNN_CUTEDSL_FUSION=1`` lets eligible MXFP8 SwiGLU
-    calls use the cuDNN frontend CuTeDSL FC1 fusion and raises dispatch
-    alignment to the kernel-required 256 tokens. Calls outside that narrow
-    surface fall back to the existing CUDA C++ grouped-GEMM path.
+    ``NVTE_JAX_MOE_USE_CUDNN_CUTEDSL_FUSION=1`` requires the call to match
+    the eligible MXFP8 SwiGLU surface, uses the cuDNN frontend CuTeDSL FC1
+    fusion, and raises dispatch alignment to the kernel-required 256 tokens.
+    Ineligible opt-in calls fail with the reasons they cannot use CuTeDSL.
 
     Axis-name parameters:
 
@@ -1575,7 +1575,7 @@ def moe(
     score_function = _validate_score_function(score_function)
     use_cudnn_cutedsl_fusion = False
     if _use_cudnn_cutedsl_fusion_from_env():
-        use_cudnn_cutedsl_fusion = _can_use_cudnn_cutedsl_fusion(
+        rejection_reasons = _cudnn_cutedsl_fusion_rejection_reasons(
             x,
             wi_0,
             wi_1,
@@ -1587,6 +1587,12 @@ def moe(
             activation_type=activation_type,
             ep_axis=ep_axis,
         )
+        if rejection_reasons:
+            raise ValueError(
+                f"{_CUDNN_CUTEDSL_ENV}=1 is unsupported for this moe() call:\n- "
+                + "\n- ".join(rejection_reasons)
+            )
+        use_cudnn_cutedsl_fusion = True
 
     # Enforce ((outer_dp..., ep), None, None) on inbound activations. The
     # EP comm groups consecutive global ranks (dp_color = rank // ep_size),
