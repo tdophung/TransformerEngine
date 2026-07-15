@@ -91,7 +91,10 @@ def _cudnn_cutedsl_fusion_rejection_reasons(
     """Return reasons this call cannot use the CuTeDSL fusion, or an empty list."""
     from transformer_engine_jax import get_device_compute_capability
 
-    from .cutedsl_extensions.moe import load_grouped_gemm_swiglu_kernel
+    from .cutedsl_extensions.moe import (
+        load_grouped_gemm_dswiglu_kernel,
+        load_grouped_gemm_swiglu_kernel,
+    )
     from .quantize import GroupedQuantizer, ScalingMode
 
     errors = []
@@ -116,7 +119,10 @@ def _cudnn_cutedsl_fusion_rejection_reasons(
     required_quantizers = {
         "fc1.x": fc1_quantizer_set.x,
         "fc1.kernel": fc1_quantizer_set.kernel,
+        "fc1.dgrad": fc1_quantizer_set.dgrad,
         "fc2.x": fc2_quantizer_set.x,
+        "fc2.kernel": fc2_quantizer_set.kernel,
+        "fc2.dgrad": fc2_quantizer_set.dgrad,
     }
     for name, quantizer in required_quantizers.items():
         if not isinstance(quantizer, GroupedQuantizer):
@@ -129,11 +135,15 @@ def _cudnn_cutedsl_fusion_rejection_reasons(
     if all(isinstance(q, GroupedQuantizer) for q in required_quantizers.values()):
         if fc1_quantizer_set.x.q_dtype != fc1_quantizer_set.kernel.q_dtype:
             errors.append("requires identical FC1 activation and weight MXFP8 payload dtypes")
+        if fc2_quantizer_set.dgrad.q_dtype != fc2_quantizer_set.kernel.q_dtype:
+            errors.append(
+                "requires identical FC2 dgrad and weight MXFP8 payload dtypes for "
+                "dSwiGLU backward fusion"
+            )
         supported = (jnp.float8_e4m3fn, jnp.float8_e5m2)
-        if fc1_quantizer_set.x.q_dtype not in supported:
-            errors.append(f"unsupported FC1 MXFP8 payload dtype {fc1_quantizer_set.x.q_dtype}")
-        if fc2_quantizer_set.x.q_dtype not in supported:
-            errors.append(f"unsupported FC2 MXFP8 payload dtype {fc2_quantizer_set.x.q_dtype}")
+        for name, quantizer in required_quantizers.items():
+            if quantizer.q_dtype not in supported:
+                errors.append(f"unsupported MXFP8 payload dtype {quantizer.q_dtype} for {name}")
 
     mesh = _get_mesh()
     if mesh is not None and not mesh.empty and ep_axis in mesh.shape:
@@ -154,10 +164,14 @@ def _cudnn_cutedsl_fusion_rejection_reasons(
         except (AttributeError, RuntimeError) as exc:
             errors.append(f"CUTLASS JAX runtime check failed: {exc}")
 
-    try:
-        load_grouped_gemm_swiglu_kernel()
-    except (ImportError, ModuleNotFoundError, RuntimeError) as exc:
-        errors.append(f"could not load the cuDNN frontend CuTeDSL kernel: {exc}")
+    for kernel_name, loader in (
+        ("SwiGLU forward", load_grouped_gemm_swiglu_kernel),
+        ("dSwiGLU backward", load_grouped_gemm_dswiglu_kernel),
+    ):
+        try:
+            loader()
+        except (ImportError, ModuleNotFoundError, RuntimeError) as exc:
+            errors.append(f"could not load the cuDNN frontend {kernel_name} kernel: {exc}")
 
     return errors
 
@@ -691,11 +705,6 @@ def _ffn_bwd_per_shard(
     )
     _casted_d_eo_lhs = casted_d_eo.get_tensor(usage=TensorUsage.LHS)
     _casted_d_eo_rhs = casted_d_eo.get_tensor(usage=TensorUsage.RHS)
-    d_intermediate = tex.grouped_gemm(
-        _casted_d_eo_lhs,
-        casted_wo_rhs_trans,
-        contracting_dims=((1,), (2,)),
-    )
     d_wo = tex.grouped_gemm(
         casted_intermediate_lhs_trans,
         _casted_d_eo_rhs,
@@ -704,49 +713,122 @@ def _ffn_bwd_per_shard(
     d_wo = jnp.where(wgrad_group_active, d_wo, jnp.zeros_like(d_wo))
     d_wo_bias = tex.grouped_dbias(d_eo_2d, local_group_sizes) if has_bias else None
 
-    act_fn = _convert_to_activation_function(activation_type)
-    if apply_topk_weights_early:
-        # intermediate' = intermediate * w * mask. Split the cotangent
-        # across both factors before the activation bwd consumes it. Padded
-        # recv slots may still be NaN in the saved activation residuals, so
-        # use zero-filled residuals on inactive rows before the activation VJP.
-        w_b = recv_w_flat[:, None].astype(d_intermediate.dtype)
-        active = (recv_w_flat != 0)[:, None]
-        gate_proj_for_bwd = jnp.where(active, gate_proj_out, jnp.zeros_like(gate_proj_out))
-        up_proj_for_bwd = jnp.where(active, up_proj_out, jnp.zeros_like(up_proj_out))
-        intermediate_unweighted = act_fn(gate_proj_for_bwd) * up_proj_for_bwd
-        d_recv_w_from_intermediate = jnp.sum(
-            d_intermediate * intermediate_unweighted,
-            axis=-1,
-        ).astype(recv_w_flat.dtype)
-        d_intermediate = jnp.where(active, d_intermediate * w_b, jnp.zeros_like(d_intermediate))
-    else:
-        gate_proj_for_bwd = gate_proj_out
-        up_proj_for_bwd = up_proj_out
-        d_recv_w_from_intermediate = jnp.zeros_like(recv_w_flat)
-
-    # Activation bwd, symmetric with the fwd: silu' and the two
-    # elementwise products run in the GEMM dtype (no fp32 island), so
-    # the chain rule composes through at the same precision the wi/wo
-    # GEMMs consume.
-    act_gp, dact_pullback = jax.vjp(act_fn, gate_proj_for_bwd)
-    d_up_proj_out = d_intermediate * act_gp
-    (d_gate_proj_out,) = dact_pullback(d_intermediate * up_proj_for_bwd)
-
-    # wi bwd (fused gate/up via concat). Mirror the fused fwd: pack the
-    # gate/up cotangents along the trailing axis, run a single
-    # grouped_quantize + two grouped_gemm pair (one dgrad, one wgrad)
-    # against the fused casted_wi_rhs_trans residual, then split the
-    # wgrad result back into d_wi_0 / d_wi_1 halves with jnp.split.
     if use_cudnn_cutedsl_fusion:
-        from .cutedsl_extensions.moe import pack_swiglu_pair
+        from .cutedsl_extensions.moe import (
+            grouped_gemm_dswiglu_mxfp8,
+            pack_swiglu_pair,
+        )
 
-        d_combined = pack_swiglu_pair(d_gate_proj_out, d_up_proj_out)
+        packed_forward = pack_swiglu_pair(gate_proj_out, up_proj_out)
+        padded_offsets = jnp.cumsum(local_group_sizes, dtype=jnp.int32)
+        prob = (
+            recv_w_flat[:, None, None]
+            if apply_topk_weights_early
+            else jnp.ones((recv_rows, 1, 1), dtype=jnp.float32)
+        )
+        (
+            d_combined_row,
+            d_combined_col,
+            d_combined_scale_row,
+            d_combined_scale_col,
+            dprob,
+        ) = grouped_gemm_dswiglu_mxfp8(
+            _casted_d_eo_lhs.data.reshape(recv_rows, hidden, 1),
+            casted_wo_rhs_trans.data.reshape(
+                num_local_experts, intermediate_size, hidden
+            ).transpose(1, 2, 0),
+            packed_forward.reshape(recv_rows, 2 * intermediate_size, 1),
+            _casted_d_eo_lhs.scale_inv,
+            casted_wo_rhs_trans.scale_inv,
+            padded_offsets,
+            prob,
+            output_dtype=fc1_quantizer_set.dgrad.q_dtype,
+        )
+        d_combined_shape = (recv_rows, 2 * intermediate_size)
+        scaling_mode = fc1_quantizer_set.dgrad.scaling_mode
+        row_scale_size = scaling_mode.get_grouped_scale_shape(
+            d_combined_shape,
+            num_local_experts,
+            False,
+            is_padded=True,
+            flatten_axis=1,
+        )[0]
+        col_scale_size = scaling_mode.get_grouped_scale_shape(
+            d_combined_shape,
+            num_local_experts,
+            True,
+            is_padded=True,
+            flatten_axis=1,
+        )[0]
+        d_combined_scale_row = jnp.pad(
+            d_combined_scale_row,
+            (0, row_scale_size - d_combined_scale_row.size),
+        )
+        d_combined_scale_col = jnp.pad(
+            d_combined_scale_col,
+            (0, col_scale_size - d_combined_scale_col.size),
+        )
+        casted_d_combined = ScaledTensorFactory.create(
+            data=d_combined_row.reshape(-1),
+            scale_inv=d_combined_scale_row,
+            colwise_data=d_combined_col.reshape(-1),
+            colwise_scale_inv=d_combined_scale_col,
+            scaling_mode=scaling_mode,
+            dq_dtype=gate_proj_out.dtype,
+            data_layout=fc1_quantizer_set.dgrad.data_layout,
+            q_layout=fc1_quantizer_set.dgrad.q_layout,
+            flatten_axis=1,
+            first_dims=local_group_sizes,
+            original_shape=d_combined_shape,
+            pre_swizzled=True,
+        )
+        active = (recv_w_flat != 0)
+        d_recv_w_from_intermediate = (
+            jnp.where(active, dprob.reshape(-1), jnp.zeros_like(recv_w_flat))
+            if apply_topk_weights_early
+            else jnp.zeros_like(recv_w_flat)
+        ).astype(recv_w_flat.dtype)
+        d_combined_for_bias = None
     else:
-        d_combined = jnp.concatenate([d_gate_proj_out, d_up_proj_out], axis=-1)
-    casted_d_combined = tex.grouped_quantize(
-        d_combined, fc1_quantizer_set.dgrad, local_group_sizes, flatten_axis=-1
-    )
+        d_intermediate = tex.grouped_gemm(
+            _casted_d_eo_lhs,
+            casted_wo_rhs_trans,
+            contracting_dims=((1,), (2,)),
+        )
+        act_fn = _convert_to_activation_function(activation_type)
+        if apply_topk_weights_early:
+            # intermediate' = intermediate * w * mask. Split the cotangent
+            # across both factors before the activation bwd consumes it. Padded
+            # recv slots may still be NaN in the saved activation residuals, so
+            # use zero-filled residuals on inactive rows before the activation VJP.
+            w_b = recv_w_flat[:, None].astype(d_intermediate.dtype)
+            active = (recv_w_flat != 0)[:, None]
+            gate_proj_for_bwd = jnp.where(active, gate_proj_out, jnp.zeros_like(gate_proj_out))
+            up_proj_for_bwd = jnp.where(active, up_proj_out, jnp.zeros_like(up_proj_out))
+            intermediate_unweighted = act_fn(gate_proj_for_bwd) * up_proj_for_bwd
+            d_recv_w_from_intermediate = jnp.sum(
+                d_intermediate * intermediate_unweighted,
+                axis=-1,
+            ).astype(recv_w_flat.dtype)
+            d_intermediate = jnp.where(
+                active, d_intermediate * w_b, jnp.zeros_like(d_intermediate)
+            )
+        else:
+            gate_proj_for_bwd = gate_proj_out
+            up_proj_for_bwd = up_proj_out
+            d_recv_w_from_intermediate = jnp.zeros_like(recv_w_flat)
+
+        # Activation bwd, symmetric with the fwd: silu' and the two
+        # elementwise products run in the GEMM dtype (no fp32 island), so
+        # the chain rule composes through at the same precision the wi/wo
+        # GEMMs consume.
+        act_gp, dact_pullback = jax.vjp(act_fn, gate_proj_for_bwd)
+        d_up_proj_out = d_intermediate * act_gp
+        (d_gate_proj_out,) = dact_pullback(d_intermediate * up_proj_for_bwd)
+        d_combined_for_bias = jnp.concatenate([d_gate_proj_out, d_up_proj_out], axis=-1)
+        casted_d_combined = tex.grouped_quantize(
+            d_combined_for_bias, fc1_quantizer_set.dgrad, local_group_sizes, flatten_axis=-1
+        )
     d_sorted_x = tex.grouped_gemm(
         casted_d_combined.get_tensor(usage=TensorUsage.LHS),
         casted_wi_rhs_trans,
@@ -765,7 +847,7 @@ def _ffn_bwd_per_shard(
     else:
         d_wi_0, d_wi_1 = jnp.split(d_wi_combined, 2, axis=-1)
     if has_bias:
-        d_wi_combined_bias = tex.grouped_dbias(d_combined, local_group_sizes)
+        d_wi_combined_bias = tex.grouped_dbias(d_combined_for_bias, local_group_sizes)
         d_wi_0_bias, d_wi_1_bias = jnp.split(d_wi_combined_bias, 2, axis=-1)
     else:
         d_wi_0_bias = None
