@@ -91,7 +91,7 @@ def _cudnn_cutedsl_fusion_rejection_reasons(
     """Return reasons this call cannot use the CuTeDSL fusion, or an empty list."""
     from transformer_engine_jax import get_device_compute_capability
 
-    from .cutedsl_extensions.moe import cudnn_cutedsl_runtime_error
+    from .cutedsl_extensions.moe import load_grouped_gemm_swiglu_kernel
     from .quantize import GroupedQuantizer, ScalingMode
 
     errors = []
@@ -141,9 +141,21 @@ def _cudnn_cutedsl_fusion_rejection_reasons(
         if num_local_experts > 1024:
             errors.append(f"requires at most 1024 local experts, got {num_local_experts}")
 
-    runtime_error = cudnn_cutedsl_runtime_error()
-    if runtime_error is not None:
-        errors.append(runtime_error)
+    try:
+        import cutlass.jax as cutlass_jax
+    except ImportError as exc:
+        errors.append(f"nvidia-cutlass-dsl with JAX bindings is required: {exc}")
+    else:
+        try:
+            if not cutlass_jax.is_available():
+                errors.append("cutlass.jax.is_available() is false; check cute_dsl_runtime.so discovery")
+        except (AttributeError, RuntimeError) as exc:
+            errors.append(f"CUTLASS JAX runtime check failed: {exc}")
+
+    try:
+        load_grouped_gemm_swiglu_kernel()
+    except (ImportError, ModuleNotFoundError, RuntimeError) as exc:
+        errors.append(f"could not load the cuDNN frontend CuTeDSL kernel: {exc}")
 
     return errors
 
