@@ -56,7 +56,7 @@ def _patch_atomic_add_float32_for_cutlass_dsl(utils_module) -> None:
     try:
         import cutlass
         from cutlass._mlir.dialects import nvvm
-        from cutlass.cutlass_dsl import Float32
+        from cutlass.cute.typing import Float32
     except ImportError:
         return
 
