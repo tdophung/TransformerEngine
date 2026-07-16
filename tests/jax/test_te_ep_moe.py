@@ -151,6 +151,16 @@ LOGICAL_AXIS_RULES = (
     ("batch", (EP_AXIS, FSDP_AXIS)),
 )
 
+
+@pytest.fixture(autouse=True)
+def _use_cutedsl_only_for_cutedsl_tests(request, monkeypatch):
+    # run_te_ep_moe.sh may be launched with the CuTeDSL env var enabled so
+    # the dedicated MXFP8 tests run. The non-MXFP8 tests should still exercise
+    # the ordinary CUDA C++ path instead of strict opt-in rejection.
+    cls = getattr(request.node, "cls", None)
+    if cls is None or cls.__name__ != "TestTeEpMoeCudnnCutedslFusion":
+        monkeypatch.setenv("NVTE_JAX_MOE_USE_CUDNN_CUTEDSL_FUSION", "0")
+
 # Small shapes so the parity tests stay tight on bf16. The block still
 # has all four ranks participating in dispatch/combine.  The explicit
 # MaxText-shape regression mode is selected by its dedicated test invocation;
