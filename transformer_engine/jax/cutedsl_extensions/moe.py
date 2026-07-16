@@ -51,6 +51,41 @@ def _load_source_module(name: str, path):
     return module
 
 
+def _patch_atomic_add_float32_for_cutlass_dsl(utils_module) -> None:
+    """Patch cuDNN frontend utility source for newer CUTLASS DSL bindings."""
+    try:
+        import cutlass
+        from cutlass._mlir.dialects import nvvm
+        from cutlass.cutlass_dsl import Float32
+    except ImportError:
+        return
+
+    def atomic_add_float32(ptr, value: Float32, *, loc=None, ip=None) -> Float32:
+        a = value.ir_value(loc=loc, ip=ip)
+        try:
+            old_value = nvvm.atomicrmw(
+                op=cutlass._mlir.dialects.nvvm.AtomicOpKind.FADD,
+                ptr=ptr,
+                a=a,
+                res=a.type,
+                loc=loc,
+                ip=ip,
+            )
+        except TypeError as exc:
+            if "res" not in str(exc):
+                raise
+            old_value = nvvm.atomicrmw(
+                op=cutlass._mlir.dialects.nvvm.AtomicOpKind.FADD,
+                ptr=ptr,
+                a=a,
+                loc=loc,
+                ip=ip,
+            )
+        return Float32(old_value)
+
+    utils_module.atomic_add_float32 = atomic_add_float32
+
+
 def _ensure_torch_annotation_stub() -> bool:
     # Do not shadow a real Torch installation. If it is installed, the
     # unmodified cuDNN frontend source can import it normally; the sentinel is
@@ -88,7 +123,8 @@ def _load_grouped_gemm_kernel_module(subpackage: str, filename: str):
 
     torch_stubbed = _ensure_torch_annotation_stub()
     try:
-        _load_source_module(f"{_PRIVATE_PACKAGE}.utils", utils_path)
+        utils_module = _load_source_module(f"{_PRIVATE_PACKAGE}.utils", utils_path)
+        _patch_atomic_add_float32_for_cutlass_dsl(utils_module)
         module_name = f"{private_subpackage}.{filename.removesuffix('.py')}"
         return _load_source_module(module_name, kernel_path)
     except Exception:

@@ -47,6 +47,8 @@ fi
 echo "Per-process logs: $LOG_DIR"
 
 PIDS=()
+EXITS=()
+PHASE_FAILED=0
 
 cleanup() {
     for pid in "${PIDS[@]:-}"; do
@@ -63,64 +65,96 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-for i in $(seq 0 $((NUM_GPUS - 1))); do
-    LOG_FILE="$LOG_DIR/proc_${i}.log"
-    PYTEST_CMD=(
-        python3 -m pytest -c "$PYTEST_INI"
-        "$TEST_FILE"
-        -p no:typeguard
-        -v -s
-        --num-process="$NUM_GPUS"
-        --process-id="$i"
-        "$@"
-    )
-    if [ "$i" -eq 0 ]; then
-        echo "=== Live output from process 0 ==="
-        "${PYTEST_CMD[@]}" 2>&1 | tee "$LOG_FILE" &
-    else
-        "${PYTEST_CMD[@]}" > "$LOG_FILE" 2>&1 &
-    fi
-    PIDS+=("$!")
-done
+run_phase() {
+    local phase_name="$1"
+    local fusion_env="$2"
+    shift 2
+    local -a phase_args=("$@")
+    local phase_log_dir="$LOG_DIR/$phase_name"
+    mkdir -p "$phase_log_dir"
+    PIDS=()
+    EXITS=()
 
-EXITS=()
-for pid in "${PIDS[@]}"; do
-    if wait "$pid"; then
-        EXITS+=("0")
+    echo
+    echo "============================================================"
+    echo "Phase: $phase_name"
+    echo "  NVTE_JAX_MOE_USE_CUDNN_CUTEDSL_FUSION=$fusion_env"
+    echo "  phase pytest args : ${phase_args[*]:-<none>}"
+    echo "  logs              : $phase_log_dir"
+    echo "============================================================"
+
+    for i in $(seq 0 $((NUM_GPUS - 1))); do
+        local log_file="$phase_log_dir/proc_${i}.log"
+        local -a pytest_cmd=(
+            python3 -m pytest -c "$PYTEST_INI"
+            "$TEST_FILE"
+            -p no:typeguard
+            -v -s
+            --num-process="$NUM_GPUS"
+            --process-id="$i"
+            "${phase_args[@]}"
+        )
+        if [ "$i" -eq 0 ]; then
+            echo "=== Live output from process 0 ($phase_name) ==="
+            env NVTE_JAX_MOE_USE_CUDNN_CUTEDSL_FUSION="$fusion_env" \
+                "${pytest_cmd[@]}" 2>&1 | tee "$log_file" &
+        else
+            env NVTE_JAX_MOE_USE_CUDNN_CUTEDSL_FUSION="$fusion_env" \
+                "${pytest_cmd[@]}" > "$log_file" 2>&1 &
+        fi
+        PIDS+=("$!")
+    done
+
+    for pid in "${PIDS[@]}"; do
+        if wait "$pid"; then
+            EXITS+=("0")
+        else
+            EXITS+=("$?")
+        fi
+    done
+
+    echo
+    echo "Per-process exit codes for $phase_name:"
+    for i in "${!EXITS[@]}"; do
+        echo "  proc $i -> ${EXITS[$i]}"
+    done
+
+    local failed=0
+    for e in "${EXITS[@]}"; do
+        if [ "$e" != "0" ] && [ "$e" != "5" ]; then
+            failed=1
+            break
+        fi
+    done
+    if [ "$failed" -ne 0 ]; then
+        PHASE_FAILED=1
+        echo "[run_te_ep_moe.sh] phase $phase_name FAILED"
+        echo "  process 0 tail:"
+        tail -20 "$phase_log_dir/proc_0.log" 2>/dev/null || true
     else
-        EXITS+=("$?")
+        echo "[run_te_ep_moe.sh] phase $phase_name PASSED"
     fi
-done
+}
+
+if [ "${NVTE_JAX_MOE_USE_CUDNN_CUTEDSL_FUSION:-0}" = "1" ]; then
+    # Keep ordinary CUDA C++ and CuTeDSL coverage in separate Python process
+    # groups. TE EP/NCCL caches layer alignment process-wide, so 128-token and
+    # 256-token dispatch-alignment tests cannot safely share one interpreter.
+    run_phase "ordinary" "0" -k "not TestTeEpMoeCudnnCutedslFusion" "$@"
+    run_phase "cutedsl" "1" -k "TestTeEpMoeCudnnCutedslFusion" "$@"
+else
+    run_phase "ordinary" "0" "$@"
+fi
 
 echo
-echo "============================================================"
-echo "Per-process exit codes:"
-for i in "${!EXITS[@]}"; do
-    echo "  proc $i -> ${EXITS[$i]}"
-done
-
-# Treat exit 0 (pass) and exit 5 (pytest "no tests collected", which the
-# file emits via pytest.skip(allow_module_level=True) on pre-Blackwell
-# GPUs) as success.
-FAILED=0
-for e in "${EXITS[@]}"; do
-    if [ "$e" != "0" ] && [ "$e" != "5" ]; then
-        FAILED=1
-        break
-    fi
-done
-
-echo
-if [ "$FAILED" -eq 0 ]; then
-    echo "[run_te_ep_moe.sh] all processes PASSED"
+if [ "$PHASE_FAILED" -eq 0 ]; then
+    echo "[run_te_ep_moe.sh] all phases PASSED"
     if [ -z "${TE_EP_MOE_MP_LOG_DIR:-}" ]; then
         rm -rf "$LOG_DIR"
     fi
     exit 0
 fi
 
-echo "[run_te_ep_moe.sh] at least one process FAILED"
+echo "[run_te_ep_moe.sh] at least one phase FAILED"
 echo "  retaining logs at $LOG_DIR for diagnosis"
-echo "  process 0 tail:"
-tail -20 "$LOG_DIR/proc_0.log" 2>/dev/null || true
 exit 1
