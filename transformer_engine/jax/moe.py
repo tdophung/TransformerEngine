@@ -458,16 +458,10 @@ def _ffn_fwd_per_shard(
         jnp.concatenate([wi_0_bias, wi_1_bias], axis=-1) if wi_0_bias is not None else None
     )
 
-    if use_cudnn_cutedsl_fusion:
-        # The EP receive buffer is intentionally overallocated and padded.
-        # Zero inactive rows before block quantization so padding cannot
-        # contaminate generated columnwise output scales.
-        active_rows = (recv_w_flat != 0)[:, None]
-        sorted_x_for_quant = jnp.where(active_rows, sorted_x, jnp.zeros_like(sorted_x))
-    else:
-        sorted_x_for_quant = sorted_x
+    # EP dispatch zero-fills aligned padding rows in recv_tokens, so
+    # inactive slots do not contaminate grouped quantization scales.
     casted_sorted_x = tex.grouped_quantize(
-        sorted_x_for_quant, fc1_quantizer_set.x, local_group_sizes, flatten_axis=-1
+        sorted_x, fc1_quantizer_set.x, local_group_sizes, flatten_axis=-1
     )
     casted_wi = tex.grouped_quantize(wi_combined, fc1_quantizer_set.kernel, flatten_axis=-1)
     casted_intermediate = None
@@ -580,14 +574,12 @@ def _ffn_fwd_per_shard(
     if apply_topk_weights_early and not use_cudnn_cutedsl_fusion:
         # Fold the per-token combine weights into the FFN intermediate;
         # the downstream wo GEMM is linear so this is equivalent to the
-        # late-weighting path. Padded recv slots can contain uninitialized
-        # data, so overwrite inactive rows with literal zeros instead of
-        # relying on multiplication by a zero mask (IEEE NaN * 0 = NaN).
+        # late-weighting path. EP dispatch zero-fills aligned padding tokens
+        # and routing weights; grouped ops exclude any trailing over-allocation,
+        # so a separate validity select is unnecessary.
         # ``w_b`` is cast to ``intermediate.dtype`` so the multiply doesn't
         # promote expert_outputs above the EP buffer's element width.
-        w_b = recv_w_flat[:, None].astype(intermediate.dtype)
-        active = (recv_w_flat != 0)[:, None]
-        intermediate = jnp.where(active, intermediate * w_b, jnp.zeros_like(intermediate))
+        intermediate = intermediate * recv_w_flat[:, None].astype(intermediate.dtype)
 
     if not use_cudnn_cutedsl_fusion:
         casted_intermediate = tex.grouped_quantize(
@@ -694,9 +686,9 @@ def _ffn_bwd_per_shard(
         is_colwise=False,
         flatten_axis=2,
     )
-    # cuBLAS grouped_gemm skips size_g == 0 groups without zero-filling
-    # the output slice; mask 0-token-expert wgrads to zero so the
-    # optimizer never sees uninit memory.
+    # Grouped GEMM skips size_g == 0 experts without writing their wgrad
+    # slice. Mask those slices to zero so the optimizer never sees garbage;
+    # this is unrelated to EP alignment padding (handled by dispatch zero-fill).
     wgrad_group_active = (local_group_sizes > 0)[:, None, None]
 
     # wo bwd
@@ -731,7 +723,7 @@ def _ffn_bwd_per_shard(
             d_combined_col,
             d_combined_scale_row,
             d_combined_scale_col,
-            dprob,
+            _dprob,
         ) = grouped_gemm_dswiglu_mxfp8(
             _casted_d_eo_lhs.data.reshape(recv_rows, hidden, 1),
             casted_wo_rhs_trans.data.reshape(
@@ -782,12 +774,26 @@ def _ffn_bwd_per_shard(
             original_shape=d_combined_shape,
             pre_swizzled=True,
         )
-        active = (recv_w_flat != 0)
-        d_recv_w_from_intermediate = (
-            jnp.where(active, dprob.reshape(-1), jnp.zeros_like(recv_w_flat))
-            if apply_topk_weights_early
-            else jnp.zeros_like(recv_w_flat)
-        ).astype(recv_w_flat.dtype)
+        if apply_topk_weights_early:
+            # The cuDNN frontend dSwiGLU kernel accumulates dprob with
+            # atomics and expects a zero-initialized output buffer. cutlass_call
+            # allocates custom-call outputs uninitialized, so compute this
+            # routing-weight cotangent explicitly until we can pass dprob as an
+            # initialized input/output buffer.
+            d_intermediate_for_prob = tex.grouped_gemm(
+                _casted_d_eo_lhs,
+                casted_wo_rhs_trans,
+                contracting_dims=((1,), (2,)),
+            )
+            act_fn = _convert_to_activation_function(activation_type)
+            intermediate_unweighted = act_fn(gate_proj_out) * up_proj_out
+            d_recv_w_from_intermediate = jnp.sum(
+                d_intermediate_for_prob * intermediate_unweighted,
+                axis=-1,
+            )
+        else:
+            d_recv_w_from_intermediate = jnp.zeros_like(recv_w_flat)
+        d_recv_w_from_intermediate = d_recv_w_from_intermediate.astype(recv_w_flat.dtype)
         d_combined_for_bias = None
     else:
         d_intermediate = tex.grouped_gemm(
@@ -797,34 +803,26 @@ def _ffn_bwd_per_shard(
         )
         act_fn = _convert_to_activation_function(activation_type)
         if apply_topk_weights_early:
-            # intermediate' = intermediate * w * mask. Split the cotangent
-            # across both factors before the activation bwd consumes it. Padded
-            # recv slots may still be NaN in the saved activation residuals, so
-            # use zero-filled residuals on inactive rows before the activation VJP.
+            # intermediate' = intermediate * w. Split the cotangent across
+            # both factors before the activation bwd consumes it. EP zero-fills
+            # aligned padding, and grouped ops exclude trailing over-allocation.
             w_b = recv_w_flat[:, None].astype(d_intermediate.dtype)
-            active = (recv_w_flat != 0)[:, None]
-            gate_proj_for_bwd = jnp.where(active, gate_proj_out, jnp.zeros_like(gate_proj_out))
-            up_proj_for_bwd = jnp.where(active, up_proj_out, jnp.zeros_like(up_proj_out))
-            intermediate_unweighted = act_fn(gate_proj_for_bwd) * up_proj_for_bwd
+            intermediate_unweighted = act_fn(gate_proj_out) * up_proj_out
             d_recv_w_from_intermediate = jnp.sum(
                 d_intermediate * intermediate_unweighted,
                 axis=-1,
             ).astype(recv_w_flat.dtype)
-            d_intermediate = jnp.where(
-                active, d_intermediate * w_b, jnp.zeros_like(d_intermediate)
-            )
+            d_intermediate = d_intermediate * w_b
         else:
-            gate_proj_for_bwd = gate_proj_out
-            up_proj_for_bwd = up_proj_out
             d_recv_w_from_intermediate = jnp.zeros_like(recv_w_flat)
 
         # Activation bwd, symmetric with the fwd: silu' and the two
         # elementwise products run in the GEMM dtype (no fp32 island), so
         # the chain rule composes through at the same precision the wi/wo
         # GEMMs consume.
-        act_gp, dact_pullback = jax.vjp(act_fn, gate_proj_for_bwd)
+        act_gp, dact_pullback = jax.vjp(act_fn, gate_proj_out)
         d_up_proj_out = d_intermediate * act_gp
-        (d_gate_proj_out,) = dact_pullback(d_intermediate * up_proj_for_bwd)
+        (d_gate_proj_out,) = dact_pullback(d_intermediate * up_proj_out)
         d_combined_for_bias = jnp.concatenate([d_gate_proj_out, d_up_proj_out], axis=-1)
         casted_d_combined = tex.grouped_quantize(
             d_combined_for_bias, fc1_quantizer_set.dgrad, local_group_sizes, flatten_axis=-1
@@ -1122,21 +1120,11 @@ def _moe_fwd_rule(
         else:
             (r_tok, r_w, tc, w0, w1, w_o, fc1_qset, fc2_qset) = args
             w0b = w1b = wob = None
-        # NOTE: tex.ep_dispatch_fwd's NCCL EP HT path leaves the recv
-        # buffer uninitialised on fully-empty-receiver ranks (and at
-        # padded slots on partially-loaded ranks). We don't need a
-        # zero-init guard here anymore because:
-        #   1. ``tc`` (per-expert padded counts) is plumbed into
-        #      grouped_gemm as group_sizes, so cuBLAS skips both
-        #      0-token experts and the trailing overalloc tail.
-        #   2. The per-group wgrad masks in _ffn_bwd_per_shard zero
-        #      ``d_wo`` / ``d_wi_combined`` slices for 0-token-globally
-        #      experts (cuBLAS skips size_g==0 groups without
-        #      zero-filling, which would otherwise leak NaN into the
-        #      user's optimizer).
-        #   3. All other downstream consumers (ep_combine,
-        #      ep_dispatch_bwd) are handle_mem-aware and read only
-        #      valid positions.
+        # NCCL EP zero-fills aligned expert padding. Any trailing
+        # over-allocation remains safe because ``tc`` is plumbed into
+        # grouped operations and EP consumers use handle metadata to read
+        # only valid positions. Zero-token-expert wgrads are masked in
+        # ``_ffn_bwd_per_shard`` separately from padding.
         # If a future caller adds a non-group-aware reader of r_tok
         # (e.g. an inspect probe over the full recv tile), re-add the
         # ``jax.lax.cond(jnp.any(r_w != 0), identity, zeros_like)``
@@ -1298,14 +1286,10 @@ def _moe_bwd_rule(
         d_expert_outputs = grad_pre_combine
         d_recv_w_from_combine = jnp.zeros_like(ctx.recv_topk_weights)
     else:
-        # Reverse the late-weighting multiply. Padded expert-major rows are
-        # part of the physical grouped-GEMM ranges, so write literal zero
-        # cotangents for inactive rows instead of relying on NaN * 0.
+        # Reverse the late-weighting multiply. NCCL EP zero-fills aligned
+        # padding, while grouped/EP consumers ignore trailing over-allocation.
         w = ctx.recv_topk_weights[..., None].astype(grad_pre_combine.dtype)
-        mask_bool = (ctx.recv_topk_weights != 0)[..., None]
-        d_expert_outputs = jnp.where(
-            mask_bool, grad_pre_combine * w, jnp.zeros_like(grad_pre_combine)
-        )
+        d_expert_outputs = grad_pre_combine * w
         d_recv_w_from_combine = (grad_pre_combine * ctx.expert_outputs).sum(axis=-1)
         d_recv_w_from_combine = d_recv_w_from_combine.astype(ctx.recv_topk_weights.dtype)
 

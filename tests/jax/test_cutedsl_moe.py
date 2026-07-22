@@ -11,7 +11,6 @@ import numpy as np
 import pytest
 
 from transformer_engine.jax import cpp_extensions as tex
-from transformer_engine.jax.moe import _use_cudnn_cutedsl_fusion_from_env
 from transformer_engine.jax.cutedsl_extensions.moe import (
     grouped_gemm_dswiglu_mxfp8,
     grouped_gemm_swiglu_mxfp8,
@@ -54,19 +53,8 @@ def test_direct_kernel_loader_bypasses_torch_api():
     )
 
 
-def test_cutedsl_fusion_env_is_strict(monkeypatch):
-    """The opt-in environment variable accepts only explicit boolean integers."""
-    monkeypatch.delenv("NVTE_JAX_MOE_USE_CUDNN_CUTEDSL_FUSION", raising=False)
-    assert not _use_cudnn_cutedsl_fusion_from_env()
-    monkeypatch.setenv("NVTE_JAX_MOE_USE_CUDNN_CUTEDSL_FUSION", "1")
-    assert _use_cudnn_cutedsl_fusion_from_env()
-    monkeypatch.setenv("NVTE_JAX_MOE_USE_CUDNN_CUTEDSL_FUSION", "true")
-    with pytest.raises(ValueError, match="must be '0' or '1'"):
-        _use_cudnn_cutedsl_fusion_from_env()
-
-
-def test_grouped_gemm_swiglu_cutlass_call_raw_projection_parity():
-    """The CUTLASS call sees the same MXFP8 projection as TE grouped GEMM."""
+def test_swiglu_forward_fused_output_parity():
+    """The forward fused call matches TE projection plus JAX SwiGLU reference."""
     try:
         from transformer_engine_jax import get_device_compute_capability
 
@@ -162,8 +150,8 @@ def test_grouped_gemm_swiglu_cutlass_call_raw_projection_parity():
         assert relative_error < 0.05
 
 
-def test_grouped_gemm_dswiglu_cutlass_call_quantized_output_parity():
-    """The CUTLASS dSwiGLU bwd call emits the expected packed MXFP8 VJP."""
+def test_dswiglu_backward_quantized_output_parity():
+    """The backward fused call emits the expected packed MXFP8 VJP."""
     try:
         from transformer_engine_jax import get_device_compute_capability
 
