@@ -2,53 +2,61 @@ CuTeDSL MXFP8 MoE pipeclean
 ===========================
 
 The JAX MoE path has an opt-in Blackwell fusion for FC1 grouped GEMM,
-SwiGLU, and rowwise/colwise MXFP8 quantization. All CuTe-specific code lives
-in ``transformer_engine/jax/cutedsl_extensions``; the surrounding EP path
-continues to use ``shard_map`` and sees only shard-local tensors.
+SwiGLU, and rowwise/colwise MXFP8 quantization. The forward leaf is compiled
+from abstract tensor descriptors by cuDNN-FE and invoked as a native
+``tvm_ffi.Function``. The surrounding EP path continues to use ``shard_map``
+and sees only shard-local tensors. The fused dSwiGLU backward leaf continues
+to use CUTLASS DSL's JAX integration.
 
 Environment baseline
 --------------------
 
 Use the versions in ``tests/jax/requirements_cutedsl.txt`` on an SM100 CUDA
-host. Build Transformer Engine with JAX and NCCL EP support, then run::
+host and install the sibling cuDNN-FE checkout with its compile-only extra.
+The end-to-end driver installs both editable trees, runs standalone forward
+and backward parity, exercises custom partitioning and ``shard_map`` across
+two processes, and runs the four-GPU MoEBlock integration test::
 
-   python3 tests/jax/cutedsl_smoke.py
-   python3 -m pytest -c tests/jax/pytest.ini tests/jax/test_cutedsl_moe.py -v
-   bash tests/jax/run_te_ep_moe.sh
-   NVTE_JAX_MOE_USE_CUDNN_CUTEDSL_FUSION=1 \
-   bash tests/jax/run_te_ep_moe.sh -k TestTeEpMoeCudnnCutedslFusion
+   CUDNN_FE_ROOT=/path/to/cudnn-frontend NUM_GPUS=4 \
+       bash tests/jax/run_tvm_ffi_fused_moe_e2e.sh
 
-The first command is intentionally independent of Transformer Engine. It
-must report ``cutlass.jax.is_available()`` and execute its vector-add kernel
-inside ``jax.jit`` before failures in the fused MoE tests are investigated.
-The EP launcher currently requires four or more ranks even though the EP
-mesh itself uses groups of two ranks. The CuTeDSL opt-in is strict, so run
-only the CuTeDSL fusion class with that environment variable enabled.
+If ``CUDNN_FE_ROOT`` does not exist, the driver clones the pinned NVIDIA
+upstream revision and applies the bundled compile-only patch. An existing
+checkout that already provides the API is left unchanged. Set
+``INSTALL_DEPS=0`` to reuse an existing environment. The EP launcher currently
+requires four or more ranks even though the EP mesh itself uses groups of two
+ranks. Logs from every stage are retained in the timestamped artifact directory
+printed by the driver.
 
 Support and fallback contract
 -----------------------------
 
 The default value of ``NVTE_JAX_MOE_USE_CUDNN_CUTEDSL_FUSION`` is ``0`` and
-never imports CUTLASS DSL. Existing unfused runs therefore remain supported
-when the optional packages or SM100 hardware are absent. Explicit opt-in
-validates the GPU architecture, SwiGLU shapes and biases, MXFP8 quantizers,
-JAX/CUTLASS FFI availability, and the cuDNN frontend source layout before
-kernel lowering. An unsupported explicit opt-in fails with the complete validation
-list instead of failing later during kernel compilation.
+does not import the optional TVM-FFI or CUTLASS DSL packages. Existing
+unfused runs therefore remain supported when the optional packages or SM100
+hardware are absent. Explicit opt-in validates the GPU architecture, SwiGLU
+shapes and biases, MXFP8 quantizers, JAX FFI availability, and both compiler
+paths before lowering. Unsupported configurations emit one warning with the
+complete validation list and use the unfused implementation.
 
-The pinned cuDNN frontend layout is::
+The cuDNN-FE compile-only API is exported from::
 
-   cudnn/grouped_gemm/utils.py
-   cudnn/grouped_gemm/grouped_gemm_swiglu/grouped_gemm_swiglu_quant.py
+   cudnn/grouped_gemm/grouped_gemm_swiglu/compile.py
 
-and must export ``BlockScaledContiguousGroupedGemmKernel``. The fused path
+It accepts self-describing operand metadata, compiles without Torch or live
+buffers, and returns a native function plus an exact ABI descriptor. The
+native launch wrapper reorders the eight arguments, five results, and stream
+into the volatile raw kernel ABI. This is necessary because ``jax-tvm-ffi``
+currently describes only complete argument and result groups. The fused path
 uses 256-token dispatch alignment; the unfused path remains at 128.
 
 Custom partitioning migration design
 ------------------------------------
 
-Do not add a ``custom_partitioning`` wrapper until nvbug 6432162 is fixed.
-Today the five kernel outputs are:
+The standalone single-expert primitive now has a ``custom_partitioning``
+wrapper and is tested against an explicit ``shard_map`` path. Integrated
+multi-expert MoE remains inside the established ``shard_map`` boundary.
+The five kernel outputs are:
 
 * combined projection: ``[tokens, 2 * intermediate, 1]``
 * rowwise MXFP8 payload: ``[tokens, intermediate, 1]``
@@ -68,18 +76,9 @@ singleton factors for each singleton dimension, and a constant factor
 * pre-swizzled A/B scales: opaque until their JAX boundary is structured
 
 The first three outputs inherit the ``tokens`` factor and otherwise remain
-local. The two scale outputs must eventually be exposed as structured block
-layouts carrying ``tokens``/``intermediate`` (and the per-expert padding
-factor where applicable), then flattened only inside ``cutlass_call``. Do
-not assign a Shardy factor to the current giant flat dimension: that is the
-failure mode tracked by nvbug 6432162. Until structured scales and the bug
-fix are both available, the leaf stays under ``shard_map`` and needs no
-partitioning rule.
-
-``tests/jax/repro_cutedsl_moe_shardy.py`` lowers a shape-only custom
-partitioning leaf with the production EP2/FSDP2 output shapes. Run it before
-starting the migration; it should lower successfully after the Shardy fix.
-After that gate passes, replace the shape-only leaf with
-``grouped_gemm_swiglu_mxfp8``, structure both scale outputs, add the rule
-above, and compare its shardings and numerics with the existing ``shard_map``
-tests before removing ``shard_map``.
+local. Scale buffers remain opaque flat native-ABI values at lowering time.
+The standalone partitioner can shard them along the data axis because every
+shard compiles a complete local scale buffer. Multi-expert production
+partitioning stays below ``shard_map`` so expert-local padded offsets and
+pre-swizzled scale layouts are preserved without exposing an invalid global
+flat-buffer factor to Shardy.

@@ -3,6 +3,7 @@
 # See LICENSE for license information.
 """Tests for the JAX binding to cuDNN frontend's CuTeDSL MoE kernel."""
 
+import importlib
 import sys
 
 import jax
@@ -13,8 +14,6 @@ import pytest
 from transformer_engine.jax import cpp_extensions as tex
 from transformer_engine.jax.cutedsl_extensions.moe import (
     grouped_gemm_dswiglu_mxfp8,
-    grouped_gemm_swiglu_mxfp8,
-    load_grouped_gemm_swiglu_kernel,
     pack_swiglu_pair,
     unpack_swiglu_pair,
 )
@@ -24,6 +23,8 @@ from transformer_engine.jax.quantize import (
     ScalingMode,
     TensorUsage,
 )
+
+_RAGGED_EIGHT_EXPERT_GROUP_SIZES = (512, 256, 1024, 512, 768, 256, 256, 512)
 
 
 def test_swiglu_block_pack_round_trip():
@@ -39,33 +40,38 @@ def test_swiglu_block_pack_round_trip():
     np.testing.assert_array_equal(unpacked_up, up)
 
 
-def test_direct_kernel_loader_bypasses_torch_api():
-    """The direct source loader must not execute cuDNN's Torch API package."""
-    kernel_cls = load_grouped_gemm_swiglu_kernel()
-    assert kernel_cls.__name__ == "BlockScaledContiguousGroupedGemmKernel"
+def test_compile_only_api_bypasses_torch_wrapper():
+    """The forward compiler must not execute cuDNN's Torch wrapper module."""
+    from cudnn import compile_grouped_gemm_swiglu
+
+    assert callable(compile_grouped_gemm_swiglu)
     assert "cudnn.grouped_gemm.grouped_gemm_swiglu.api" not in sys.modules
-    # cuDNN frontend 1.25's shared utility source imports torch only for an
-    # unused annotation. The loader supplies a non-executable sentinel rather
-    # than importing the Torch package.
-    torch_module = sys.modules.get("torch")
-    assert torch_module is None or getattr(
-        torch_module, "__transformer_engine_cutedsl_stub__", False
-    )
 
 
-def test_swiglu_forward_fused_output_parity():
+@pytest.mark.parametrize(
+    "group_sizes_tuple",
+    [
+        pytest.param((256,), id="one-expert"),
+        pytest.param(_RAGGED_EIGHT_EXPERT_GROUP_SIZES, id="eight-expert-ragged"),
+    ],
+)
+def test_swiglu_forward_fused_output_parity(group_sizes_tuple):
     """The forward fused call matches TE projection plus JAX SwiGLU reference."""
     try:
         from transformer_engine_jax import get_device_compute_capability
 
         if get_device_compute_capability(0) != 100:
             pytest.skip("cuDNN frontend grouped GEMM SwiGLU requires SM100")
-        load_grouped_gemm_swiglu_kernel()
-        import cutlass.jax  # noqa: F401  # pylint: disable=unused-import,import-outside-toplevel
+        dependencies_available, dependency_error = (
+            tex.grouped_gemm_swiglu_dependencies_available()
+        )
+        if not dependencies_available:
+            pytest.skip(f"TVM-FFI JAX dependencies are unavailable: {dependency_error}")
     except (ImportError, RuntimeError) as exc:
         pytest.skip(f"CuTeDSL JAX dependencies are unavailable: {exc}")
 
-    experts, rows, hidden, intermediate = 1, 256, 128, 128
+    experts = len(group_sizes_tuple)
+    rows, hidden, intermediate = sum(group_sizes_tuple), 128, 128
     key = jax.random.PRNGKey(123)
     x = jax.random.normal(key, (rows, hidden), dtype=jnp.bfloat16)
     wi_0 = jax.random.normal(
@@ -75,7 +81,9 @@ def test_swiglu_forward_fused_output_parity():
         jax.random.fold_in(key, 2), (experts, hidden, intermediate), dtype=jnp.bfloat16
     )
     wi = pack_swiglu_pair(wi_0, wi_1)
-    group_sizes = jnp.asarray([rows], dtype=jnp.int32)
+    group_sizes = jnp.asarray(group_sizes_tuple, dtype=jnp.int32)
+    assert len(set(group_sizes_tuple)) > 1 or experts == 1
+    assert all(offset % 256 == 0 for offset in np.cumsum(group_sizes_tuple))
     quantizers = QuantizerFactory.create_set(
         scaling_mode=ScalingMode.MXFP8_1D_SCALING,
         fwd_dtype=jnp.float8_e4m3fn,
@@ -97,8 +105,18 @@ def test_swiglu_forward_fused_output_parity():
             casted_wi,
             contracting_dims=((1,), (1,)),
         )
+        reference_gate, reference_up = unpack_swiglu_pair(reference)
+        swiglu_reference = jax.nn.silu(reference_gate) * reference_up
+        quantized_reference = tex.grouped_quantize(
+            swiglu_reference,
+            quantizers.x,
+            group_sizes,
+            flatten_axis=-1,
+        )
+        reference_row = quantized_reference.get_tensor(TensorUsage.LHS)
+        reference_col = quantized_reference.get_tensor(TensorUsage.LHS_TRANS)
         physical_wi = casted_wi.data.reshape(experts, hidden, 2 * intermediate).transpose(0, 2, 1)
-        combined, swiglu_row, swiglu_col, scale_row, scale_col = grouped_gemm_swiglu_mxfp8(
+        combined, swiglu_row, swiglu_col, scale_row, scale_col = tex.grouped_gemm_swiglu(
             casted_x.data.reshape(rows, hidden, 1),
             physical_wi,
             casted_x.scale_inv,
@@ -115,9 +133,34 @@ def test_swiglu_forward_fused_output_parity():
             swiglu_col,
             scale_row,
             scale_col,
+            reference_row.data,
+            reference_row.scale_inv,
+            reference_col.data,
+            reference_col.scale_inv,
         )
 
-    reference, combined, swiglu_row, swiglu_col, scale_row, scale_col = run(x, wi)
+    # Lowering is deliberately separate from execution: this proves that the
+    # cuDNN-FE compiler consumes only abstract descriptors and returns a native
+    # TVM-FFI target without requiring live device buffers.
+    run.lower(x, wi)
+    grouped_gemm_swiglu_module = importlib.import_module(
+        "transformer_engine.jax.cpp_extensions.grouped_gemm_swiglu"
+    )
+
+    assert grouped_gemm_swiglu_module._REGISTERED_TARGETS  # pylint: disable=protected-access
+
+    (
+        reference,
+        combined,
+        swiglu_row,
+        swiglu_col,
+        scale_row,
+        scale_col,
+        reference_row,
+        reference_scale_row,
+        reference_col,
+        reference_scale_col,
+    ) = run(x, wi)
     jax.block_until_ready((reference, combined, swiglu_row, swiglu_col))
     np.testing.assert_array_equal(combined, reference)
     assert swiglu_row.shape == swiglu_col.shape == (rows, intermediate, 1)
@@ -126,10 +169,14 @@ def test_swiglu_forward_fused_output_parity():
 
     gate, up = unpack_swiglu_pair(combined)
     swiglu_reference = np.asarray(jax.nn.silu(gate) * up, dtype=np.float32)
-    for is_colwise, payload, scale in (
-        (False, swiglu_row, scale_row),
-        (True, swiglu_col, scale_col),
+    for is_colwise, payload, scale, reference_payload, reference_scale in (
+        (False, swiglu_row, scale_row, reference_row, reference_scale_row),
+        (True, swiglu_col, scale_col, reference_col, reference_scale_col),
     ):
+        # The kernel emits the compact scale payload. TE grouped tensors use a
+        # larger metadata-compatible buffer and pad the unused tail in the
+        # production MoE path.
+        scale = jnp.pad(scale, (0, reference_scale.size - scale.size))
         scaled = ScaledTensorFactory.create_1x(
             payload.reshape(-1),
             scale,
@@ -142,12 +189,31 @@ def test_swiglu_forward_fused_output_parity():
             original_shape=(rows, intermediate),
             pre_swizzled=True,
         )
-        dequantized = np.asarray(scaled.dequantize()[0], dtype=np.float32)
-        assert np.all(np.isfinite(dequantized))
-        relative_error = np.linalg.norm(dequantized - swiglu_reference) / np.linalg.norm(
-            swiglu_reference
+        reference_scaled = ScaledTensorFactory.create_1x(
+            reference_payload.reshape(-1),
+            reference_scale,
+            scaling_mode=ScalingMode.MXFP8_1D_SCALING,
+            dq_dtype=jnp.bfloat16,
+            is_colwise=is_colwise,
+            data_layout="N",
+            flatten_axis=1,
+            first_dims=group_sizes,
+            original_shape=(rows, intermediate),
+            pre_swizzled=True,
         )
-        assert relative_error < 0.05
+        dequantized = np.asarray(jnp.concatenate(scaled.dequantize(), axis=0), dtype=np.float32)
+        reference_dequantized = np.asarray(
+            jnp.concatenate(reference_scaled.dequantize(), axis=0), dtype=np.float32
+        )
+        assert np.all(np.isfinite(dequantized))
+        swiglu_relative_error = np.linalg.norm(
+            dequantized - swiglu_reference
+        ) / np.linalg.norm(swiglu_reference)
+        quantization_relative_error = np.linalg.norm(
+            dequantized - reference_dequantized
+        ) / np.linalg.norm(reference_dequantized)
+        assert swiglu_relative_error < 0.05
+        assert quantization_relative_error < 0.05
 
 
 def test_dswiglu_backward_quantized_output_parity():
@@ -157,7 +223,6 @@ def test_dswiglu_backward_quantized_output_parity():
 
         if get_device_compute_capability(0) != 100:
             pytest.skip("cuDNN frontend grouped GEMM dSwiGLU requires SM100")
-        load_grouped_gemm_swiglu_kernel()
         from transformer_engine.jax.cutedsl_extensions.moe import load_grouped_gemm_dswiglu_kernel
 
         load_grouped_gemm_dswiglu_kernel()

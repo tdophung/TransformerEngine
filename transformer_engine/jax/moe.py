@@ -93,7 +93,6 @@ def _cudnn_cutedsl_fusion_rejection_reasons(
 
     from .cutedsl_extensions.moe import (
         load_grouped_gemm_dswiglu_kernel,
-        load_grouped_gemm_swiglu_kernel,
     )
     from .quantize import GroupedQuantizer, ScalingMode
 
@@ -164,14 +163,14 @@ def _cudnn_cutedsl_fusion_rejection_reasons(
         except (AttributeError, RuntimeError) as exc:
             errors.append(f"CUTLASS JAX runtime check failed: {exc}")
 
-    for kernel_name, loader in (
-        ("SwiGLU forward", load_grouped_gemm_swiglu_kernel),
-        ("dSwiGLU backward", load_grouped_gemm_dswiglu_kernel),
-    ):
-        try:
-            loader()
-        except (ImportError, ModuleNotFoundError, RuntimeError) as exc:
-            errors.append(f"could not load the cuDNN frontend {kernel_name} kernel: {exc}")
+    dependencies_available, dependency_error = tex.grouped_gemm_swiglu_dependencies_available()
+    if not dependencies_available:
+        errors.append(f"could not load the TVM-FFI CuTeDSL compiler/bridge: {dependency_error}")
+
+    try:
+        load_grouped_gemm_dswiglu_kernel()
+    except (ImportError, ModuleNotFoundError, RuntimeError) as exc:
+        errors.append(f"could not load the cuDNN frontend dSwiGLU backward kernel: {exc}")
 
     return errors
 
@@ -466,10 +465,7 @@ def _ffn_fwd_per_shard(
     casted_wi = tex.grouped_quantize(wi_combined, fc1_quantizer_set.kernel, flatten_axis=-1)
     casted_intermediate = None
     if use_cudnn_cutedsl_fusion:
-        from .cutedsl_extensions.moe import (
-            grouped_gemm_swiglu_mxfp8,
-            unpack_swiglu_pair,
-        )
+        from .cutedsl_extensions.moe import unpack_swiglu_pair
 
         casted_sorted_x_lhs = casted_sorted_x.get_tensor(usage=TensorUsage.LHS)
         casted_wi_rhs = casted_wi.get_tensor(usage=TensorUsage.RHS)
@@ -485,7 +481,7 @@ def _ffn_fwd_per_shard(
             intermediate_col,
             intermediate_scale_row,
             intermediate_scale_col,
-        ) = grouped_gemm_swiglu_mxfp8(
+        ) = tex.grouped_gemm_swiglu(
             casted_sorted_x_lhs.data.reshape(sorted_x.shape[0], hidden, 1),
             # TE stores the colwise payload in logical [E,K,N] order even
             # though its values were quantized along K. Materialize the
@@ -1622,7 +1618,7 @@ def moe(
     ``NVTE_JAX_MOE_USE_CUDNN_CUTEDSL_FUSION=1`` requires the call to match
     the eligible MXFP8 SwiGLU surface, uses the cuDNN frontend CuTeDSL FC1
     fusion, and raises dispatch alignment to the kernel-required 256 tokens.
-    Ineligible opt-in calls fail with the reasons they cannot use CuTeDSL.
+    Ineligible opt-in calls warn and fall back to the regular grouped-GEMM path.
 
     Axis-name parameters:
 
@@ -1668,11 +1664,15 @@ def moe(
             ep_axis=ep_axis,
         )
         if rejection_reasons:
-            raise ValueError(
-                f"{_CUDNN_CUTEDSL_ENV}=1 is unsupported for this moe() call:\n- "
-                + "\n- ".join(rejection_reasons)
+            warnings.warn(
+                f"{_CUDNN_CUTEDSL_ENV}=1 is unsupported for this moe() call; "
+                "falling back to the regular grouped-GEMM path:\n- "
+                + "\n- ".join(rejection_reasons),
+                RuntimeWarning,
+                stacklevel=2,
             )
-        use_cudnn_cutedsl_fusion = True
+        else:
+            use_cudnn_cutedsl_fusion = True
 
     # Enforce ((outer_dp..., ep), None, None) on inbound activations. The
     # EP comm groups consecutive global ranks (dp_color = rank // ep_size),

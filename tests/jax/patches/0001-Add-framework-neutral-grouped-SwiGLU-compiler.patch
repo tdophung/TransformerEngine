@@ -1,0 +1,813 @@
+From fe78f4c3f3050b537362ebca83b734adfbff1093 Mon Sep 17 00:00:00 2001
+From: tdophung <tdophung@nvidia.com>
+Date: Wed, 22 Jul 2026 12:15:31 -0700
+Subject: [PATCH] Add framework-neutral grouped SwiGLU compiler
+
+---
+ .../gemm_fusions/grouped_gemm_swiglu.md       |  41 ++
+ pyproject.toml                                |   5 +
+ python/cudnn/__init__.py                      |   6 +
+ python/cudnn/grouped_gemm/__init__.py         | 114 +++---
+ .../grouped_gemm_swiglu/__init__.py           |  32 +-
+ .../grouped_gemm_swiglu/compile.py            | 366 ++++++++++++++++++
+ python/cudnn/grouped_gemm/utils.py            |  10 +-
+ .../test_grouped_gemm_swiglu_compile.py       |  96 +++++
+ 8 files changed, 597 insertions(+), 73 deletions(-)
+ create mode 100644 python/cudnn/grouped_gemm/grouped_gemm_swiglu/compile.py
+ create mode 100644 test/python/fe_api/grouped_gemm/test_grouped_gemm_swiglu_compile.py
+
+diff --git a/docs/fe-oss-apis/gemm_fusions/grouped_gemm_swiglu.md b/docs/fe-oss-apis/gemm_fusions/grouped_gemm_swiglu.md
+index 1ac83b7..bf73160 100644
+--- a/docs/fe-oss-apis/gemm_fusions/grouped_gemm_swiglu.md
++++ b/docs/fe-oss-apis/gemm_fusions/grouped_gemm_swiglu.md
+@@ -96,6 +96,47 @@ $$
+
+ ## API Usage
+
++### Framework-neutral compile-only API
++
++The compile-only entrypoint is intended for frameworks that own their output
++allocation and launch through TVM-FFI. It consumes tensor metadata, compiles a
++native `tvm_ffi.Function`, and returns a `GroupedGemmAbiDescriptor` describing
++the exact positional ABI of that function. It does not allocate framework
++buffers and does not launch the kernel.
++
++Install the compiler path without PyTorch:
++
++```bash
++pip install -e ".[cutedsl-compile]"
++```
++
++```python
++from cudnn import (
++    GroupedGemmElementType as DType,
++    GroupedGemmOperandDesc as Operand,
++    GroupedGemmSwigluConfig,
++    compile_grouped_gemm_swiglu,
++)
++
++operands = {
++    "a": Operand("a", DType.FLOAT8_E4M3FN, (256, 128, 1), (1, 0, 2)),
++    "b": Operand("b", DType.FLOAT8_E4M3FN, (256, 128, 1), (1, 0, 2)),
++    # sfa, sfb, padded_offsets, alpha, prob, norm_const and the five
++    # output descriptors are omitted here for brevity.
++}
++native_function, abi = compile_grouped_gemm_swiglu(
++    operands=operands,
++    config=GroupedGemmSwigluConfig(),
++)
++```
++
++The supported native ABI groups the eight input buffers, the five output
++buffers, and the CUDA stream. This grouping can be registered directly with
++`jax-tvm-ffi` as `abi.arg_spec == ("args", "rets", "ctx.stream")`. A native
++CuTeDSL reorder launcher hides the volatile raw-kernel operand order, so no
++Python callback runs during execution. The `amax` slot is disabled in this
++five-output prototype.
++
+ ### High-level Wrapper
+
+ ```python
+diff --git a/pyproject.toml b/pyproject.toml
+index 544b28d..c68805d 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -61,6 +61,11 @@ cutedsl = [
+     "apache-tvm-ffi",
+     "torch-c-dlpack-ext",
+ ]
++cutedsl-compile = [
++    "nvidia-cutlass-dsl[cu13]>=4.5.0",
++    "cuda-python",
++    "apache-tvm-ffi>=0.1.12",
++]
+
+ [dependency-groups]
+ dev = [
+diff --git a/python/cudnn/__init__.py b/python/cudnn/__init__.py
+index 6e8b998..e4493a4 100644
+--- a/python/cudnn/__init__.py
++++ b/python/cudnn/__init__.py
+@@ -298,6 +298,12 @@ _LAZY_OPTIONAL_IMPORTS = {
+     "grouped_gemm": (".grouped_gemm", None),
+     "GroupedGemmSwigluSm100": (".grouped_gemm", "GroupedGemmSwigluSm100"),
+     "grouped_gemm_swiglu_wrapper_sm100": (".grouped_gemm", "grouped_gemm_swiglu_wrapper_sm100"),
++    "GroupedGemmElementType": (".grouped_gemm", "GroupedGemmElementType"),
++    "GroupedGemmOperandDesc": (".grouped_gemm", "GroupedGemmOperandDesc"),
++    "GroupedGemmSwigluConfig": (".grouped_gemm", "GroupedGemmSwigluConfig"),
++    "GroupedGemmAbiEntry": (".grouped_gemm", "GroupedGemmAbiEntry"),
++    "GroupedGemmAbiDescriptor": (".grouped_gemm", "GroupedGemmAbiDescriptor"),
++    "compile_grouped_gemm_swiglu": (".grouped_gemm", "compile_grouped_gemm_swiglu"),
+     "GroupedGemmDswigluSm100": (".grouped_gemm", "GroupedGemmDswigluSm100"),
+     "grouped_gemm_dswiglu_wrapper_sm100": (".grouped_gemm", "grouped_gemm_dswiglu_wrapper_sm100"),
+     "GroupedGemmSreluSm100": (".grouped_gemm", "GroupedGemmSreluSm100"),
+diff --git a/python/cudnn/grouped_gemm/__init__.py b/python/cudnn/grouped_gemm/__init__.py
+index 818a1ab..0f69996 100644
+--- a/python/cudnn/grouped_gemm/__init__.py
++++ b/python/cudnn/grouped_gemm/__init__.py
+@@ -1,68 +1,50 @@
+-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++# Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ # SPDX-License-Identifier: MIT
+
+-from .grouped_gemm_swiglu.api import (
+-    GroupedGemmSwigluSm100,
+-    grouped_gemm_swiglu_wrapper_sm100,
+-)
+-
+-from .grouped_gemm_dswiglu.api import (
+-    GroupedGemmDswigluSm100,
+-    grouped_gemm_dswiglu_wrapper_sm100,
+-)
+-
+-from .grouped_gemm_quant.api import (
+-    GroupedGemmQuantSm100,
+-    grouped_gemm_quant_wrapper_sm100,
+-)
+-
+-from .grouped_gemm_srelu.api import (
+-    GroupedGemmSreluSm100,
+-    grouped_gemm_srelu_wrapper_sm100,
+-)
+-
+-from .grouped_gemm_dsrelu.api import (
+-    GroupedGemmDsreluSm100,
+-    grouped_gemm_dsrelu_wrapper_sm100,
+-)
+-
+-from .grouped_gemm_glu.api import (
+-    GroupedGemmGluSm100,
+-    grouped_gemm_glu_wrapper_sm100,
+-)
+-
+-from .grouped_gemm_glu_hadamard.api import (
+-    GroupedGemmGluHadamardSm100,
+-    grouped_gemm_glu_hadamard_wrapper_sm100,
+-)
+-
+-from .grouped_gemm_dglu.api import (
+-    GroupedGemmDgluSm100,
+-    grouped_gemm_dglu_wrapper_sm100,
+-)
+-
+-from .grouped_gemm_wgrad.api import (
+-    GroupedGemmWgradSm100,
+-    grouped_gemm_wgrad_wrapper_sm100,
+-)
+-
+-__all__ = [
+-    "GroupedGemmSwigluSm100",
+-    "grouped_gemm_swiglu_wrapper_sm100",
+-    "GroupedGemmDswigluSm100",
+-    "grouped_gemm_dswiglu_wrapper_sm100",
+-    "GroupedGemmQuantSm100",
+-    "grouped_gemm_quant_wrapper_sm100",
+-    "GroupedGemmSreluSm100",
+-    "grouped_gemm_srelu_wrapper_sm100",
+-    "GroupedGemmDsreluSm100",
+-    "grouped_gemm_dsrelu_wrapper_sm100",
+-    "GroupedGemmGluSm100",
+-    "grouped_gemm_glu_wrapper_sm100",
+-    "GroupedGemmGluHadamardSm100",
+-    "grouped_gemm_glu_hadamard_wrapper_sm100",
+-    "GroupedGemmDgluSm100",
+-    "grouped_gemm_dglu_wrapper_sm100",
+-    "GroupedGemmWgradSm100",
+-    "grouped_gemm_wgrad_wrapper_sm100",
+-]
++"""Lazy public exports for grouped GEMM CuTeDSL APIs.
++
++Keeping these imports lazy lets framework-neutral compile-only entrypoints be
++used in environments that intentionally do not install PyTorch.
++"""
++
++from importlib import import_module
++
++
++_LAZY_IMPORTS = {
++    "GroupedGemmSwigluSm100": (".grouped_gemm_swiglu", "GroupedGemmSwigluSm100"),
++    "grouped_gemm_swiglu_wrapper_sm100": (".grouped_gemm_swiglu", "grouped_gemm_swiglu_wrapper_sm100"),
++    "GroupedGemmElementType": (".grouped_gemm_swiglu", "GroupedGemmElementType"),
++    "GroupedGemmOperandDesc": (".grouped_gemm_swiglu", "GroupedGemmOperandDesc"),
++    "GroupedGemmSwigluConfig": (".grouped_gemm_swiglu", "GroupedGemmSwigluConfig"),
++    "GroupedGemmAbiEntry": (".grouped_gemm_swiglu", "GroupedGemmAbiEntry"),
++    "GroupedGemmAbiDescriptor": (".grouped_gemm_swiglu", "GroupedGemmAbiDescriptor"),
++    "compile_grouped_gemm_swiglu": (".grouped_gemm_swiglu", "compile_grouped_gemm_swiglu"),
++    "GroupedGemmDswigluSm100": (".grouped_gemm_dswiglu.api", "GroupedGemmDswigluSm100"),
++    "grouped_gemm_dswiglu_wrapper_sm100": (".grouped_gemm_dswiglu.api", "grouped_gemm_dswiglu_wrapper_sm100"),
++    "GroupedGemmQuantSm100": (".grouped_gemm_quant.api", "GroupedGemmQuantSm100"),
++    "grouped_gemm_quant_wrapper_sm100": (".grouped_gemm_quant.api", "grouped_gemm_quant_wrapper_sm100"),
++    "GroupedGemmSreluSm100": (".grouped_gemm_srelu.api", "GroupedGemmSreluSm100"),
++    "grouped_gemm_srelu_wrapper_sm100": (".grouped_gemm_srelu.api", "grouped_gemm_srelu_wrapper_sm100"),
++    "GroupedGemmDsreluSm100": (".grouped_gemm_dsrelu.api", "GroupedGemmDsreluSm100"),
++    "grouped_gemm_dsrelu_wrapper_sm100": (".grouped_gemm_dsrelu.api", "grouped_gemm_dsrelu_wrapper_sm100"),
++    "GroupedGemmGluSm100": (".grouped_gemm_glu.api", "GroupedGemmGluSm100"),
++    "grouped_gemm_glu_wrapper_sm100": (".grouped_gemm_glu.api", "grouped_gemm_glu_wrapper_sm100"),
++    "GroupedGemmGluHadamardSm100": (".grouped_gemm_glu_hadamard.api", "GroupedGemmGluHadamardSm100"),
++    "grouped_gemm_glu_hadamard_wrapper_sm100": (".grouped_gemm_glu_hadamard.api", "grouped_gemm_glu_hadamard_wrapper_sm100"),
++    "GroupedGemmDgluSm100": (".grouped_gemm_dglu.api", "GroupedGemmDgluSm100"),
++    "grouped_gemm_dglu_wrapper_sm100": (".grouped_gemm_dglu.api", "grouped_gemm_dglu_wrapper_sm100"),
++    "GroupedGemmWgradSm100": (".grouped_gemm_wgrad.api", "GroupedGemmWgradSm100"),
++    "grouped_gemm_wgrad_wrapper_sm100": (".grouped_gemm_wgrad.api", "grouped_gemm_wgrad_wrapper_sm100"),
++}
++
++
++def __getattr__(name):
++    if name not in _LAZY_IMPORTS:
++        raise AttributeError(name)
++    module_name, attr_name = _LAZY_IMPORTS[name]
++    value = getattr(import_module(module_name, package=__name__), attr_name)
++    globals()[name] = value
++    return value
++
++
++__all__ = list(_LAZY_IMPORTS)
+diff --git a/python/cudnn/grouped_gemm/grouped_gemm_swiglu/__init__.py b/python/cudnn/grouped_gemm/grouped_gemm_swiglu/__init__.py
+index 6bcd935..77483cf 100644
+--- a/python/cudnn/grouped_gemm/grouped_gemm_swiglu/__init__.py
++++ b/python/cudnn/grouped_gemm/grouped_gemm_swiglu/__init__.py
+@@ -8,12 +8,36 @@ This module provides the forward grouped GEMM with SwiGLU activation
+ for MoE (Mixture of Experts) workloads on SM100+ GPUs.
+ """
+
+-from .api import (
+-    GroupedGemmSwigluSm100,
+-    grouped_gemm_swiglu_wrapper_sm100,
+-)
++from importlib import import_module
++
++
++_LAZY_IMPORTS = {
++    "GroupedGemmSwigluSm100": (".api", "GroupedGemmSwigluSm100"),
++    "grouped_gemm_swiglu_wrapper_sm100": (".api", "grouped_gemm_swiglu_wrapper_sm100"),
++    "GroupedGemmElementType": (".compile", "GroupedGemmElementType"),
++    "GroupedGemmOperandDesc": (".compile", "GroupedGemmOperandDesc"),
++    "GroupedGemmSwigluConfig": (".compile", "GroupedGemmSwigluConfig"),
++    "GroupedGemmAbiEntry": (".compile", "GroupedGemmAbiEntry"),
++    "GroupedGemmAbiDescriptor": (".compile", "GroupedGemmAbiDescriptor"),
++    "compile_grouped_gemm_swiglu": (".compile", "compile_grouped_gemm_swiglu"),
++}
++
++
++def __getattr__(name):
++    if name not in _LAZY_IMPORTS:
++        raise AttributeError(name)
++    module_name, attr_name = _LAZY_IMPORTS[name]
++    value = getattr(import_module(module_name, package=__name__), attr_name)
++    globals()[name] = value
++    return value
+
+ __all__ = [
+     "GroupedGemmSwigluSm100",
+     "grouped_gemm_swiglu_wrapper_sm100",
++    "GroupedGemmElementType",
++    "GroupedGemmOperandDesc",
++    "GroupedGemmSwigluConfig",
++    "GroupedGemmAbiEntry",
++    "GroupedGemmAbiDescriptor",
++    "compile_grouped_gemm_swiglu",
+ ]
+diff --git a/python/cudnn/grouped_gemm/grouped_gemm_swiglu/compile.py b/python/cudnn/grouped_gemm/grouped_gemm_swiglu/compile.py
+new file mode 100644
+index 0000000..04f5d30
+--- /dev/null
++++ b/python/cudnn/grouped_gemm/grouped_gemm_swiglu/compile.py
+@@ -0,0 +1,391 @@
++# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++# SPDX-License-Identifier: MIT
++
++"""Framework-neutral compile-only API for grouped GEMM + SwiGLU.
++
++This module deliberately has no PyTorch dependency. It consumes tensor
++metadata, compiles a native TVM-FFI function, and returns a self-describing
++ABI. It allocates no framework buffers and never launches the kernel.
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++from enum import Enum
++import hashlib
++import json
++import threading
++from typing import Any, Literal, Mapping
++
++from cuda.bindings import driver as cuda
++import cutlass
++import cutlass.cute as cute
++from cutlass.cute.runtime import make_fake_stream
++
++from .grouped_gemm_swiglu_quant import BlockScaledContiguousGroupedGemmKernel
++
++
++class GroupedGemmElementType(str, Enum):
++    """Framework-neutral element types accepted by the compile API."""
++
++    FLOAT4_E2M1FN_X2 = "float4_e2m1fn_x2"
++    FLOAT8_E4M3FN = "float8_e4m3fn"
++    FLOAT8_E5M2 = "float8_e5m2"
++    FLOAT8_E8M0FNU = "float8_e8m0fnu"
++    FLOAT16 = "float16"
++    BFLOAT16 = "bfloat16"
++    FLOAT32 = "float32"
++    INT32 = "int32"
++    UINT8 = "uint8"
++
++
++_CUTLASS_DTYPES = {
++    GroupedGemmElementType.FLOAT4_E2M1FN_X2: "Float4E2M1FN",
++    GroupedGemmElementType.FLOAT8_E4M3FN: "Float8E4M3FN",
++    GroupedGemmElementType.FLOAT8_E5M2: "Float8E5M2",
++    GroupedGemmElementType.FLOAT8_E8M0FNU: "Float8E8M0FNU",
++    GroupedGemmElementType.FLOAT16: "Float16",
++    GroupedGemmElementType.BFLOAT16: "BFloat16",
++    GroupedGemmElementType.FLOAT32: "Float32",
++    GroupedGemmElementType.INT32: "Int32",
++    GroupedGemmElementType.UINT8: "Uint8",
++}
++
++
++def _normalize_dtype(dtype: GroupedGemmElementType | str) -> GroupedGemmElementType:
++    if isinstance(dtype, GroupedGemmElementType):
++        return dtype
++    return GroupedGemmElementType(dtype)
++
++
++def _cutlass_dtype(dtype: GroupedGemmElementType | str) -> type[cutlass.Numeric]:
++    dtype = _normalize_dtype(dtype)
++    try:
++        return getattr(cutlass, _CUTLASS_DTYPES[dtype])
++    except AttributeError as exc:
++        raise RuntimeError(f"Installed nvidia-cutlass-dsl does not provide {dtype.value}") from exc
++
++
++@dataclass(frozen=True)
++class GroupedGemmOperandDesc:
++    """Storage-free metadata for one logical kernel operand."""
++
++    role: str
++    dtype: GroupedGemmElementType | str
++    shape: tuple[int, ...]
++    stride_order: tuple[int, ...]
++    align: int = 16
++
++    def __post_init__(self):
++        dtype = _normalize_dtype(self.dtype)
++        shape = tuple(int(dim) for dim in self.shape)
++        stride_order = tuple(int(dim) for dim in self.stride_order)
++        if not self.role:
++            raise ValueError("Operand role must not be empty")
++        if not shape or any(dim < 0 for dim in shape):
++            raise ValueError(f"{self.role}: shape must contain non-negative dimensions, got {shape}")
++        if tuple(sorted(stride_order)) != tuple(range(len(shape))):
++            raise ValueError(f"{self.role}: invalid stride_order {stride_order} for rank {len(shape)}")
++        if self.align <= 0 or self.align & (self.align - 1):
++            raise ValueError(f"{self.role}: align must be a positive power of two, got {self.align}")
++        object.__setattr__(self, "dtype", dtype)
++        object.__setattr__(self, "shape", shape)
++        object.__setattr__(self, "stride_order", stride_order)
++
++
++@dataclass(frozen=True)
++class GroupedGemmSwigluConfig:
++    """Compile-time configuration for the SM100 grouped SwiGLU kernel."""
++
++    sf_vec_size: int = 32
++    acc_dtype: GroupedGemmElementType | str = GroupedGemmElementType.FLOAT32
++    mma_tiler_mn: tuple[int, int] = (256, 256)
++    cluster_shape_mn: tuple[int, int] = (2, 1)
++    vector_f32: bool = False
++    discrete_col_sfd: bool = True
++    use_mono_increase_expert_idx: bool = True
++    num_cluster_overlap_margin: int = 0
++
++    def __post_init__(self):
++        object.__setattr__(self, "acc_dtype", _normalize_dtype(self.acc_dtype))
++        object.__setattr__(self, "mma_tiler_mn", tuple(self.mma_tiler_mn))
++        object.__setattr__(self, "cluster_shape_mn", tuple(self.cluster_shape_mn))
++        if self.sf_vec_size not in (16, 32):
++            raise ValueError(f"sf_vec_size must be 16 or 32, got {self.sf_vec_size}")
++        if self.acc_dtype != GroupedGemmElementType.FLOAT32:
++            raise ValueError("Grouped GEMM SwiGLU requires a float32 accumulator")
++
++
++@dataclass(frozen=True)
++class GroupedGemmAbiEntry:
++    """One positional slot in the returned native TVM-FFI function."""
++
++    role: str
++    kind: Literal["arg", "ret", "stream"]
++    dtype: GroupedGemmElementType | None
++    shape: tuple[int, ...] = ()
++    stride_order: tuple[int, ...] = ()
++    optional: bool = False
++
++
++@dataclass(frozen=True)
++class GroupedGemmAbiDescriptor:
++    """The exact positional ABI and stable registration key for a compile."""
++
++    entries: tuple[GroupedGemmAbiEntry, ...]
++    key: str
++
++    @property
++    def arg_spec(self) -> tuple[str, ...]:
++        """jax-tvm-ffi routing for this native, inputs-then-results ABI."""
++        kinds = tuple(entry.kind for entry in self.entries)
++        first_ret = next((idx for idx, kind in enumerate(kinds) if kind == "ret"), len(kinds))
++        first_stream = next((idx for idx, kind in enumerate(kinds) if kind == "stream"), len(kinds))
++        if any(kind != "arg" for kind in kinds[:first_ret]):
++            raise ValueError("ABI args must be contiguous")
++        if any(kind != "ret" for kind in kinds[first_ret:first_stream]):
++            raise ValueError("ABI returns must be contiguous")
++        if kinds[first_stream:] != ("stream",):
++            raise ValueError("ABI must contain exactly one trailing stream")
++        return ("args", "rets", "ctx.stream")
++
++
++_INPUT_ROLES = ("a", "b", "sfa", "sfb", "padded_offsets", "alpha", "prob", "norm_const")
++_OUTPUT_ROLES = ("c", "d", "d_col", "sfd_row", "sfd_col")
++_ALL_ROLES = _INPUT_ROLES + _OUTPUT_ROLES
++_COMPILE_CACHE: dict[str, tuple[Any, GroupedGemmAbiDescriptor]] = {}
++_COMPILE_LOCK = threading.Lock()
++
++
++def _ceil_div(value: int, divisor: int) -> int:
++    return (value + divisor - 1) // divisor
++
++
++def _scale_size(rows: int, cols: int, sf_vec_size: int, *, colwise: bool) -> int:
++    if colwise:
++        rows, cols = cols, rows
++    return 32 * 4 * _ceil_div(rows, 128) * 4 * _ceil_div(_ceil_div(cols, sf_vec_size), 4)
++
++
++def _expect_shape(operand: GroupedGemmOperandDesc, shape: tuple[int, ...]) -> None:
++    if operand.shape != shape:
++        raise ValueError(f"{operand.role}: expected shape {shape}, got {operand.shape}")
++
++
++def _validate_operands(operands: Mapping[str, GroupedGemmOperandDesc], config: GroupedGemmSwigluConfig) -> None:
++    missing = sorted(set(_ALL_ROLES) - set(operands))
++    extra = sorted(set(operands) - set(_ALL_ROLES))
++    if missing or extra:
++        raise ValueError(f"Invalid operand roles: missing={missing}, extra={extra}")
++    for role, operand in operands.items():
++        if operand.role != role:
++            raise ValueError(f"Operand mapping key {role!r} does not match descriptor role {operand.role!r}")
++
++    a, b = operands["a"], operands["b"]
++    if len(a.shape) != 3 or a.shape[2] != 1:
++        raise ValueError(f"a: expected [M,K,1], got {a.shape}")
++    if len(b.shape) != 3:
++        raise ValueError(f"b: expected [N,K,E], got {b.shape}")
++    m, k, _ = a.shape
++    n, b_k, experts = b.shape
++    if k != b_k:
++        raise ValueError(f"A/B K mismatch: {k} != {b_k}")
++    if m % BlockScaledContiguousGroupedGemmKernel.FIX_PAD_SIZE:
++        raise ValueError(f"M must be {BlockScaledContiguousGroupedGemmKernel.FIX_PAD_SIZE}-aligned, got {m}")
++    if n % 2:
++        raise ValueError(f"Combined SwiGLU N must be even, got {n}")
++    if experts > 1024:
++        raise ValueError(f"Expert count must be <= 1024, got {experts}")
++
++    _expect_shape(operands["c"], (m, n, 1))
++    _expect_shape(operands["d"], (m, n // 2, 1))
++    _expect_shape(operands["d_col"], (m, n // 2, 1))
++    _expect_shape(operands["padded_offsets"], (experts,))
++    _expect_shape(operands["alpha"], (experts,))
++    _expect_shape(operands["prob"], (m, 1, 1))
++    _expect_shape(operands["norm_const"], (1,))
++    expected_sfa = _scale_size(m, k, config.sf_vec_size, colwise=False)
++    expected_sfb = _scale_size(n, k, config.sf_vec_size, colwise=False) * experts
++    if len(operands["sfa"].shape) != 1 or operands["sfa"].shape[0] < expected_sfa:
++        raise ValueError(f"sfa: expected a flat buffer with at least {expected_sfa} values")
++    if len(operands["sfb"].shape) != 1 or operands["sfb"].shape[0] < expected_sfb:
++        raise ValueError(f"sfb: expected a flat buffer with at least {expected_sfb} values")
++    _expect_shape(operands["sfd_row"], (_scale_size(m, n // 2, config.sf_vec_size, colwise=False),))
++    _expect_shape(operands["sfd_col"], (_scale_size(m, n // 2, config.sf_vec_size, colwise=True),))
++
++    if a.dtype != b.dtype or a.dtype not in (GroupedGemmElementType.FLOAT8_E4M3FN, GroupedGemmElementType.FLOAT8_E5M2):
++        raise ValueError(f"A/B must have one matching FP8 dtype, got {a.dtype}/{b.dtype}")
++    sf_dtype = GroupedGemmElementType.FLOAT8_E8M0FNU
++    for role in ("sfa", "sfb", "sfd_row", "sfd_col"):
++        if operands[role].dtype != sf_dtype:
++            raise ValueError(f"{role}: expected {sf_dtype.value}, got {operands[role].dtype.value}")
++    if operands["c"].dtype not in (GroupedGemmElementType.BFLOAT16, GroupedGemmElementType.FLOAT16):
++        raise ValueError(f"c: expected bfloat16 or float16, got {operands['c'].dtype.value}")
++    if operands["d"].dtype != operands["d_col"].dtype:
++        raise ValueError("d and d_col must have matching dtypes")
++    if operands["d"].dtype not in (
++        GroupedGemmElementType.FLOAT8_E4M3FN,
++        GroupedGemmElementType.FLOAT8_E5M2,
++    ):
++        raise ValueError(f"d/d_col must have an FP8 dtype, got {operands['d'].dtype.value}")
++    for role in ("alpha", "prob", "norm_const"):
++        if operands[role].dtype != GroupedGemmElementType.FLOAT32:
++            raise ValueError(f"{role}: expected float32")
++    if operands["padded_offsets"].dtype != GroupedGemmElementType.INT32:
++        raise ValueError("padded_offsets: expected int32")
++
++
++def _cache_key(operands: Mapping[str, GroupedGemmOperandDesc], config: GroupedGemmSwigluConfig) -> str:
++    payload = {
++        "operands": [
++            {
++                "role": role,
++                "dtype": operands[role].dtype.value,
++                "shape": operands[role].shape,
++                "stride_order": operands[role].stride_order,
++                "align": operands[role].align,
++            }
++            for role in _ALL_ROLES
++        ],
++        "config": {
++            "sf_vec_size": config.sf_vec_size,
++            "acc_dtype": config.acc_dtype.value,
++            "mma_tiler_mn": config.mma_tiler_mn,
++            "cluster_shape_mn": config.cluster_shape_mn,
++            "vector_f32": config.vector_f32,
++            "discrete_col_sfd": config.discrete_col_sfd,
++            "use_mono_increase_expert_idx": config.use_mono_increase_expert_idx,
++            "num_cluster_overlap_margin": config.num_cluster_overlap_margin,
++        },
++    }
++    digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:24]
++    return f"cudnn.grouped_gemm_swiglu.{digest}"
++
++
++def _make_fake(desc: GroupedGemmOperandDesc):
++    return cute.runtime.make_fake_compact_tensor(
++        dtype=_cutlass_dtype(desc.dtype),
++        shape=desc.shape,
++        stride_order=desc.stride_order,
++        assumed_align=desc.align,
++    )
++
++
++def _compile_native(
++    operands: Mapping[str, GroupedGemmOperandDesc],
++    config: GroupedGemmSwigluConfig,
++    key: str,
++) -> tuple[Any, GroupedGemmAbiDescriptor]:
++    kernel = BlockScaledContiguousGroupedGemmKernel(
++        sf_vec_size=config.sf_vec_size,
++        acc_dtype=_cutlass_dtype(config.acc_dtype),
++        use_2cta_instrs=config.mma_tiler_mn[0] == 256,
++        mma_tiler_mn=config.mma_tiler_mn,
++        cluster_shape_mn=config.cluster_shape_mn,
++        vector_f32=config.vector_f32,
++        generate_sfd=True,
++        discrete_col_sfd=config.discrete_col_sfd,
++        expert_cnt=operands["padded_offsets"].shape[0],
++        use_mono_increase_expert_idx=config.use_mono_increase_expert_idx,
++    )
++    hardware_info = cutlass.utils.HardwareInfo()
++    max_active_clusters = hardware_info.get_max_active_clusters(config.cluster_shape_mn[0] * config.cluster_shape_mn[1])
++    max_active_clusters -= config.num_cluster_overlap_margin
++    if max_active_clusters <= 0:
++        raise ValueError("num_cluster_overlap_margin leaves no active clusters")
++
++    # XLA's FFI buffer ABI does not carry strides, and jax-tvm-ffi therefore
++    # exposes every buffer to TVM FFI as compact row-major.  B is logically
++    # [N,K,E] with K minor, which cannot be represented by a compact
++    # [N,K,E] buffer when E > 1.  Make the public ABI's B slot the equivalent
++    # compact [E,N,K] storage and restore the logical CuTe view in the native
++    # launcher.  This is a view only; no framework-specific code or copy is
++    # introduced on the execution path.
++    b_desc = operands["b"]
++    b_n, b_k, b_experts = b_desc.shape
++    ffi_operands = dict(operands)
++    ffi_operands["b"] = GroupedGemmOperandDesc(
++        role="b",
++        dtype=b_desc.dtype,
++        shape=(b_experts, b_n, b_k),
++        stride_order=(2, 1, 0),
++        align=b_desc.align,
++    )
++
++    # jax-tvm-ffi routes complete input and result groups. Compile a native
++    # reorder launcher with that stable grouping while keeping the volatile
++    # raw-kernel ABI private to cuDNN-FE. This remains native code: no Python
++    # callback is present on the execution path.
++    @cute.jit
++    def launch(a, b, sfa, sfb, padded_offsets, alpha, prob, norm_const, c, d, d_col, sfd_row, sfd_col, stream: cuda.CUstream):
++        b_logical = cute.make_tensor(
++            b.iterator,
++            cute.make_layout(
++                (b_n, b_k, b_experts),
++                stride=(b_k, 1, b_n * b_k),
++            ),
++        )
++        kernel(
++            a,
++            b_logical,
++            c,
++            d,
++            d_col,
++            sfa,
++            sfb,
++            sfd_row,
++            sfd_col,
++            None,
++            norm_const,
++            padded_offsets,
++            alpha,
++            prob,
++            max_active_clusters,
++            stream,
++        )
++
++    fake_operands = [_make_fake(ffi_operands[role]) for role in _ALL_ROLES]
++    fake_stream = make_fake_stream(use_tvm_ffi_env_stream=False)
++    compiled = cute.compile(launch, *fake_operands, fake_stream, options="--enable-tvm-ffi")
++    entries = tuple(
++        GroupedGemmAbiEntry(role, "arg", ffi_operands[role].dtype, ffi_operands[role].shape, ffi_operands[role].stride_order)
++        for role in _INPUT_ROLES
++    ) + tuple(
++        GroupedGemmAbiEntry(role, "ret", ffi_operands[role].dtype, ffi_operands[role].shape, ffi_operands[role].stride_order)
++        for role in _OUTPUT_ROLES
++    ) + (GroupedGemmAbiEntry("stream", "stream", None),)
++    descriptor = GroupedGemmAbiDescriptor(entries=entries, key=key)
++    descriptor.arg_spec  # Validate the grouped ABI before publishing it.
++    return compiled, descriptor
++
++
++def compile_grouped_gemm_swiglu(
++    *,
++    operands: Mapping[str, GroupedGemmOperandDesc],
++    config: GroupedGemmSwigluConfig | None = None,
++) -> tuple[Any, GroupedGemmAbiDescriptor]:
++    """Compile and cache a native grouped GEMM + SwiGLU TVM-FFI function.
++
++    The call consumes metadata only. It does not allocate output buffers and
++    does not launch. The returned descriptor is the positional ABI authority
++    for the exact returned function.
++    """
++    config = GroupedGemmSwigluConfig() if config is None else config
++    _validate_operands(operands, config)
++    key = _cache_key(operands, config)
++    with _COMPILE_LOCK:
++        cached = _COMPILE_CACHE.get(key)
++        if cached is None:
++            cached = _compile_native(operands, config, key)
++            _COMPILE_CACHE[key] = cached
++        return cached
++
++
++__all__ = [
++    "GroupedGemmElementType",
++    "GroupedGemmOperandDesc",
++    "GroupedGemmSwigluConfig",
++    "GroupedGemmAbiEntry",
++    "GroupedGemmAbiDescriptor",
++    "compile_grouped_gemm_swiglu",
++]
+diff --git a/python/cudnn/grouped_gemm/utils.py b/python/cudnn/grouped_gemm/utils.py
+index cb60dc8..1287293 100644
+--- a/python/cudnn/grouped_gemm/utils.py
++++ b/python/cudnn/grouped_gemm/utils.py
+@@ -33,7 +33,7 @@ This module contains the tile scheduler classes and helper functions used by bot
+ the forward (grouped_gemm_swiglu) and backward (grouped_gemm_dswiglu) kernels.
+ """
+
+-from typing import Tuple, Union
++from typing import TYPE_CHECKING, Tuple, Union
+
+ from cutlass.cutlass_dsl import (
+     Boolean,
+@@ -52,7 +52,6 @@ from cutlass.cutlass_dsl import T
+ from cutlass.cute.typing import Float32, Int32
+ import cutlass.cute as cute
+ import cutlass
+-import torch
+ import cutlass.pipeline as pipeline
+ from cutlass.pipeline import (
+     Agent,
+@@ -61,6 +60,9 @@ from cutlass.pipeline import (
+     make_pipeline_state,
+ )
+
++if TYPE_CHECKING:
++    import torch
++
+ ##############################################################################
+ # Helper functions
+ ##############################################################################
+@@ -201,8 +203,10 @@ def fmax(a: Union[float, Float32], b: Union[float, Float32], *, loc=None, ip=Non
+     )
+
+
+-def logical_shape_fp4x2_aware(tensor: torch.Tensor) -> Tuple[int, ...]:
++def logical_shape_fp4x2_aware(tensor: "torch.Tensor") -> Tuple[int, ...]:
+     """Return correct shapes for NVFP4 tensor."""
++    import torch
++
+     if tensor.dtype == torch.float4_e2m1fn_x2:
+         innermost_dim_index = next((i for i, s in enumerate(tensor.stride()) if s == 1), None)
+         if innermost_dim_index is None:
+diff --git a/test/python/fe_api/grouped_gemm/test_grouped_gemm_swiglu_compile.py b/test/python/fe_api/grouped_gemm/test_grouped_gemm_swiglu_compile.py
+new file mode 100644
+index 0000000..82e1eee
+--- /dev/null
++++ b/test/python/fe_api/grouped_gemm/test_grouped_gemm_swiglu_compile.py
+@@ -0,0 +1,96 @@
++# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++# SPDX-License-Identifier: MIT
++
++"""Tests for the framework-neutral grouped SwiGLU compile API."""
++
++import subprocess
++import sys
++
++import pytest
++import torch
++
++
++def _operands(m=256, k=128, n=256, experts=1):
++    from cudnn import GroupedGemmElementType as DType
++    from cudnn import GroupedGemmOperandDesc as Operand
++
++    def scale_size(rows, cols, colwise=False):
++        if colwise:
++            rows, cols = cols, rows
++        ceil_div = lambda x, y: (x + y - 1) // y
++        return 32 * 4 * ceil_div(rows, 128) * 4 * ceil_div(ceil_div(cols, 32), 4)
++
++    return {
++        "a": Operand("a", DType.FLOAT8_E4M3FN, (m, k, 1), (1, 0, 2)),
++        "b": Operand("b", DType.FLOAT8_E4M3FN, (n, k, experts), (1, 0, 2)),
++        "sfa": Operand("sfa", DType.FLOAT8_E8M0FNU, (scale_size(m, k),), (0,)),
++        "sfb": Operand("sfb", DType.FLOAT8_E8M0FNU, (scale_size(n, k) * experts,), (0,)),
++        "padded_offsets": Operand("padded_offsets", DType.INT32, (experts,), (0,)),
++        "alpha": Operand("alpha", DType.FLOAT32, (experts,), (0,)),
++        "prob": Operand("prob", DType.FLOAT32, (m, 1, 1), (1, 0, 2)),
++        "norm_const": Operand("norm_const", DType.FLOAT32, (1,), (0,)),
++        "c": Operand("c", DType.BFLOAT16, (m, n, 1), (1, 0, 2)),
++        "d": Operand("d", DType.FLOAT8_E4M3FN, (m, n // 2, 1), (1, 0, 2)),
++        "d_col": Operand("d_col", DType.FLOAT8_E4M3FN, (m, n // 2, 1), (1, 0, 2)),
++        "sfd_row": Operand("sfd_row", DType.FLOAT8_E8M0FNU, (scale_size(m, n // 2),), (0,)),
++        "sfd_col": Operand("sfd_col", DType.FLOAT8_E8M0FNU, (scale_size(m, n // 2, colwise=True),), (0,)),
++    }
++
++
++@pytest.mark.L0
++def test_compile_api_imports_without_torch():
++    script = r"""
++import importlib.abc
++import sys
++
++class BlockTorch(importlib.abc.MetaPathFinder):
++    def find_spec(self, fullname, path=None, target=None):
++        if fullname == "torch" or fullname.startswith("torch."):
++            raise ModuleNotFoundError("torch intentionally blocked")
++        return None
++
++sys.meta_path.insert(0, BlockTorch())
++from cudnn import compile_grouped_gemm_swiglu
++assert callable(compile_grouped_gemm_swiglu)
++"""
++    subprocess.run([sys.executable, "-c", script], check=True)
++
++
++@pytest.mark.L0
++def test_compile_api_rejects_unaligned_m_before_compile():
++    from cudnn import compile_grouped_gemm_swiglu
++
++    with pytest.raises(ValueError, match="M must be 256-aligned"):
++        compile_grouped_gemm_swiglu(operands=_operands(m=128))
++
++
++@pytest.mark.L1
++def test_compile_api_returns_native_function_and_self_describing_abi():
++    if torch.cuda.get_device_capability()[0] < 10:
++        pytest.skip("Grouped GEMM SwiGLU compile requires SM100+")
++    tvm_ffi = pytest.importorskip("tvm_ffi")
++    from cudnn import compile_grouped_gemm_swiglu
++
++    function, abi = compile_grouped_gemm_swiglu(operands=_operands())
++    cached_function, cached_abi = compile_grouped_gemm_swiglu(operands=_operands())
++
++    assert isinstance(function, tvm_ffi.Function)
++    assert cached_function is function
++    assert cached_abi == abi
++    assert abi.arg_spec == ("args", "rets", "ctx.stream")
++    assert [(entry.role, entry.kind) for entry in abi.entries] == [
++        ("a", "arg"),
++        ("b", "arg"),
++        ("sfa", "arg"),
++        ("sfb", "arg"),
++        ("padded_offsets", "arg"),
++        ("alpha", "arg"),
++        ("prob", "arg"),
++        ("norm_const", "arg"),
++        ("c", "ret"),
++        ("d", "ret"),
++        ("d_col", "ret"),
++        ("sfd_row", "ret"),
++        ("sfd_col", "ret"),
++        ("stream", "stream"),
++    ]
+-- 
+2.50.0

@@ -741,6 +741,23 @@ class TestTeEpMoeCudnnCutedslFusion:
         assert np.all(np.isfinite(fused_np))
 
         params_np = _params_global_numpy(variables, mesh)
+        # MoEBlock callers provide ordinary routing decisions, not the
+        # CuTeDSL kernel's 256-padded expert boundaries. Verify this seeded
+        # case is genuinely ragged before the internal dispatch/padding path.
+        routing_logits = jnp.asarray(jax.device_get(x)).reshape(-1, HIDDEN) @ jnp.asarray(
+            params_np["gate_kernel"]
+        ).astype(DTYPE)
+        _, routed_experts = jax.lax.top_k(routing_logits.astype(jnp.float32), k=TOPK)
+        raw_routing_counts = np.asarray(
+            jax.device_get(jnp.bincount(routed_experts.reshape(-1), length=NUM_EXPERTS))
+        )
+        assert np.unique(raw_routing_counts).size > 1, (
+            f"expected unequal raw routing counts, got {raw_routing_counts}"
+        )
+        assert np.any(raw_routing_counts % _CUDNN_CUTEDSL_ALIGN_SIZE != 0), (
+            "MoEBlock regression must exercise unaligned caller-visible routing counts; "
+            f"got {raw_routing_counts}"
+        )
         reference, _ = _pure_jax_moe_reference(
             jnp.asarray(jax.device_get(x)),
             jnp.asarray(params_np["gate_kernel"]),
@@ -794,22 +811,34 @@ class TestTeEpMoeCudnnCutedslFusion:
                 relative_error < 0.35
             ), f"{name} fused MXFP8 VJP relative error {relative_error:.4f} exceeds 0.35"
 
-        # Exercise the failure mode seen in MaxText: apply one optimizer-like
-        # update and require the next forward pass to remain finite.
-        updated_variables = jax.tree_util.tree_map(
-            lambda param, grad: param - jnp.asarray(1e-3, param.dtype) * grad.astype(param.dtype),
-            variables,
-            grads,
-        )
+        # Exercise the failure mode seen in MaxText over several optimizer-like
+        # steps. A one-step check can miss ABI/layout corruption that appears
+        # only after the newly quantized weights feed the next backward pass.
+        training_variables = variables
+        losses = []
         with _ctx(mesh), autocast(
             enabled=True,
             recipe=MXFP8BlockScaling(),
             mesh_resource=mesh_resource,
         ):
-            updated_output, _ = jax.jit(block.apply)(updated_variables, _shard_inputs(x, mesh))
+            compiled_loss_and_grad = jax.jit(jax.value_and_grad(loss_fn))
+            for _ in range(3):
+                step_loss, step_grads = compiled_loss_and_grad(training_variables, x_sh)
+                training_variables = jax.tree_util.tree_map(
+                    lambda param, grad: param
+                    - jnp.asarray(1e-3, param.dtype) * grad.astype(param.dtype),
+                    training_variables,
+                    step_grads,
+                )
+                losses.append(step_loss)
+            updated_output, _ = jax.jit(block.apply)(training_variables, _shard_inputs(x, mesh))
             updated_output.block_until_ready()
+            jax.block_until_ready(losses)
         updated_output_np = _to_global_numpy(updated_output, mesh).astype(np.float32)
-        assert np.all(np.isfinite(updated_output_np)), "post-update output has NaN/Inf"
+        loss_values = np.asarray([jax.device_get(loss) for loss in losses], dtype=np.float32)
+        assert np.all(np.isfinite(loss_values)), f"training losses have NaN/Inf: {loss_values}"
+        assert loss_values[-1] <= 1.2 * loss_values[0], f"training loss diverged: {loss_values}"
+        assert np.all(np.isfinite(updated_output_np)), "post-training output has NaN/Inf"
 
     def test_maxtext_shape_vjp_update_stays_finite(self, mesh):
         """Regression for the NaN observed after MaxText's first update."""
