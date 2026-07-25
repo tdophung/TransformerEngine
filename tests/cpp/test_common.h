@@ -189,6 +189,10 @@ class Tensor {
     return tensor_.get_columnwise_scale_inv().shape;
   }
 
+  NVTEShape nvfp4_scale_inv_2_shape() const {
+    return tensor_.get_nvfp4_scale_inv_2().shape;
+  }
+
   NVTEScalingMode scaling_mode() const noexcept {
     return tensor_.scaling_mode();
   }
@@ -267,6 +271,13 @@ class Tensor {
     NVTE_CHECK(scale_inv_columnwise_);
     scale_inv_columnwise_->to_cpu();
     return scale_inv_columnwise_->cpu_buffer<T>();
+  }
+
+  template <typename T>
+  T *cpu_nvfp4_scale_inv_2_ptr() {
+    NVTE_CHECK(scale_inv_2_);
+    scale_inv_2_->to_cpu();
+    return scale_inv_2_->cpu_buffer<T>();
   }
 
   template <typename T>
@@ -377,6 +388,7 @@ class Tensor {
   std::optional<Buffer> data_columnwise_;
   std::shared_ptr<Buffer> scale_inv_rowwise_;
   std::shared_ptr<Buffer> scale_inv_columnwise_;
+  std::shared_ptr<Buffer> scale_inv_2_;
   std::optional<Buffer> amax_rowwise_;
   std::optional<Buffer> amax_columnwise_;
   std::optional<Buffer> scale_;

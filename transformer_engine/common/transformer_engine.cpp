@@ -46,6 +46,8 @@ std::string to_string(const NVTEScalingMode &mode) {
       return "NVTE_BLOCK_SCALING_2D";
     case NVTE_NVFP4_1D_SCALING:
       return "NVTE_NVFP4_1D_SCALING";
+    case NVTE_NVFP4_2TIER_BLOCK_SCALING:
+      return "NVTE_NVFP4_2TIER_BLOCK_SCALING";
     case NVTE_INVALID_SCALING:
       return "NVTE_INVALID_SCALING";
   }
@@ -136,6 +138,26 @@ void CheckScaleTensorShape(const Tensor &t, std::string_view name) {
                    "\" has invalid columnwise_scale_inv shape (expected ", expected, ", got ",
                    t.columnwise_scale_inv.shape, ")");
       }
+    } else if (t.scaling_mode == NVTE_NVFP4_2TIER_BLOCK_SCALING) {
+      constexpr std::array<size_t, 2> block_alignment{
+          scale_tensor_alignment_Y_rowwise, scale_tensor_alignment_X_rowwise};
+      const auto [first_dim, last_dim] = t.flat_2d_dims();
+      NVTE_CHECK(t.has_data(), "Tensor \"", name,
+                 "\" with NVFP4 2-tier block scaling requires rowwise data.");
+      NVTE_CHECK(!t.has_columnwise_data(), "Tensor \"", name,
+                 "\" with NVFP4 2-tier block scaling does not support columnwise data.");
+      const std::array<size_t, 2> expected_s1{
+          DIVUP_TO_MULTIPLE(first_dim, block_alignment[0]),
+          DIVUP_TO_MULTIPLE(DIVUP(last_dim, static_cast<size_t>(16)), block_alignment[1])};
+      const std::array<size_t, 2> expected_s2{
+          DIVUP_TO_MULTIPLE(first_dim, block_alignment[0]),
+          DIVUP_TO_MULTIPLE(DIVUP(last_dim, static_cast<size_t>(256)), block_alignment[1])};
+      NVTE_CHECK(t.scale_inv.shape == expected_s1, "Tensor \"", name,
+                 "\" has invalid inner scale_inv shape (expected ", expected_s1, ", got ",
+                 t.scale_inv.shape, ")");
+      NVTE_CHECK(t.scale_inv_2.shape == expected_s2, "Tensor \"", name,
+                 "\" has invalid outer scale_inv_2 shape (expected ", expected_s2, ", got ",
+                 t.scale_inv_2.shape, ")");
     }
   }
 }
@@ -173,6 +195,14 @@ void CheckInputTensor(const Tensor &t, std::string_view name, bool check_scale_i
                  "_scale_inverse has invalid dtype "
                  "(expected DType::kFloat8E4M3, got ",
                  to_string(t.scale_inv.dtype), ")");
+      if (t.scaling_mode == NVTE_NVFP4_2TIER_BLOCK_SCALING) {
+        NVTE_CHECK(t.scale_inv_2.has_data(), "NVFP4 2-tier outer scaling factor input ", name,
+                   "_scale_inv_2 must be allocated");
+        NVTE_CHECK(t.scale_inv_2.dtype == DType::kFloat8E4M3,
+                   "NVFP4 2-tier outer scaling factor input ", name,
+                   "_scale_inv_2 has invalid dtype (expected Float8E4M3, got ",
+                   to_string(t.scale_inv_2.dtype), ")");
+      }
     }
     if (t.has_columnwise_data()) {
       NVTE_CHECK(t.columnwise_scale_inv.has_data(), "FP4 scaling factor input ", name,
@@ -186,6 +216,7 @@ void CheckInputTensor(const Tensor &t, std::string_view name, bool check_scale_i
   } else {
     NVTE_CHECK(!t.scale.has_data(), "Scale is not supported for non-FP8 input ", name);
     NVTE_CHECK(!t.scale_inv.has_data(), "Scale_inv is not supported for non-FP8 input ", name);
+    NVTE_CHECK(!t.scale_inv_2.has_data(), "Scale_inv_2 is not supported for non-FP4 input ", name);
     NVTE_CHECK(!t.columnwise_scale_inv.has_data(), "Scale_inv is not supported for non-FP8 input ",
                name);
   }
@@ -234,6 +265,14 @@ void CheckOutputTensor(const Tensor &t, std::string_view name, bool allow_empty)
                  "_scale_inverse has invalid dtype "
                  "(expected Float8E4M3, got ",
                  to_string(t.scale_inv.dtype), ")");
+      if (t.scaling_mode == NVTE_NVFP4_2TIER_BLOCK_SCALING) {
+        NVTE_CHECK(t.scale_inv_2.has_data(), "NVFP4 2-tier outer scaling factor output ", name,
+                   "_scale_inv_2 must be allocated");
+        NVTE_CHECK(t.scale_inv_2.dtype == DType::kFloat8E4M3,
+                   "NVFP4 2-tier outer scaling factor output ", name,
+                   "_scale_inv_2 has invalid dtype (expected Float8E4M3, got ",
+                   to_string(t.scale_inv_2.dtype), ")");
+      }
     }
     if (t.has_columnwise_data()) {
       NVTE_CHECK(t.columnwise_scale_inv.has_data(), "FP4 scaling factor output ", name,
@@ -247,6 +286,7 @@ void CheckOutputTensor(const Tensor &t, std::string_view name, bool allow_empty)
   } else {
     NVTE_CHECK(!t.scale.has_data(), "Scale is not supported for non-FP8 output ", name);
     NVTE_CHECK(!t.scale_inv.has_data(), "Scale_inv is not supported for non-FP8 output ", name);
+    NVTE_CHECK(!t.scale_inv_2.has_data(), "Scale_inv_2 is not supported for non-FP4 output ", name);
     NVTE_CHECK(!t.columnwise_scale_inv.has_data(), "Scale_inv is not supported for non-FP8 input ",
                name);
   }
@@ -847,6 +887,11 @@ void nvte_set_tensor_param_v2(NVTETensor tensor, NVTETensorParam param, const vo
       NVTE_CHECK(t.nvfp4_e4m3_max == 448 || t.nvfp4_e4m3_max == 256,
                  "Unsupported NVFP4 E4M3 max (got ", t.nvfp4_e4m3_max, ")");
       break;
+    case kNVTENVFP4ScaleInv2: {
+      const NVTEBasicTensor *basic_tensor = reinterpret_cast<const NVTEBasicTensor *>(buf);
+      t.scale_inv_2 = *basic_tensor;
+      break;
+    }
     default:
       NVTE_ERROR("Unsupported tensor parameter (", static_cast<int>(param), ")");
   }
@@ -933,6 +978,11 @@ void nvte_get_tensor_param_v2(const NVTETensor tensor, NVTETensorParam param, vo
     case kNVTENVFP4E4M3Max:
       std::memcpy(buf, &t->nvfp4_e4m3_max, attr_size);
       break;
+    case kNVTENVFP4ScaleInv2: {
+      NVTEBasicTensor *basic_tensor = reinterpret_cast<NVTEBasicTensor *>(buf);
+      *basic_tensor = static_cast<NVTEBasicTensor>(t->scale_inv_2);
+      break;
+    }
     default:
       NVTE_ERROR("Unsupported tensor parameter (", static_cast<int>(param), ")");
   }

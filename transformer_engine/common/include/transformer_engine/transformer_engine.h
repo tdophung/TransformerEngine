@@ -90,6 +90,13 @@ enum NVTETensorParam {
    *  Standard NVFP4 uses 448; 4over6 may use 256 for map-to-4 headroom.
    */
   kNVTENVFP4E4M3Max = 9,
+  /*! Outer E4M3 decode scales for NVFP4 2-tier block scaling.
+   *
+   *  The logical shape is [M, K/256]. The physical shape is padded to
+   *  [roundup(M, 128), roundup(K/256, 4)] and is unswizzled in the
+   *  correctness-first implementation.
+   */
+  kNVTENVFP4ScaleInv2 = 10,
   kNVTENumTensorParams
 };
 
@@ -115,6 +122,10 @@ enum NVTEScalingMode {
   /*! Single scale per block of 16 elements consecutive in either
    * rowwise or columnwise direction */
   NVTE_NVFP4_1D_SCALING = 4,
+  /*! Two-level rowwise FP4 block scaling with E4M3 decode scales at
+   *  1x16 (inner tier) and 1x256 (outer tier).
+   */
+  NVTE_NVFP4_2TIER_BLOCK_SCALING = 5,
   NVTE_INVALID_SCALING = 100
 };
 
@@ -855,6 +866,11 @@ class TensorWrapper {
   }
 
   template <typename ShapeType>
+  TensorWrapper &set_nvfp4_scale_inv_2(void *dptr, DType type, const ShapeType &shape) noexcept {
+    return set_parameter(kNVTENVFP4ScaleInv2, dptr, type, shape);
+  }
+
+  template <typename ShapeType>
   TensorWrapper &set_columnwise_scale_inv(void *dptr, DType type, const ShapeType &shape) noexcept {
     return set_parameter(kNVTEColumnwiseScaleInv, dptr, type, shape);
   }
@@ -899,6 +915,10 @@ class TensorWrapper {
 
   NVTEBasicTensor get_rowwise_scale_inv() const noexcept {
     return get_parameter(kNVTERowwiseScaleInv);
+  }
+
+  NVTEBasicTensor get_nvfp4_scale_inv_2() const noexcept {
+    return get_parameter(kNVTENVFP4ScaleInv2);
   }
 
   NVTEBasicTensor get_columnwise_scale_inv() const noexcept {

@@ -19,6 +19,7 @@
 #include "../mxfp8/dequantize_mxfp8.cuh"
 #include "../mxfp8/group_dequantize_mxfp8.cuh"
 #include "../nvfp4/dequantize_nvfp4.cuh"
+#include "../nvfp4/dequantize_nvfp4_2tier_block.cuh"
 
 namespace transformer_engine {
 namespace dispatch {
@@ -49,6 +50,10 @@ inline void dequantize_helper(const Tensor &input, Tensor *output, cudaStream_t 
     }
     case NVTE_NVFP4_1D_SCALING: {
       nvfp4::dequantize(input, output, stream);
+      break;
+    }
+    case NVTE_NVFP4_2TIER_BLOCK_SCALING: {
+      nvfp4_2tier_block::dequantize(input, output, stream);
       break;
     }
     default:

@@ -288,6 +288,7 @@ struct Tensor {
   SimpleTensor columnwise_amax;
   SimpleTensor scale;
   SimpleTensor scale_inv;
+  SimpleTensor scale_inv_2;
   SimpleTensor columnwise_scale_inv;
 
   NVTEScalingMode scaling_mode;
@@ -320,7 +321,8 @@ struct Tensor {
       sizeof(NVTEBasicTensor),  // kNVTEColumnwiseAmax
       sizeof(uint8_t),          // kNVTEWithGEMMSwizzledScales
       sizeof(uint8_t),          // kNVTERowScaledNVFP4
-      sizeof(int)               // kNVTENVFP4E4M3Max
+      sizeof(int),              // kNVTENVFP4E4M3Max
+      sizeof(NVTEBasicTensor)   // kNVTENVFP4ScaleInv2
   };
 
   Tensor() : scaling_mode{NVTE_DELAYED_TENSOR_SCALING}, nvte_tensor{0} {}
@@ -333,6 +335,7 @@ struct Tensor {
     columnwise_amax.clear();
     scale.clear();
     scale_inv.clear();
+    scale_inv_2.clear();
     columnwise_scale_inv.clear();
     scaling_mode = NVTE_DELAYED_TENSOR_SCALING;
     with_gemm_swizzled_scales = false;
@@ -389,7 +392,8 @@ struct Tensor {
       case NVTE_DELAYED_TENSOR_SCALING:
       case NVTE_BLOCK_SCALING_1D:
       case NVTE_BLOCK_SCALING_2D:
-      case NVTE_NVFP4_1D_SCALING: {
+      case NVTE_NVFP4_1D_SCALING:
+      case NVTE_NVFP4_2TIER_BLOCK_SCALING: {
         // Row-wise data shape matches tensor logical shape,
         // column-wise data shape is transpose of logical shape
         if (!has_data() && has_columnwise_data()) {

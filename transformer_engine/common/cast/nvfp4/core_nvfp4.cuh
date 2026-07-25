@@ -75,6 +75,56 @@ namespace core {
 #if FP4_TYPE_SUPPORTED
 using namespace ptx;
 
+namespace two_tier_block_scaling {
+
+constexpr size_t kInnerBlockSize = 16;
+constexpr size_t kOuterBlockSize = 256;
+constexpr size_t kRowsPerCTA = 16;
+constexpr int kE4M3Max = 448;
+
+template <int SCALE_MAX = kE4M3Max>
+__device__ __forceinline__ fp8e4m3 cast_scale_rne_clamp(const float value) {
+  static_assert(SCALE_MAX > 0, "Scale maximum must be positive.");
+  return static_cast<fp8e4m3>(fminf(value, static_cast<float>(SCALE_MAX)));
+}
+
+template <int SCALE_MAX = kE4M3Max>
+__device__ __forceinline__ fp8e4m3 compute_outer_decode_scale(const float outer_amax) {
+  constexpr float fp4_max = detail::TypeExtrema<fp4e2m1>::max;
+  if (outer_amax == 0.0f) {
+    // Match the existing NVFP4 zero-amax convention: keep the outer
+    // scale benign and let the zero inner scale reconstruct zeros.
+    return static_cast<fp8e4m3>(1.0f);
+  }
+  return cast_scale_rne_clamp<SCALE_MAX>(
+      outer_amax / (static_cast<float>(SCALE_MAX) * fp4_max));
+}
+
+template <int SCALE_MAX = kE4M3Max>
+__device__ __forceinline__ fp8e4m3 compute_inner_decode_scale(const float inner_amax,
+                                                               const float outer_scale) {
+  constexpr float fp4_max = detail::TypeExtrema<fp4e2m1>::max;
+  if (outer_scale == 0.0f) {
+    // A nonzero scale may underflow when stored as E4M3. Preserve the
+    // specified post-cast-S2 rule without dividing by zero.
+    return inner_amax == 0.0f ? static_cast<fp8e4m3>(0.0f)
+                              : cast_scale_rne_clamp<SCALE_MAX>(
+                                    static_cast<float>(SCALE_MAX));
+  }
+  return cast_scale_rne_clamp<SCALE_MAX>((inner_amax / fp4_max) / outer_scale);
+}
+
+__device__ __forceinline__ float compute_encode_scale(const float inner_scale,
+                                                       const float outer_scale) {
+  const float decode_scale = inner_scale * outer_scale;
+  if (decode_scale == 0.0f) {
+    return detail::TypeExtrema<float>::max;
+  }
+  return fminf(1.0f / decode_scale, detail::TypeExtrema<float>::max);
+}
+
+}  // namespace two_tier_block_scaling
+
 // Compute the global encode scale factor for a given global amax.
 // NVFP4 uses the full E4M3 range by default. Some 4over6 tensors dispatch
 // E4M3_MAX=256 to leave room for map-to-4 scale expansion.

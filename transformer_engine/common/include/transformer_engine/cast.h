@@ -77,6 +77,11 @@ extern "C" {
  *  This quantization mode includes both the calculation of the scaling factors
  *  per-tile and quantization of the row and/or columnwise tiles. No precalculated
  *  absolute max is required. The scaling factors are also rounded to powers of 2.
+ *
+ *  4) NVTE_NVFP4_2TIER_BLOCK_SCALING is a rowwise-only correctness path with
+ *  E4M3 decode scales for each 1x16 inner block and each 1x256 outer block.
+ *  It requires contiguous input, K divisible by 256, and separate unswizzled
+ *  row-major scale_inv and scale_inv_2 buffers.
  */
 
 /*! \brief Casts input tensor to FP8/MXFP8/BlockwiseFP8.
@@ -88,6 +93,14 @@ extern "C" {
  *  \param[in]     stream           CUDA stream used for the operation.
  */
 void nvte_quantize(const NVTETensor input, NVTETensor output, cudaStream_t stream);
+
+/*! \brief Quantize a contiguous tensor with rowwise NVFP4 2-tier block scaling.
+ *
+ * The output must use NVTE_NVFP4_2TIER_BLOCK_SCALING and provide separate
+ * E4M3 scale_inv (1x16) and scale_inv_2 (1x256) buffers.
+ */
+void nvte_nvfp4_2tier_block_quantize(const NVTETensor input, NVTETensor output,
+                                     cudaStream_t stream);
 
 /*! \brief Casts input grouped tensor.
  *         The type of quantized tensor in the output depends on the scaling mode of the output
@@ -415,6 +428,10 @@ void nvte_group_quantize_dbias_dsrelu(const NVTEGroupedTensor input,
  *  \param[in]     stream    CUDA stream used for the operation.
  */
 void nvte_dequantize(const NVTETensor input, NVTETensor output, cudaStream_t stream);
+
+/*! \brief Dequantize a rowwise NVFP4 2-tier block-scaled tensor. */
+void nvte_nvfp4_2tier_block_dequantize(const NVTETensor input, NVTETensor output,
+                                       cudaStream_t stream);
 
 /*! \brief Casts input grouped tensor from reduced to higher precision.
  *         In case of the MXFP8 dequantization, the dequantized values are stored to the rowwise

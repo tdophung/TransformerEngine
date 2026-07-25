@@ -23,6 +23,7 @@
 #include "../mxfp8/group_quantize_mxfp8.cuh"
 #include "../mxfp8/quantize_mxfp8.cuh"
 #include "../nvfp4/group_quantize_transpose_nvfp4.cuh"
+#include "../nvfp4/quantize_nvfp4_2tier_block.cuh"
 #include "../nvfp4/quantize_4over6_nvfp4.cuh"
 #include "../nvfp4/quantize_transpose_nvfp4.cuh"
 
@@ -158,6 +159,22 @@ void quantize_fwd_helper(const NVTETensor input, NVTETensor output,
             /*noop_tensor=*/noop_tensor->data,
             /*stream=*/stream);
       }
+      break;
+    }
+    case NVTE_NVFP4_2TIER_BLOCK_SCALING: {
+      NVTE_CHECK(!IS_ACT,
+                 "IS_ACT is not supported by NVTE_NVFP4_2TIER_BLOCK_SCALING quantization.");
+      CheckNoopTensor(*noop_tensor, "cast_noop");
+      NVTE_CHECK(!noop_tensor->data.has_data(),
+                 "NVFP4 2-tier block quantization v0 does not support a noop tensor.");
+      NVTE_CHECK(!quant_config_cpp.stochastic_rounding,
+                 "NVFP4 2-tier block quantization v0 is deterministic and does not support "
+                 "stochastic rounding.");
+      NVTE_CHECK(!quant_config_cpp.nvfp4_2d_quantization,
+                 "NVFP4 2-tier block quantization does not support 2D quantization.");
+      NVTE_CHECK(quant_config_cpp.nvfp4_4over6_mode == kNVTENVFP44Over6Disabled,
+                 "NVFP4 2-tier block quantization does not support 4over6.");
+      nvfp4_2tier_block::quantize(*input_tensor, output_tensor, stream);
       break;
     }
     case NVTE_BLOCK_SCALING_2D: {

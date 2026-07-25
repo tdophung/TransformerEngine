@@ -195,6 +195,24 @@ std::pair<scale_inv_meta, scale_inv_meta> get_scales(const NVTEShape& shape,
 
     return {ret_rowwise, ret_colwise};
   }
+  if (scaling_mode == NVTE_NVFP4_2TIER_BLOCK_SCALING) {
+    std::vector<size_t> shape_vec;
+    for (size_t i = 0; i < shape.ndim; ++i) {
+      shape_vec.push_back(shape.data[i]);
+    }
+    const size_t first_dim = first_dimension(shape_vec);
+    const size_t last_dim = last_dimension(shape_vec);
+    NVTE_CHECK(last_dim % 256 == 0);
+
+    scale_inv_meta ret_rowwise, ret_colwise;
+    ret_rowwise.shape = {
+        DIVUP_TO_MULTIPLE(first_dim, scale_tensor_alignment_Y_rowwise),
+        DIVUP_TO_MULTIPLE(DIVUP(last_dim, 16lu), scale_tensor_alignment_X_rowwise)};
+    ret_rowwise.type = DType::kFloat8E4M3;
+    ret_rowwise.type_size_bits = typeToNumBits(DType::kFloat8E4M3);
+    ret_colwise = ret_rowwise;
+    return {ret_rowwise, ret_colwise};
+  }
   if (scaling_mode == NVTE_BLOCK_SCALING_2D) {
     std::vector<size_t> shape_vec;
     for (size_t i = 0; i < shape.ndim; ++i) {
@@ -326,6 +344,10 @@ Tensor::Tensor(const std::string& name,
       }
       break;
     }
+    case NVTE_NVFP4_2TIER_BLOCK_SCALING: {
+      NVTE_ERROR("NVFP4 2-tier block scaling does not support columnwise test tensors.");
+      break;
+    }
     case NVTE_MXFP8_1D_SCALING: {
       // Column-wise data matches shape
       for (size_t i = 0; i < shape.ndim; ++i) {
@@ -371,6 +393,7 @@ Tensor::Tensor(const std::string& name,
   case NVTE_BLOCK_SCALING_1D:
   case NVTE_BLOCK_SCALING_2D:
   case NVTE_NVFP4_1D_SCALING:
+  case NVTE_NVFP4_2TIER_BLOCK_SCALING:
     {
       // Block scaling factors
       auto [rowwise_scale_meta, colwise_scale_meta] = get_scales(flattened_shape, tensor_.scaling_mode());
@@ -385,6 +408,20 @@ Tensor::Tensor(const std::string& name,
         const auto scale_dtype = colwise_scale_meta.type;
         scale_inv_columnwise_ = std::make_shared<Buffer>(product(scale_shape), scale_dtype);
         tensor_.set_columnwise_scale_inv(scale_inv_columnwise_->gpu_buffer(), scale_dtype, scale_shape);
+      }
+
+      if (scaling_mode == NVTE_NVFP4_2TIER_BLOCK_SCALING) {
+        NVTE_CHECK(rowwise && !columnwise);
+        const auto shape = tensor_.shape();
+        const size_t rows = product(shape, 0, shape.ndim - 1);
+        const size_t cols = shape.data[shape.ndim - 1];
+        const std::vector<size_t> scale_inv_2_shape{
+            DIVUP_TO_MULTIPLE(rows, scale_tensor_alignment_Y_rowwise),
+            DIVUP_TO_MULTIPLE(DIVUP(cols, 256lu), scale_tensor_alignment_X_rowwise)};
+        scale_inv_2_ =
+            std::make_shared<Buffer>(product(scale_inv_2_shape), DType::kFloat8E4M3);
+        tensor_.set_nvfp4_scale_inv_2(scale_inv_2_->gpu_buffer(), DType::kFloat8E4M3,
+                                      scale_inv_2_shape);
       }
 
       // NVFP4 uses amax for tensor scaling
@@ -457,6 +494,7 @@ void Tensor::to_cpu() {
   if (data_columnwise_) { data_columnwise_->to_cpu(); }
   if (scale_inv_rowwise_) { scale_inv_rowwise_->to_cpu(); }
   if (scale_inv_columnwise_) { scale_inv_columnwise_->to_cpu(); }
+  if (scale_inv_2_) { scale_inv_2_->to_cpu(); }
   if (amax_rowwise_) { amax_rowwise_->to_cpu(); }
   if (amax_columnwise_) { amax_columnwise_->to_cpu(); }
   if (scale_) { scale_->to_cpu(); }
@@ -467,6 +505,7 @@ void Tensor::from_cpu() {
   if (data_columnwise_) { data_columnwise_->from_cpu(); }
   if (scale_inv_rowwise_) { scale_inv_rowwise_->from_cpu(); }
   if (scale_inv_columnwise_) { scale_inv_columnwise_->from_cpu(); }
+  if (scale_inv_2_) { scale_inv_2_->from_cpu(); }
   if (amax_rowwise_) { amax_rowwise_->from_cpu(); }
   if (amax_columnwise_) { amax_columnwise_->from_cpu(); }
   if (scale_) { scale_->from_cpu(); }

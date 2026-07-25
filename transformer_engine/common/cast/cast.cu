@@ -26,6 +26,16 @@ void nvte_quantize(const NVTETensor input, NVTETensor output, cudaStream_t strea
   dispatch::quantize_fwd_helper<IS_ACT, Empty, nullptr>(input, output, nullptr, stream);
 }
 
+void nvte_nvfp4_2tier_block_quantize(const NVTETensor input, NVTETensor output,
+                                     cudaStream_t stream) {
+  NVTE_API_CALL(nvte_nvfp4_2tier_block_quantize);
+  using namespace transformer_engine;
+  Tensor *output_tensor = convertNVTETensorCheck(output);
+  NVTE_CHECK(output_tensor->scaling_mode == NVTE_NVFP4_2TIER_BLOCK_SCALING,
+             "nvte_nvfp4_2tier_block_quantize requires a 2-tier block-scaled output tensor.");
+  dispatch::nvfp4_2tier_block::quantize(*convertNVTETensorCheck(input), output_tensor, stream);
+}
+
 void nvte_quantize_noop(const NVTETensor input, NVTETensor output, NVTETensor noop,
                         cudaStream_t stream) {
   NVTE_API_CALL(nvte_quantize_noop);
@@ -52,6 +62,16 @@ void nvte_dequantize(const NVTETensor input, NVTETensor output, cudaStream_t str
   using namespace transformer_engine;
   dispatch::dequantize_helper(*convertNVTETensorCheck(input), convertNVTETensorCheck(output),
                               stream);
+}
+
+void nvte_nvfp4_2tier_block_dequantize(const NVTETensor input, NVTETensor output,
+                                       cudaStream_t stream) {
+  NVTE_API_CALL(nvte_nvfp4_2tier_block_dequantize);
+  using namespace transformer_engine;
+  const Tensor *input_tensor = convertNVTETensorCheck(input);
+  NVTE_CHECK(input_tensor->scaling_mode == NVTE_NVFP4_2TIER_BLOCK_SCALING,
+             "nvte_nvfp4_2tier_block_dequantize requires a 2-tier block-scaled input tensor.");
+  dispatch::nvfp4_2tier_block::dequantize(*input_tensor, convertNVTETensorCheck(output), stream);
 }
 
 void nvte_multi_tensor_quantize(const NVTETensor *inputs, NVTETensor *outputs,
