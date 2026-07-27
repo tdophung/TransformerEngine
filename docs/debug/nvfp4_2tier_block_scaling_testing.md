@@ -99,21 +99,32 @@ cmake \
 
 ## Run the focused tests
 
-Run the test binary directly for the clearest failures:
+For local development and agent-driven testing, run only the focused tests
+unless the user explicitly requests broader regression testing. The
+`test_operator` executable contains approximately 40 unrelated CUDA test
+sources and discovers 8,831 GoogleTest cases. Running it without a filter
+tests the entire Transformer Engine operator surface, not just this feature.
+
+Run the focused tests in one process for the fastest feedback and clearest
+failures:
 
 ```bash
 tests/cpp/build-nvfp4-2tier/operator/test_operator \
   --gtest_filter='NVFP4TwoTierBlockQuantize.*:NVFP4TwoTierBlockDequantize.*'
 ```
 
-Five tests should run:
+Nine tests should run:
 
 ```text
 NVFP4TwoTierBlockQuantize.FP32PartialMTileAndMultipleOuterBlocks
 NVFP4TwoTierBlockQuantize.BF16PartialMTileAndMultipleOuterBlocks
+NVFP4TwoTierBlockQuantize.FP32Multiple64RowTiles
+NVFP4TwoTierBlockQuantize.BF16LargeMultiple64RowTilesAndOuterBlocks
 NVFP4TwoTierBlockQuantize.ZeroAmaxUsesBenignOuterScale
 NVFP4TwoTierBlockDequantize.FP32PartialMTileAndMultipleOuterBlocks
 NVFP4TwoTierBlockDequantize.BF16PartialMTileAndMultipleOuterBlocks
+NVFP4TwoTierBlockDequantize.FP32Multiple64RowTiles
+NVFP4TwoTierBlockDequantize.BF16LargeMultiple64RowTilesAndOuterBlocks
 ```
 
 The quantization tests compare all of the following bitwise against a host
@@ -126,7 +137,14 @@ reference:
 - zero-amax behavior;
 - scale saturation and non-finite input behavior;
 - zeroed padding in the physical `128 x 4`-aligned scale allocations;
-- partial 16-row CTA tiles and multiple outer blocks per row.
+- partial 16-row CTA tiles and multiple outer blocks per row;
+- `256 x 512` and `1024 x 1024` large-M inputs.
+
+The large-M cases are intended to protect future tiling optimizations. In
+particular, they exercise multiple prospective `64 x 256` CTA tiles if the
+kernel keeps the current thread count but loops over four 16-row M subtiles.
+They do not require that optimization; they verify that either the current
+implementation or a future implementation produces the same results.
 
 The dequantization tests reconstruct a host reference from the actual packed
 bytes, S1, and S2 buffers and verify:
@@ -143,19 +161,54 @@ The same tests can be run through CTest:
 ```bash
 ctest \
   --test-dir tests/cpp/build-nvfp4-2tier \
-  -R 'NVFP4TwoTierBlock' \
+  -R '^NVFP4TwoTierBlock' \
   --output-on-failure
 ```
 
-## Regression testing
+CTest starts the test executable separately for each discovered case, so the
+nine focused cases are slower through CTest than through the single-process
+GoogleTest command. Use the direct command for iteration and CTest only to
+confirm test discovery.
 
-After the focused tests pass, run the complete operator test binary:
+### Large-M optimization iteration
+
+To run only the four cases that exercise multiple prospective 64-row tiles:
+
+```bash
+tests/cpp/build-nvfp4-2tier/operator/test_operator \
+  --gtest_filter='NVFP4TwoTierBlockQuantize.*Multiple64RowTiles*:NVFP4TwoTierBlockDequantize.*Multiple64RowTiles*'
+```
+
+These are correctness tests, not performance benchmarks. GoogleTest elapsed
+time includes CUDA initialization, allocation, copies, synchronization, and
+host-reference computation. When evaluating a larger tile such as `64 x 256`
+with four-way M looping, use a CUDA profiler or dedicated benchmark to compare
+the `quantize_kernel` and `dequantize_kernel` durations. Keep these four tests
+as the correctness gate before and after collecting performance results.
+
+**Stop here for normal local or agent-driven feature testing.** Do not run
+the unfiltered `test_operator` binary or unfiltered CTest suite merely to
+validate this kernel.
+
+## Optional broad regression testing
+
+The C++ test project uses `gtest_discover_tests` on a monolithic operator
+binary. Parameterized suites form Cartesian products over shapes, data types,
+scaling modes, backends, activation functions, and boolean options. This
+currently expands into 8,831 operator cases plus four utility cases. An
+unfiltered CTest run starts a fresh process, including CUDA initialization,
+for each case and can take well over an hour even though the monolithic binary
+finishes much sooner.
+
+Run broad regression only in CI, before integration, or when the user
+explicitly requests it. To run all operator cases in one process:
 
 ```bash
 tests/cpp/build-nvfp4-2tier/operator/test_operator
 ```
 
-Then run the complete C++ test project:
+To verify all individually discovered CTest entries, accepting the much
+larger process-launch overhead:
 
 ```bash
 ctest \
@@ -219,15 +272,18 @@ Check the mismatch in this order:
 
 ## Acceptance checklist
 
-- All five focused tests pass on BF16 and FP32 cases.
+- All nine focused tests pass on BF16 and FP32 cases.
 - Focused tests pass when run alone and through CTest discovery.
-- Existing NVFP4 quantize and dequantize tests still pass.
-- The complete `test_operator` binary passes.
-- The complete C++ CTest suite passes.
+- The `256 x 512` and `1024 x 1024` cases pass in both directions.
 - S1 and S2 padding remains zero.
 - No test requires an `amax` allocation for the 2-tier mode.
 - No columnwise, transpose, swizzle, stochastic-rounding, 4over6, or GEMM
   behavior is accidentally enabled.
+
+For an explicitly requested broad regression, additionally require existing
+NVFP4 quantize/dequantize tests and the complete `test_operator` binary to
+pass. Reserve the complete per-case CTest suite for CI when its process-launch
+overhead is acceptable.
 
 ## Current scope boundary
 

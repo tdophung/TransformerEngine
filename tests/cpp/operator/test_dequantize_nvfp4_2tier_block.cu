@@ -89,6 +89,16 @@ TEST(NVFP4TwoTierBlockDequantize, BF16PartialMTileAndMultipleOuterBlocks) {
   run_dequantize_case<bf16>(19, 512);
 }
 
+// Match the large-M quantization coverage so a future 64x256 CTA tile with
+// four-way M looping is checked in both directions.
+TEST(NVFP4TwoTierBlockDequantize, FP32Multiple64RowTiles) {
+  run_dequantize_case<float>(256, 512);
+}
+
+TEST(NVFP4TwoTierBlockDequantize, BF16LargeMultiple64RowTilesAndOuterBlocks) {
+  run_dequantize_case<bf16>(1024, 1024);
+}
+
 }  // namespace
 
 #endif  // FP4_TYPE_SUPPORTED

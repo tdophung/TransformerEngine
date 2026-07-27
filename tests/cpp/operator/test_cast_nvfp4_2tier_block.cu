@@ -166,6 +166,17 @@ TEST(NVFP4TwoTierBlockQuantize, BF16PartialMTileAndMultipleOuterBlocks) {
   run_quantize_case<bf16>(19, 512, false);
 }
 
+// Large-M cases exercise multiple prospective 64-row CTA tiles. They guard
+// future kernels that keep the same thread count and loop over four 16-row
+// subtiles in M rather than assigning one 16-row tile per CTA.
+TEST(NVFP4TwoTierBlockQuantize, FP32Multiple64RowTiles) {
+  run_quantize_case<float>(256, 512, false);
+}
+
+TEST(NVFP4TwoTierBlockQuantize, BF16LargeMultiple64RowTilesAndOuterBlocks) {
+  run_quantize_case<bf16>(1024, 1024, false);
+}
+
 TEST(NVFP4TwoTierBlockQuantize, ZeroAmaxUsesBenignOuterScale) {
   run_quantize_case<float>(3, 256, true);
 }
