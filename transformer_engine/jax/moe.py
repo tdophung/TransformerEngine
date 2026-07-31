@@ -91,9 +91,6 @@ def _cudnn_cutedsl_fusion_rejection_reasons(
     """Return reasons this call cannot use the CuTeDSL fusion, or an empty list."""
     from transformer_engine_jax import get_device_compute_capability
 
-    from .cutedsl_extensions.moe import (
-        load_grouped_gemm_dswiglu_kernel,
-    )
     from .quantize import GroupedQuantizer, ScalingMode
 
     errors = []
@@ -150,27 +147,9 @@ def _cudnn_cutedsl_fusion_rejection_reasons(
         if num_local_experts > 1024:
             errors.append(f"requires at most 1024 local experts, got {num_local_experts}")
 
-    try:
-        import cutlass.jax as cutlass_jax
-    except ImportError as exc:
-        errors.append(f"nvidia-cutlass-dsl with JAX bindings is required: {exc}")
-    else:
-        try:
-            if not cutlass_jax.is_available():
-                errors.append(
-                    "cutlass.jax.is_available() is false; check cute_dsl_runtime.so discovery"
-                )
-        except (AttributeError, RuntimeError) as exc:
-            errors.append(f"CUTLASS JAX runtime check failed: {exc}")
-
     dependencies_available, dependency_error = tex.grouped_gemm_swiglu_dependencies_available()
     if not dependencies_available:
         errors.append(f"could not load the TVM-FFI CuTeDSL compiler/bridge: {dependency_error}")
-
-    try:
-        load_grouped_gemm_dswiglu_kernel()
-    except (ImportError, ModuleNotFoundError, RuntimeError) as exc:
-        errors.append(f"could not load the cuDNN frontend dSwiGLU backward kernel: {exc}")
 
     return errors
 
@@ -445,9 +424,7 @@ def _ffn_fwd_per_shard(
     # blocks. The existing TE grouped-GEMM path consumes the two full
     # projections concatenated along N.
     if use_cudnn_cutedsl_fusion:
-        from .cutedsl_extensions.moe import pack_swiglu_pair
-
-        wi_combined = pack_swiglu_pair(wi_0, wi_1)
+        wi_combined = tex.pack_swiglu_pair(wi_0, wi_1)
     else:
         # Concat along the trailing axis (NOT stack on a new axis).
         # grouped_gemm requires the 3D (G, K, N) weight layout with
@@ -465,8 +442,6 @@ def _ffn_fwd_per_shard(
     casted_wi = tex.grouped_quantize(wi_combined, fc1_quantizer_set.kernel, flatten_axis=-1)
     casted_intermediate = None
     if use_cudnn_cutedsl_fusion:
-        from .cutedsl_extensions.moe import unpack_swiglu_pair
-
         casted_sorted_x_lhs = casted_sorted_x.get_tensor(usage=TensorUsage.LHS)
         casted_wi_rhs = casted_wi.get_tensor(usage=TensorUsage.RHS)
         padded_offsets = jnp.cumsum(local_group_sizes, dtype=jnp.int32)
@@ -497,7 +472,7 @@ def _ffn_fwd_per_shard(
             output_dtype=fc2_quantizer_set.x.q_dtype,
         )
         combined_out = combined_out_3d.reshape(sorted_x.shape[0], wi_combined.shape[-1])
-        gate_proj_out, up_proj_out = unpack_swiglu_pair(combined_out)
+        gate_proj_out, up_proj_out = tex.unpack_swiglu_pair(combined_out)
 
         intermediate_shape = (sorted_x.shape[0], gate_proj_out.shape[-1])
         scaling_mode = fc2_quantizer_set.x.scaling_mode
@@ -702,12 +677,7 @@ def _ffn_bwd_per_shard(
     d_wo_bias = tex.grouped_dbias(d_eo_2d, local_group_sizes) if has_bias else None
 
     if use_cudnn_cutedsl_fusion:
-        from .cutedsl_extensions.moe import (
-            grouped_gemm_dswiglu_mxfp8,
-            pack_swiglu_pair,
-        )
-
-        packed_forward = pack_swiglu_pair(gate_proj_out, up_proj_out)
+        packed_forward = tex.pack_swiglu_pair(gate_proj_out, up_proj_out)
         padded_offsets = jnp.cumsum(local_group_sizes, dtype=jnp.int32)
         prob = (
             recv_w_flat[:, None, None]
@@ -720,11 +690,9 @@ def _ffn_bwd_per_shard(
             d_combined_scale_row,
             d_combined_scale_col,
             _dprob,
-        ) = grouped_gemm_dswiglu_mxfp8(
+        ) = tex.grouped_gemm_dswiglu(
             _casted_d_eo_lhs.data.reshape(recv_rows, hidden, 1),
-            casted_wo_rhs_trans.data.reshape(
-                num_local_experts, intermediate_size, hidden
-            ).transpose(1, 2, 0),
+            casted_wo_rhs_trans.data.reshape(num_local_experts, intermediate_size, hidden),
             packed_forward.reshape(recv_rows, 2 * intermediate_size, 1),
             _casted_d_eo_lhs.scale_inv,
             casted_wo_rhs_trans.scale_inv,
@@ -772,7 +740,7 @@ def _ffn_bwd_per_shard(
         )
         if apply_topk_weights_early:
             # The cuDNN frontend dSwiGLU kernel accumulates dprob with
-            # atomics and expects a zero-initialized output buffer. cutlass_call
+            # atomics and expects a zero-initialized output buffer. XLA FFI
             # allocates custom-call outputs uninitialized, so compute this
             # routing-weight cotangent explicitly until we can pass dprob as an
             # initialized input/output buffer.
@@ -835,9 +803,7 @@ def _ffn_bwd_per_shard(
     )
     d_wi_combined = jnp.where(wgrad_group_active, d_wi_combined, jnp.zeros_like(d_wi_combined))
     if use_cudnn_cutedsl_fusion:
-        from .cutedsl_extensions.moe import unpack_swiglu_pair
-
-        d_wi_0, d_wi_1 = unpack_swiglu_pair(d_wi_combined)
+        d_wi_0, d_wi_1 = tex.unpack_swiglu_pair(d_wi_combined)
     else:
         d_wi_0, d_wi_1 = jnp.split(d_wi_combined, 2, axis=-1)
     if has_bias:

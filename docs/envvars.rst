@@ -503,10 +503,11 @@ JAX-Specific Variables
    :Type: ``int`` (0 or 1)
    :Default: ``0``
    :Description: **(JAX only)** Enable the experimental cuDNN frontend CuTeDSL fusion
-      for MXFP8 MoE FC1 grouped GEMM, SwiGLU, and grouped quantization. Explicit
-      opt-in requires an eligible SM100 SwiGLU MXFP8 MoE call and the optional
-      CUTLASS/cuDNN frontend JAX runtime packages; unsupported calls fail with the
-      full validation reason list.
+      for MXFP8 MoE FC1 grouped GEMM, SwiGLU/dSwiGLU, and grouped quantization.
+      Forward and backward launch as native TVM-FFI functions through ``jax-tvm-ffi``.
+      Explicit opt-in requires an eligible SM100 SwiGLU MXFP8 MoE call and the
+      optional compiler/runtime packages; unsupported calls warn with the full
+      validation reason list and use the unfused path.
 
 JAX Triton Extensions
 ^^^^^^^^^^^^^^^^^^^^^

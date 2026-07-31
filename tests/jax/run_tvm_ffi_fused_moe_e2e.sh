@@ -4,7 +4,7 @@
 # See LICENSE for license information.
 
 # End-to-end remote SM100 validation for the cuDNN-FE compile-only API,
-# JAX TVM-FFI forward primitive, fused backward, partitioning, and MoEBlock.
+# JAX TVM-FFI forward/backward primitives, partitioning, and MoEBlock.
 
 set -euo pipefail
 
@@ -28,14 +28,19 @@ if [ ! -f "$CUDNN_FE_ROOT/pyproject.toml" ]; then
     git -C "$CUDNN_FE_ROOT" checkout --detach "$CUDNN_FE_BASE_REV"
 fi
 
-CUDNN_FE_COMPILE_API="$CUDNN_FE_ROOT/python/cudnn/grouped_gemm/grouped_gemm_swiglu/compile.py"
-if [ ! -f "$CUDNN_FE_COMPILE_API" ]; then
+CUDNN_FE_FWD_COMPILE_API="$CUDNN_FE_ROOT/python/cudnn/grouped_gemm/grouped_gemm_swiglu/compile.py"
+CUDNN_FE_BWD_COMPILE_API="$CUDNN_FE_ROOT/python/cudnn/grouped_gemm/grouped_gemm_dswiglu/compile.py"
+if [ ! -f "$CUDNN_FE_FWD_COMPILE_API" ] && [ ! -f "$CUDNN_FE_BWD_COMPILE_API" ]; then
     if ! git -C "$CUDNN_FE_ROOT" apply --check "$CUDNN_FE_PATCH"; then
         echo "The bundled compile-only patch does not apply cleanly to $CUDNN_FE_ROOT." >&2
         echo "Use the pinned base $CUDNN_FE_BASE_REV or provide an already-patched checkout." >&2
         exit 1
     fi
     git -C "$CUDNN_FE_ROOT" apply "$CUDNN_FE_PATCH"
+elif [ ! -f "$CUDNN_FE_FWD_COMPILE_API" ] || [ ! -f "$CUDNN_FE_BWD_COMPILE_API" ]; then
+    echo "The cuDNN-FE checkout has only one of the required forward/backward compile APIs." >&2
+    echo "Use the updated compile-only branch or a fresh checkout so both APIs come from one patch." >&2
+    exit 1
 fi
 if [ "$NUM_GPUS" -lt 2 ]; then
     echo "The E2E suite requires at least two SM100 GPUs" >&2
@@ -60,11 +65,12 @@ import inspect
 import jax
 import jax_tvm_ffi
 import tvm_ffi
-from cudnn import compile_grouped_gemm_swiglu
+from cudnn import compile_grouped_gemm_dswiglu, compile_grouped_gemm_swiglu
 
 print("jax", jax.__version__)
 print("devices", jax.devices())
-print("cudnn_frontend", inspect.getfile(compile_grouped_gemm_swiglu))
+print("cudnn_frontend_fwd", inspect.getfile(compile_grouped_gemm_swiglu))
+print("cudnn_frontend_bwd", inspect.getfile(compile_grouped_gemm_dswiglu))
 print("jax_tvm_ffi", inspect.getfile(jax_tvm_ffi))
 print("tvm_ffi", inspect.getfile(tvm_ffi))
 assert all(device.platform == "gpu" for device in jax.devices())

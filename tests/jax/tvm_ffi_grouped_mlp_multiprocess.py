@@ -158,7 +158,6 @@ def _run_matrix_cell(mesh: Mesh, label: str) -> None:
 def _run_ragged_multiprocess_cell(mesh: Mesh) -> None:
     """Exercise eight unequal experts through a global multiprocess shard_map."""
     from transformer_engine.jax import cpp_extensions as tex
-    from transformer_engine.jax.cutedsl_extensions.moe import unpack_swiglu_pair
     from transformer_engine.jax.quantize import (
         QuantizerFactory,
         ScaledTensorFactory,
@@ -255,7 +254,7 @@ def _run_ragged_multiprocess_cell(mesh: Mesh) -> None:
         np.asarray(combined_local[:, :, 0]),
         np.asarray(combined_reference),
     )
-    gate, up = unpack_swiglu_pair(combined_reference)
+    gate, up = tex.unpack_swiglu_pair(combined_reference)
     swiglu_reference = jax.nn.silu(gate) * up
 
     quantizers = QuantizerFactory.create_set(

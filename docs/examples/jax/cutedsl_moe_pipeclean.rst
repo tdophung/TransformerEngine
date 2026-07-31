@@ -4,9 +4,9 @@ CuTeDSL MXFP8 MoE pipeclean
 The JAX MoE path has an opt-in Blackwell fusion for FC1 grouped GEMM,
 SwiGLU, and rowwise/colwise MXFP8 quantization. The forward leaf is compiled
 from abstract tensor descriptors by cuDNN-FE and invoked as a native
-``tvm_ffi.Function``. The surrounding EP path continues to use ``shard_map``
-and sees only shard-local tensors. The fused dSwiGLU backward leaf continues
-to use CUTLASS DSL's JAX integration.
+``tvm_ffi.Function``. The fused dSwiGLU backward leaf uses the same compile-only
+cuDNN-FE and ``jax-tvm-ffi`` path. The surrounding EP path continues to use
+``shard_map`` and sees only shard-local tensors.
 
 Environment baseline
 --------------------
@@ -39,16 +39,19 @@ shapes and biases, MXFP8 quantizers, JAX FFI availability, and both compiler
 paths before lowering. Unsupported configurations emit one warning with the
 complete validation list and use the unfused implementation.
 
-The cuDNN-FE compile-only API is exported from::
+The cuDNN-FE compile-only APIs are exported from::
 
    cudnn/grouped_gemm/grouped_gemm_swiglu/compile.py
+   cudnn/grouped_gemm/grouped_gemm_dswiglu/compile.py
 
 It accepts self-describing operand metadata, compiles without Torch or live
 buffers, and returns a native function plus an exact ABI descriptor. The
-native launch wrapper reorders the eight arguments, five results, and stream
-into the volatile raw kernel ABI. This is necessary because ``jax-tvm-ffi``
-currently describes only complete argument and result groups. The fused path
-uses 256-token dispatch alignment; the unfused path remains at 128.
+native launch wrappers reorder each operation's arguments, five results, and
+stream into the volatile raw kernel ABIs. This is necessary because
+``jax-tvm-ffi`` currently describes only complete argument and result groups.
+Neither compile entrypoint imports the Torch wrapper APIs, and TE contains no
+Torch stub or ``cutlass_call`` launcher. The fused path uses 256-token dispatch
+alignment; the unfused path remains at 128.
 
 Custom partitioning migration design
 ------------------------------------

@@ -12,11 +12,6 @@ import numpy as np
 import pytest
 
 from transformer_engine.jax import cpp_extensions as tex
-from transformer_engine.jax.cutedsl_extensions.moe import (
-    grouped_gemm_dswiglu_mxfp8,
-    pack_swiglu_pair,
-    unpack_swiglu_pair,
-)
 from transformer_engine.jax.quantize import (
     QuantizerFactory,
     ScaledTensorFactory,
@@ -31,21 +26,23 @@ def test_swiglu_block_pack_round_trip():
     """Gate/up packing alternates 32-column blocks and is reversible."""
     gate = jnp.arange(2 * 3 * 64, dtype=jnp.float32).reshape(2, 3, 64)
     up = gate + 1000
-    interleaved = pack_swiglu_pair(gate, up)
+    interleaved = tex.pack_swiglu_pair(gate, up)
 
     np.testing.assert_array_equal(interleaved[..., :32], gate[..., :32])
     np.testing.assert_array_equal(interleaved[..., 32:64], up[..., :32])
-    unpacked_gate, unpacked_up = unpack_swiglu_pair(interleaved)
+    unpacked_gate, unpacked_up = tex.unpack_swiglu_pair(interleaved)
     np.testing.assert_array_equal(unpacked_gate, gate)
     np.testing.assert_array_equal(unpacked_up, up)
 
 
-def test_compile_only_api_bypasses_torch_wrapper():
-    """The forward compiler must not execute cuDNN's Torch wrapper module."""
-    from cudnn import compile_grouped_gemm_swiglu
+def test_compile_only_api_bypasses_torch_wrappers():
+    """Neither compiler executes a cuDNN Torch wrapper module."""
+    from cudnn import compile_grouped_gemm_dswiglu, compile_grouped_gemm_swiglu
 
     assert callable(compile_grouped_gemm_swiglu)
+    assert callable(compile_grouped_gemm_dswiglu)
     assert "cudnn.grouped_gemm.grouped_gemm_swiglu.api" not in sys.modules
+    assert "cudnn.grouped_gemm.grouped_gemm_dswiglu.api" not in sys.modules
 
 
 @pytest.mark.parametrize(
@@ -80,7 +77,7 @@ def test_swiglu_forward_fused_output_parity(group_sizes_tuple):
     wi_1 = jax.random.normal(
         jax.random.fold_in(key, 2), (experts, hidden, intermediate), dtype=jnp.bfloat16
     )
-    wi = pack_swiglu_pair(wi_0, wi_1)
+    wi = tex.pack_swiglu_pair(wi_0, wi_1)
     group_sizes = jnp.asarray(group_sizes_tuple, dtype=jnp.int32)
     assert len(set(group_sizes_tuple)) > 1 or experts == 1
     assert all(offset % 256 == 0 for offset in np.cumsum(group_sizes_tuple))
@@ -105,7 +102,7 @@ def test_swiglu_forward_fused_output_parity(group_sizes_tuple):
             casted_wi,
             contracting_dims=((1,), (1,)),
         )
-        reference_gate, reference_up = unpack_swiglu_pair(reference)
+        reference_gate, reference_up = tex.unpack_swiglu_pair(reference)
         swiglu_reference = jax.nn.silu(reference_gate) * reference_up
         quantized_reference = tex.grouped_quantize(
             swiglu_reference,
@@ -167,7 +164,7 @@ def test_swiglu_forward_fused_output_parity(group_sizes_tuple):
     assert swiglu_row.dtype == swiglu_col.dtype == jnp.float8_e4m3fn
     assert scale_row.dtype == scale_col.dtype == jnp.float8_e8m0fnu
 
-    gate, up = unpack_swiglu_pair(combined)
+    gate, up = tex.unpack_swiglu_pair(combined)
     swiglu_reference = np.asarray(jax.nn.silu(gate) * up, dtype=np.float32)
     for is_colwise, payload, scale, reference_payload, reference_scale in (
         (False, swiglu_row, scale_row, reference_row, reference_scale_row),
@@ -223,10 +220,9 @@ def test_dswiglu_backward_quantized_output_parity():
 
         if get_device_compute_capability(0) != 100:
             pytest.skip("cuDNN frontend grouped GEMM dSwiGLU requires SM100")
-        from transformer_engine.jax.cutedsl_extensions.moe import load_grouped_gemm_dswiglu_kernel
-
-        load_grouped_gemm_dswiglu_kernel()
-        import cutlass.jax  # noqa: F401  # pylint: disable=unused-import,import-outside-toplevel
+        dependencies_available, dependency_error = tex.grouped_gemm_swiglu_dependencies_available()
+        if not dependencies_available:
+            pytest.skip(f"TVM-FFI JAX dependencies are unavailable: {dependency_error}")
     except (ImportError, RuntimeError) as exc:
         pytest.skip(f"CuTeDSL JAX dependencies are unavailable: {exc}")
 
@@ -238,7 +234,7 @@ def test_dswiglu_backward_quantized_output_parity():
     )
     gate = jax.random.normal(jax.random.fold_in(key, 2), (rows, intermediate), dtype=jnp.bfloat16)
     up = jax.random.normal(jax.random.fold_in(key, 3), (rows, intermediate), dtype=jnp.bfloat16)
-    packed_forward = pack_swiglu_pair(gate, up)
+    packed_forward = tex.pack_swiglu_pair(gate, up)
     group_sizes = jnp.asarray([rows], dtype=jnp.int32)
     quantizers = QuantizerFactory.create_set(
         scaling_mode=ScalingMode.MXFP8_1D_SCALING,
@@ -261,9 +257,9 @@ def test_dswiglu_backward_quantized_output_parity():
             casted_wo,
             contracting_dims=((1,), (2,)),
         )
-        d_row, d_col, scale_row, scale_col, dprob = grouped_gemm_dswiglu_mxfp8(
+        d_row, d_col, scale_row, scale_col, dprob = tex.grouped_gemm_dswiglu(
             casted_d_eo.data.reshape(rows, hidden, 1),
-            casted_wo.data.reshape(experts, intermediate, hidden).transpose(1, 2, 0),
+            casted_wo.data.reshape(experts, intermediate, hidden),
             packed_arg.reshape(rows, 2 * intermediate, 1),
             casted_d_eo.scale_inv,
             casted_wo.scale_inv,
@@ -272,6 +268,16 @@ def test_dswiglu_backward_quantized_output_parity():
             output_dtype=quantizers.dgrad.q_dtype,
         )
         return reference_intermediate, d_row, d_col, scale_row, scale_col, dprob
+
+    run.lower(d_eo, wo, packed_forward)
+    grouped_gemm_module = importlib.import_module(
+        "transformer_engine.jax.cpp_extensions.grouped_gemm_swiglu"
+    )
+
+    assert any(
+        name.startswith("te_grouped_gemm_dswiglu.")
+        for name in grouped_gemm_module._REGISTERED_TARGETS  # pylint: disable=protected-access
+    )
 
     reference_intermediate, d_row, d_col, scale_row, scale_col, dprob = run(
         d_eo, wo, packed_forward
@@ -287,7 +293,7 @@ def test_dswiglu_backward_quantized_output_parity():
     ref = reference_intermediate.astype(jnp.float32)
     d_up = ref * swish
     d_gate = ref * up.astype(jnp.float32) * sigmoid * (1 + gate.astype(jnp.float32) * (1 - sigmoid))
-    packed_reference = np.asarray(pack_swiglu_pair(d_gate, d_up), dtype=np.float32)
+    packed_reference = np.asarray(tex.pack_swiglu_pair(d_gate, d_up), dtype=np.float32)
 
     for is_colwise, payload, scale in (
         (False, d_row, scale_row),
