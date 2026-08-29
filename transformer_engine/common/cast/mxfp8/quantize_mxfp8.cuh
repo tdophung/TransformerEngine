@@ -783,8 +783,11 @@ void quantize(const Tensor &input, const Tensor *act_input, const Tensor *noop, 
                     // no bias/activation.  Register-resident tiles, no TMA, L2 evict_last
                     // on all three streams, software prefetch, shape-selective clusters.
                     // 1.35× faster than the TMA kernel on B200 (geomean of 6 shapes).
+                    // Shape guard: KF kernel requires M%32==0, K%256==0 (its fallback
+                    // kernel grid is K/256 blocks wide; K not multiple of 256 → 0 blocks).
                     if constexpr (std::is_same_v<IType, bf16> && std::is_same_v<OType, fp8e4m3> &&
                                   !IS_DBIAS && !IS_DACT && !IS_ACT) {
+                      if (rows % 32 == 0 && cols % 256 == 0) {
                       kf_bidim::launch_mxfp8_kf_bidim(
                           input.data.dptr,
                           output->data.dptr,
@@ -797,7 +800,8 @@ void quantize(const Tensor &input, const Tensor *act_input, const Tensor *noop, 
                           static_cast<int>(scale_stride_colwise),
                           stream);
                       break;
-                    }
+                      }  // if rows%32==0 && cols%256==0
+                    }  // if constexpr bf16→fp8e4m3
 
                     using traits =
                         specialized::CastTraitsSwizzle<IType, OType,
