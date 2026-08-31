@@ -806,6 +806,34 @@ __device__ __forceinline__ bf16x2 exp2f_rcp_2x(e8m0_t biased_exp) {
   return result;
 }
 
+// Scale two BF16 pairs by independent scales and pack the four results into a
+// single FP8E4M3 word.  The mul_cvt_4x overload below shares one scale across
+// all four elements, which is what a rowwise MX block wants; a colwise block
+// gives every column pair its own scale, and this keeps that case to one
+// instruction sequence instead of two conversions and a merge.
+__device__ __forceinline__ void mul_cvt_4x(fp8e4m3x4 &out, const bf16x2 &in0, const bf16x2 &scale0,
+                                           const bf16x2 &in1, const bf16x2 &scale1) {
+#if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+  asm volatile(
+      "{\n\t"
+      ".reg.b32 y0, y1; \n\t"
+      ".reg.b16 z0, z1; \n\t"
+      "mul.rn.bf16x2 y0, %1, %2; \n\t"
+      "mul.rn.bf16x2 y1, %3, %4; \n\t"
+      "cvt.rn.satfinite.e4m3x2.bf16x2 z0, y0; \n\t"
+      "cvt.rn.satfinite.e4m3x2.bf16x2 z1, y1; \n\t"
+      "mov.b32 %0, {z0, z1}; \n"
+      "}\n"
+      : "=r"(reinterpret_cast<uint32_t &>(out))
+      : "r"(reinterpret_cast<const uint32_t &>(in0)),
+        "r"(reinterpret_cast<const uint32_t &>(scale0)),
+        "r"(reinterpret_cast<const uint32_t &>(in1)),
+        "r"(reinterpret_cast<const uint32_t &>(scale1)));
+#else
+  NVTE_DEVICE_ERROR("mul_cvt_4x is only supported on SM 10.0+.");
+#endif  // (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+}
+
 __device__ __forceinline__ void mul_cvt_4x(fp8e4m3x4 &out, const bf16x4 &in, const bf16x2 scale) {
 #if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
 #if (defined CUDA_VERSION) && (CUDA_VERSION >= 13010)
@@ -1688,6 +1716,56 @@ __device__ __forceinline__ void st_global_b32x4(void *dst, const uint32_t (&src)
 #else
   NVTE_DEVICE_ERROR("st_global_b32x4 is only supported on SM 9.0+.");
 #endif  // (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+}
+
+// Non-coherent 128-bit global load tagged with an L2 cache policy.
+__device__ __forceinline__ void ld_global_nc_b32x4(uint32_t (&dst)[4], const void *src,
+                                                   uint64_t l2_policy) {
+#if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+  asm volatile("ld.global.nc.L2::cache_hint.v4.b32 {%0,%1,%2,%3}, [%4], %5;"
+               : "=r"(dst[0]), "=r"(dst[1]), "=r"(dst[2]), "=r"(dst[3])
+               : "l"(src), "l"(l2_policy));
+#else
+  NVTE_DEVICE_ERROR("ld_global_nc_b32x4 is only supported on SM 9.0+.");
+#endif  // (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+}
+
+// 64-bit global store tagged with an L2 cache policy.
+__device__ __forceinline__ void st_global_b32x2(void *dst, const uint32_t (&src)[2],
+                                                uint64_t l2_policy) {
+#if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+  asm volatile("st.global.L2::cache_hint.v2.b32 [%0], {%1,%2}, %3;"
+               :
+               : "l"(dst), "r"(src[0]), "r"(src[1]), "l"(l2_policy)
+               : "memory");
+#else
+  NVTE_DEVICE_ERROR("st_global_b32x2 is only supported on SM 9.0+.");
+#endif  // (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+}
+
+// Single-byte global store tagged with an L2 cache policy.  Scale bytes are
+// written one at a time by a subset of lanes, and tagging them with the same
+// policy as the bulk streams keeps every access from this kernel consistent.
+__device__ __forceinline__ void st_global_b8(void *dst, uint8_t value, uint64_t l2_policy) {
+#if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+  const uint16_t widened = value;
+  asm volatile("st.global.L2::cache_hint.b8 [%0], %1, %2;"
+               :
+               : "l"(dst), "h"(widened), "l"(l2_policy)
+               : "memory");
+#else
+  NVTE_DEVICE_ERROR("st_global_b8 is only supported on SM 9.0+.");
+#endif  // (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+}
+
+// Bring one global cache line into L2 ahead of the demand load that needs it,
+// marked evict_last so it matches the policy the demand load will use.
+__device__ __forceinline__ void prefetch_l2_evict_last(const void *addr) {
+#if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+  asm volatile("prefetch.global.L2::evict_last [%0];" : : "l"(addr));
+#else
+  NVTE_DEVICE_ERROR("prefetch_l2_evict_last is only supported on SM 8.0+.");
+#endif  // (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
 }
 }  // namespace ptx
 
