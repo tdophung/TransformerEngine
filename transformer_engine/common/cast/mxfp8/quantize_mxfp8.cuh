@@ -21,9 +21,9 @@
 #include "../../util/ptx_arch_spec.cuh"
 #include "../../utils.cuh"
 #include "../core/common.cuh"
+#include "kf_rowwise/kernel.h"
 #include "specialized/quantize_mxfp8.cuh"
 #include "swizzle.cuh"
-#include "kf_rowwise/kernel.h"
 
 namespace transformer_engine {
 namespace dispatch {
@@ -751,14 +751,10 @@ void quantize(const Tensor &input, const Tensor *act_input, const Tensor *noop, 
                     // global scale writes — 10-20% faster than the TE specialized kernel.
                     if constexpr (std::is_same_v<IType, bf16> && std::is_same_v<OType, fp8e4m3> &&
                                   !IS_DBIAS && !IS_DACT && !IS_ACT) {
-                      kf_rowwise::launch_mxfp8_kf(
-                          input.data.dptr,
-                          output->data.dptr,
-                          reinterpret_cast<void *>(scales_rowwise_ptr),
-                          static_cast<int>(rows),
-                          static_cast<int>(cols),
-                          static_cast<int>(scale_stride_rowwise),
-                          stream);
+                      kf_rowwise::launch_mxfp8_kf(input.data.dptr, output->data.dptr,
+                                                  reinterpret_cast<void *>(scales_rowwise_ptr),
+                                                  static_cast<int>(rows), static_cast<int>(cols),
+                                                  static_cast<int>(scale_stride_rowwise), stream);
                       break;
                     }
 

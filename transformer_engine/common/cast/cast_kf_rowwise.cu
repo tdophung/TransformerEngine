@@ -1,432 +1,423 @@
-// KF campaign rowwise MXFP8 quantization kernel, adapted for TransformerEngine.
-// Original: kf_campaign/mxfp8_r12_record (B200 campaign round 12).
-// Requires SM90+ at runtime (bf16x2 PTX: max.xorsign.abs, cvt.rn.satfinite.e4m3x2,
-// cvt.rp.satfinite.ue8m0x2).  Device helpers are guarded; kernel templates are
-// declared at file scope so the host <<<>>> launch stubs compile correctly.
+/*************************************************************************
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ *
+ * See LICENSE for license information.
+ ************************************************************************/
+
+/*! \file cast_kf_rowwise.cu
+ *  \brief Register-resident rowwise MXFP8 quantization kernel.
+ */
 
 #include <cuda_runtime.h>
-#include <cstdint>
+
+#include "../common.h"
+#include "../util/ptx.cuh"
+#include "../util/ptx_arch_spec.cuh"
+#include "../utils.cuh"
 #include "mxfp8/kf_rowwise/kernel.h"
 
 namespace transformer_engine {
+namespace dispatch {
+namespace mxfp8 {
+namespace quantize_kernel {
 namespace kf_rowwise {
 
-// ---------------------------------------------------------------------------
-// Tunables — B200 campaign best, verified ≥ default on SM107
-// ---------------------------------------------------------------------------
-#ifndef KF_NT0
-#define KF_NT0 256
-#endif
-#ifndef KF_GG0
-#define KF_GG0 1
-#endif
-#ifndef KF_EV0
-#define KF_EV0 1
-#endif
-#ifndef KF_LP0
-#define KF_LP0 0
-#endif
-#ifndef KF_QM0
-#define KF_QM0 0
-#endif
-#ifndef KF_CV0
-#define KF_CV0 (-1)
-#endif
+namespace ptx = transformer_engine::ptx;
 
-#ifndef KF_NT1
-#define KF_NT1 256
-#endif
-#ifndef KF_GG1
-#define KF_GG1 2
-#endif
-#ifndef KF_EV1
-#define KF_EV1 1
-#endif
-#ifndef KF_LP1
-#define KF_LP1 0
-#endif
-#ifndef KF_QM1
-#define KF_QM1 0
-#endif
-#ifndef KF_CV1
-#define KF_CV1 (-1)
-#endif
+// This kernel casts BF16 to rowwise-scaled MXFP8: every run of 32 consecutive
+// elements within a row forms one MX block that shares a single E8M0 scale,
+// chosen so the block's largest magnitude lands at the top of the FP8E4M3
+// range.
+//
+// Unlike the TMA-based kernel in mxfp8/specialized, this one keeps its tile
+// entirely in registers.  There is no shared memory, no barrier, and no
+// two-dimensional tiling: for a row-major tensor whose scale array is also
+// contiguous, MX blocks never straddle a row boundary, so the whole tensor is
+// just a flat sequence of M*(K/32) independent blocks.  That reduces the
+// kernel to a pure streaming problem, and what is left to tune is how the
+// input and output streams share L2.
+//
+// A tensor whose scale array is padded (scale_stride > K/32) breaks the flat
+// view; those shapes go to quantize_strided_kernel below.
 
-#ifndef KF_NT2
-#define KF_NT2 128
-#endif
-#ifndef KF_GG2
-#define KF_GG2 2
-#endif
-#ifndef KF_EV2
-#define KF_EV2 3
-#endif
-#ifndef KF_LP2
-#define KF_LP2 60
-#endif
-#ifndef KF_QM2
-#define KF_QM2 0
-#endif
-#ifndef KF_CV2
-#define KF_CV2 (-1)
-#endif
+// Elements in one MX block, all sharing a single E8M0 scale.
+constexpr int32_t kBlockElems = 32;
 
-#ifndef KF_NT3
-#define KF_NT3 256
-#endif
-#ifndef KF_GG3
-#define KF_GG3 2
-#endif
-#ifndef KF_EV3
-#define KF_EV3 3
-#endif
-#ifndef KF_LP3
-#define KF_LP3 60
-#endif
-#ifndef KF_QM3
-#define KF_QM3 0
-#endif
-#ifndef KF_CV3
-#define KF_CV3 (-1)
-#endif
+// Two lanes cooperate on each MX block.  A lane's half of a block is 16 BF16
+// values = 32 bytes = one 256-bit load, the widest the ISA offers; splitting
+// the block any further would waste load width, and any less would exceed it.
+constexpr int32_t kLanesPerBlock = 2;
+constexpr int32_t kElemsPerLane = kBlockElems / kLanesPerBlock;
 
-#ifndef KF_R0MICRO
-#define KF_R0MICRO 1
-#endif
+// Both tensors are addressed as 32-bit words: BF16 packs 2 elements per word,
+// FP8 packs 4.  All the packed-math PTX below operates on those words.
+constexpr int32_t kInElemsPerWord = sizeof(uint32_t) / sizeof(bf16);
+constexpr int32_t kOutElemsPerWord = sizeof(uint32_t) / sizeof(fp8e4m3);
 
-#define KF_R0_BYTES (24ll << 20)
-#define KF_R1_BYTES (48ll << 20)
-#define KF_R2_BYTES (96ll << 20)
+constexpr int32_t kInWordsPerLane = kElemsPerLane / kInElemsPerWord;    // 8 -> 256-bit load
+constexpr int32_t kOutWordsPerLane = kElemsPerLane / kOutElemsPerWord;  // 4 -> 128-bit store
+constexpr int32_t kInWordsPerBlock = kBlockElems / kInElemsPerWord;     // 16
+constexpr int32_t kOutWordsPerBlock = kBlockElems / kOutElemsPerWord;   // 8
 
-// ---------------------------------------------------------------------------
-// SM90+ device helpers — only compiled for __CUDA_ARCH__ >= 900
-// ---------------------------------------------------------------------------
-#if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+// MX blocks a single warp covers in one pass over its registers.
+constexpr int32_t kBlocksPerWarp = THREADS_PER_WARP / kLanesPerBlock;  // 16
 
-#define KF_DEVI __device__ __forceinline__
+// The block-wide maximum is formed with a single shuffle that swaps a lane
+// with its odd/even partner, which only covers a two-lane group.
+static_assert(kLanesPerBlock == 2, "A wider lane group would need a multi-step reduction.");
 
-KF_DEVI uint32_t kf_amax2(uint32_t a, uint32_t b) {
-    uint32_t d;
-    asm("max.xorsign.abs.bf16x2 %0, %1, %2;" : "=r"(d) : "r"(a), "r"(b));
-    return d;
-}
-KF_DEVI uint32_t kf_bmul2(uint32_t a, uint32_t b) {
-    uint32_t d;
-    asm("mul.rn.bf16x2 %0, %1, %2;" : "=r"(d) : "r"(a), "r"(b));
-    return d;
-}
-KF_DEVI uint32_t kf_cvt_pack(uint32_t lo, uint32_t hi) {
-    uint16_t a, b;
-    asm("cvt.rn.satfinite.e4m3x2.bf16x2 %0, %1;" : "=h"(a) : "r"(lo));
-    asm("cvt.rn.satfinite.e4m3x2.bf16x2 %0, %1;" : "=h"(b) : "r"(hi));
-    return (uint32_t)a | ((uint32_t)b << 16);
-}
-KF_DEVI uint32_t kf_scale_cvt_pack(uint32_t lo, uint32_t hi, uint32_t scale) {
-    uint32_t d;
-    asm("{ .reg .b16 a, b;\n\t"
-        "mul.rn.bf16x2 %1, %1, %3;\n\t"
-        "mul.rn.bf16x2 %2, %2, %3;\n\t"
-        "cvt.rn.satfinite.e4m3x2.bf16x2 a, %1;\n\t"
-        "cvt.rn.satfinite.e4m3x2.bf16x2 b, %2;\n\t"
-        "mov.b32 %0, {a, b}; }"
-        : "=r"(d), "+r"(lo), "+r"(hi) : "r"(scale));
-    return d;
-}
-KF_DEVI uint32_t kf_f32_to_e8m0_rp(float v) {
-    uint16_t d;
-    asm("cvt.rp.satfinite.ue8m0x2.f32 %0, %1, %2;" : "=h"(d) : "f"(v), "f"(v));
-    return (uint32_t)(d & 0xFFu);
-}
+/*! \brief Launch parameters for one tensor-size regime.
+ *
+ * The kernel is bandwidth-bound, so the best configuration tracks how the
+ * working set compares with L2 rather than the shape itself.  These were
+ * selected by autotuning over a B200 shape sweep; see kTierMaxBytes below for
+ * the one threshold that has since been re-measured.
+ */
+struct LaunchConfig {
+  //! CTA width.  Trades occupancy against per-CTA scheduling overhead.
+  int32_t threads_per_cta;
+  //! MX blocks each lane pair handles per launch.  Raising this unrolls the
+  //! body, giving more independent loads in flight at the cost of registers.
+  int32_t blocks_per_lane;
+  //! Percentage of CTAs that let their input settle in L2 normally; the
+  //! remainder tag their loads evict_first so the data streams past without
+  //! displacing anything.  0 streams the entire input.
+  //!
+  //! Streaming everything is right once the input dwarfs L2, since nothing
+  //! would survive to be reused anyway.  When the input is only a few times
+  //! L2, holding part of it back leaves capacity for the output write-back
+  //! instead of thrashing on input lines.
+  int32_t l2_cached_cta_percent;
+};
 
-#define KF_LD8N(p,a,b,c,d,e,f,g,h) \
-    asm("ld.global.nc.v8.b32 {%0,%1,%2,%3,%4,%5,%6,%7},[%8];" \
-        :"=r"(a),"=r"(b),"=r"(c),"=r"(d),"=r"(e),"=r"(f),"=r"(g),"=r"(h):"l"(p))
-#define KF_LD8F(p,a,b,c,d,e,f,g,h) \
-    asm("ld.global.nc.L2::evict_first.v8.b32 {%0,%1,%2,%3,%4,%5,%6,%7},[%8];" \
-        :"=r"(a),"=r"(b),"=r"(c),"=r"(d),"=r"(e),"=r"(f),"=r"(g),"=r"(h):"l"(p))
-#define KF_LD8H(p,pol,a,b,c,d,e,f,g,h) \
-    asm("ld.global.nc.L2::cache_hint.v8.b32 {%0,%1,%2,%3,%4,%5,%6,%7},[%8],%9;" \
-        :"=r"(a),"=r"(b),"=r"(c),"=r"(d),"=r"(e),"=r"(f),"=r"(g),"=r"(h):"l"(p),"l"(pol))
-#define KF_LD4N(p,a,b,c,d) \
-    asm("ld.global.nc.v4.b32 {%0,%1,%2,%3},[%4];" :"=r"(a),"=r"(b),"=r"(c),"=r"(d):"l"(p))
-#define KF_LD4F(p,pol,a,b,c,d) \
-    asm("ld.global.nc.L2::cache_hint.v4.b32 {%0,%1,%2,%3},[%4],%5;" \
-        :"=r"(a),"=r"(b),"=r"(c),"=r"(d):"l"(p),"l"(pol))
-#define KF_ST2H(p,pol,a,b) \
-    asm volatile("st.global.L2::cache_hint.v2.b32 [%0],{%1,%2},%3;" \
-        ::"l"(p),"r"(a),"r"(b),"l"(pol):"memory")
-#define KF_ST4H(p,pol,a,b,c,d) \
-    asm volatile("st.global.L2::cache_hint.v4.b32 [%0],{%1,%2,%3,%4},%5;" \
-        ::"l"(p),"r"(a),"r"(b),"r"(c),"r"(d),"l"(pol):"memory")
+// Output bytes (one FP8 byte per element, i.e. M*K) separating the regimes.
+//
+// The first threshold is 12 MiB rather than the 24 MiB the original sweep
+// picked.  The single-block-per-lane configuration of tier 0 stops paying off
+// well before 24 MiB: measured on B200, a 16 MiB tensor ran 8.29 us on tier 0
+// against 6.78 us on tier 1, and a 24 MiB tensor 11.58 us against 9.82 us.
+// Both were also slower than the TMA kernel this one replaces, so the tier 0
+// range is cut where the crossover actually lies.
+constexpr int64_t kTierMaxBytes[] = {12ll << 20, 48ll << 20, 96ll << 20};
 
-KF_DEVI uint64_t kf_policy_evict_last() {
-    uint64_t p;
-    asm("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;" : "=l"(p));
-    return p;
-}
+constexpr LaunchConfig kTierConfigs[] = {
+    {/*threads_per_cta=*/256, /*blocks_per_lane=*/1, /*l2_cached_cta_percent=*/0},
+    {/*threads_per_cta=*/256, /*blocks_per_lane=*/2, /*l2_cached_cta_percent=*/0},
+    {/*threads_per_cta=*/128, /*blocks_per_lane=*/2, /*l2_cached_cta_percent=*/40},
+    {/*threads_per_cta=*/256, /*blocks_per_lane=*/2, /*l2_cached_cta_percent=*/40},
+};
+constexpr int32_t kNumTiers = sizeof(kTierConfigs) / sizeof(kTierConfigs[0]);
+static_assert(kNumTiers == sizeof(kTierMaxBytes) / sizeof(kTierMaxBytes[0]) + 1,
+              "Each size threshold must separate two tiers.");
 
-template <bool EVF>
-KF_DEVI void kf_load_half(const uint32_t* __restrict__ p, uint32_t* r) {
-    if (EVF) { KF_LD8F(p, r[0],r[1],r[2],r[3],r[4],r[5],r[6],r[7]); }
-    else     { KF_LD8N(p, r[0],r[1],r[2],r[3],r[4],r[5],r[6],r[7]); }
-}
+namespace {
 
-template <bool FUSED_CONV, bool SHORT_SCALE, bool FUSE_LAST_PAIR = false>
-KF_DEVI void kf_proc_half(const uint32_t* r, uint32_t* __restrict__ q,
-                           uint8_t* __restrict__ s, bool store_scale, uint64_t pol) {
-    uint32_t a0 = kf_amax2(r[0],r[1]), a1 = kf_amax2(r[2],r[3]);
-    uint32_t a2 = kf_amax2(r[4],r[5]), a3 = kf_amax2(r[6],r[7]);
-    a0 = kf_amax2(a0,a1); a2 = kf_amax2(a2,a3);
-    a0 = kf_amax2(a0,a2);
-    a0 = kf_amax2(a0, __shfl_xor_sync(0xFFFFFFFFu, a0, 1));
-    a0 = kf_amax2(a0, __byte_perm(a0, a0, 0x1032));
+#if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
 
-    uint32_t biased, spk;
-#if KF_R0MICRO
-    if constexpr (SHORT_SCALE) {
-        const float amax = fabsf(__int_as_float(a0 << 16));
-        biased = kf_f32_to_e8m0_rp(amax * (1.0f / 448.0f));
-        spk = 0x7F007F00u - biased * 0x00800080u;
-    } else
-#endif
-    {
-        const float amax = __int_as_float((a0 & 0x7FFFu) << 16);
-        biased = kf_f32_to_e8m0_rp(amax * (1.0f / 448.0f));
-        const uint32_t sb = 32512u - (biased << 7);
-        spk = __byte_perm(sb, sb, 0x1010);
-    }
-    if (store_scale) *s = (uint8_t)biased;
+/*! \brief Reduce eight BF16 pairs to the largest magnitude among them. */
+__device__ __forceinline__ ptx::bf16x2 block_half_amax(const uint32_t (&words)[kInWordsPerLane]) {
+  const ptx::bf16x2 *pairs = reinterpret_cast<const ptx::bf16x2 *>(words);
 
-    uint32_t o[4];
-    if constexpr (FUSE_LAST_PAIR) {
+  // Balanced tree: depth 3 instead of the 7 of a serial chain, so the
+  // independent maxima issue back to back.
+  ptx::bf16x2 level[kInWordsPerLane / 2];
 #pragma unroll
-        for (int i = 0; i < 3; ++i)
-            o[i] = kf_cvt_pack(kf_bmul2(r[2*i],spk), kf_bmul2(r[2*i+1],spk));
-        o[3] = kf_scale_cvt_pack(r[6], r[7], spk);
-    } else {
+  for (int32_t i = 0; i < kInWordsPerLane / 2; ++i) {
+    ptx::abs_max_2x(level[i], pairs[2 * i], pairs[2 * i + 1]);
+  }
 #pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            if constexpr (FUSED_CONV) o[i] = kf_scale_cvt_pack(r[2*i], r[2*i+1], spk);
-            else                      o[i] = kf_cvt_pack(kf_bmul2(r[2*i],spk), kf_bmul2(r[2*i+1],spk));
-        }
-    }
-    KF_ST4H(q, pol, o[0], o[1], o[2], o[3]);
+  for (int32_t i = 0; i < kInWordsPerLane / 4; ++i) {
+    ptx::abs_max_2x(level[i], level[i], level[i + kInWordsPerLane / 4]);
+  }
+  ptx::bf16x2 result;
+  ptx::abs_max_2x(result, level[0], level[1]);
+  return result;
 }
 
-KF_DEVI void kf_proc_block(const uint32_t* r, uint32_t* __restrict__ q,
-                            uint8_t* __restrict__ s) {
-    uint32_t a0=kf_amax2(r[0],r[1]),   a1=kf_amax2(r[2],r[3]);
-    uint32_t a2=kf_amax2(r[4],r[5]),   a3=kf_amax2(r[6],r[7]);
-    uint32_t a4=kf_amax2(r[8],r[9]),   a5=kf_amax2(r[10],r[11]);
-    uint32_t a6=kf_amax2(r[12],r[13]), a7=kf_amax2(r[14],r[15]);
-    a0=kf_amax2(a0,a1); a2=kf_amax2(a2,a3); a4=kf_amax2(a4,a5); a6=kf_amax2(a6,a7);
-    a0=kf_amax2(a0,a2); a4=kf_amax2(a4,a6); a0=kf_amax2(a0,a4);
-    a0=kf_amax2(a0,__byte_perm(a0,a0,0x1032));
-    const float amax = __int_as_float((a0 & 0x7FFFu) << 16);
-    const uint32_t biased = kf_f32_to_e8m0_rp(amax * (1.0f / 448.0f));
-    const uint32_t sb = 32512u - (biased << 7);
-    const uint32_t spk = __byte_perm(sb, sb, 0x1010);
-    *s = (uint8_t)biased;
-    uint32_t o[8];
-#pragma unroll
-    for (int i = 0; i < 8; ++i)
-        o[i] = kf_cvt_pack(kf_bmul2(r[2*i],spk), kf_bmul2(r[2*i+1],spk));
-    asm volatile("st.global.L2::evict_last.v8.b32 [%0],{%1,%2,%3,%4,%5,%6,%7,%8};"
-        ::"l"(q),"r"(o[0]),"r"(o[1]),"r"(o[2]),"r"(o[3]),
-          "r"(o[4]),"r"(o[5]),"r"(o[6]),"r"(o[7]):"memory");
+/*! \brief Widen a BF16 pair's larger magnitude to FP32.
+ *
+ * `max.xorsign.abs` keeps the magnitude of the larger operand but sets the
+ * result sign to the XOR of the input signs, so an accumulator built from it
+ * can come out negative.  Only the magnitude means anything for a scale, and
+ * feeding a negative value to the unsigned E8M0 conversion would saturate it
+ * to zero, so the sign is cleared here.
+ */
+__device__ __forceinline__ float pair_amax_to_float(ptx::bf16x2 pair) {
+  const uint32_t bits = reinterpret_cast<const uint32_t &>(pair);
+  // Fold the two halves against each other, then keep the low BF16 sans sign.
+  const uint32_t folded = __byte_perm(bits, bits, 0x1032);
+  ptx::bf16x2 a, b;
+  reinterpret_cast<uint32_t &>(a) = bits;
+  reinterpret_cast<uint32_t &>(b) = folded;
+  ptx::bf16x2 wide;
+  ptx::abs_max_2x(wide, a, b);
+  const uint32_t magnitude = reinterpret_cast<const uint32_t &>(wide) & 0x7FFFu;
+  return __int_as_float(magnitude << 16);
 }
 
-#endif  // __CUDA_ARCH__ >= 900
-
-// ---------------------------------------------------------------------------
-// Kernel templates — declared at file scope so the host <<< >>> stubs compile.
-// Bodies are no-ops below SM90; device helpers above are unreachable there.
-// ---------------------------------------------------------------------------
-template <int NT, int G, int EVFM, int FUSE_MODE = 0>
-__global__ __launch_bounds__(NT)
-void kf_half_kernel(const uint32_t* __restrict__ xin, uint32_t* __restrict__ qout,
-                    uint8_t* __restrict__ sout, uint32_t late) {
-#if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
-    const uint32_t lane = threadIdx.x & 31u;
-    const long long wid = (long long)blockIdx.x * (NT/32) + (threadIdx.x >> 5);
-    const long long B   = wid * (16 * G);
-    const uint64_t pol  = kf_policy_evict_last();
-    const bool even     = (lane & 1u) == 0u;
-
-    uint32_t r[8 * G];
-    if (EVFM == 3) {
-        const float frac = (blockIdx.x >= late) ? 1.0f : 0.0f;
-        uint64_t rpol;
-        asm("createpolicy.fractional.L2::evict_first.b64 %0,%1;" : "=l"(rpol) : "f"(frac));
+/*! \brief Scale and convert one lane's 16 BF16 values into 16 FP8E4M3 bytes. */
+__device__ __forceinline__ void scale_and_convert(const uint32_t (&in)[kInWordsPerLane],
+                                                  ptx::bf16x2 scale_reciprocal,
+                                                  uint32_t (&out)[kOutWordsPerLane]) {
 #pragma unroll
-        for (int g = 0; g < G; ++g) {
-            const uint32_t* pp = xin + 16*B + 256*g + 8*lane;
-            uint32_t* d = r + 8*g;
-            KF_LD8H(pp, rpol, d[0],d[1],d[2],d[3],d[4],d[5],d[6],d[7]);
-        }
-    } else if (EVFM == 1 || (EVFM == 2 && blockIdx.x >= late)) {
-#pragma unroll
-        for (int g = 0; g < G; ++g)
-            kf_load_half<true>(xin + 16*B + 256*g + 8*lane, r + 8*g);
-    } else {
-#pragma unroll
-        for (int g = 0; g < G; ++g)
-            kf_load_half<false>(xin + 16*B + 256*g + 8*lane, r + 8*g);
-    }
-    if constexpr (G == 1) {
-        kf_proc_half<true, true>(r, qout+8*B+4*lane, sout+B+(lane>>1), even, pol);
-    } else {
-        static_assert(G == 2);
-        kf_proc_half<false,false>(r, qout+8*B+4*lane, sout+B+(lane>>1), even, pol);
-        if constexpr (FUSE_MODE == 2)
-            kf_proc_half<false,false,true>(r+8, qout+8*B+128+4*lane, sout+B+16+(lane>>1), even, pol);
-        else
-            kf_proc_half<(FUSE_MODE==1),false>(r+8, qout+8*B+128+4*lane, sout+B+16+(lane>>1), even, pol);
-    }
-#endif
+  for (int32_t i = 0; i < kOutWordsPerLane; ++i) {
+    ptx::mul_cvt_4x(reinterpret_cast<ptx::fp8e4m3x4 &>(out[i]),
+                    reinterpret_cast<const ptx::bf16x4 &>(in[2 * i]), scale_reciprocal);
+  }
 }
 
-template <int NT, int G, int EVFM>
-__global__ __launch_bounds__(NT)
-void kf_quarter_kernel(const uint32_t* __restrict__ xin, uint32_t* __restrict__ qout,
-                       uint8_t* __restrict__ sout, uint32_t late) {
-#if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
-    const uint32_t lane = threadIdx.x & 31u;
-    const long long wid = (long long)blockIdx.x * (NT/32) + (threadIdx.x >> 5);
-    const long long W   = wid * G;
-    const uint64_t pol  = kf_policy_evict_last();
-    const bool leader   = (lane & 3u) == 0u;
+/*! \brief Quantize one whole MX block held by a single thread.
+ *
+ * Used by the remainder and strided kernels, which handle far too little data
+ * to be worth the two-lane split of the main kernel.
+ */
+__device__ __forceinline__ void quantize_one_block(const uint32_t *__restrict__ in,
+                                                   uint32_t *__restrict__ out,
+                                                   e8m0_t *__restrict__ scale,
+                                                   uint64_t output_policy) {
+  uint32_t words[kInWordsPerBlock];
+  ptx::ld_global_nc_b32x8(reinterpret_cast<uint32_t(&)[8]>(words[0]), in);
+  ptx::ld_global_nc_b32x8(reinterpret_cast<uint32_t(&)[8]>(words[kInWordsPerLane]),
+                          in + kInWordsPerLane);
 
-    uint32_t r[4 * G];
-    const bool evf = (EVFM == 1) || (EVFM == 2 && blockIdx.x >= late);
-    uint64_t rpol = 0;
-    if (evf) { asm("createpolicy.fractional.L2::evict_first.b64 %0,1.0;" : "=l"(rpol)); }
+  ptx::bf16x2 amax_lo = block_half_amax(reinterpret_cast<const uint32_t(&)[8]>(words[0]));
+  ptx::bf16x2 amax_hi =
+      block_half_amax(reinterpret_cast<const uint32_t(&)[8]>(words[kInWordsPerLane]));
+  ptx::bf16x2 amax_pair;
+  ptx::abs_max_2x(amax_pair, amax_lo, amax_hi);
+
+  const float amax = pair_amax_to_float(amax_pair);
+  const e8m0_t biased_exponent = ptx::float_to_e8m0(amax * Quantized_Limits<fp8e4m3>::max_norm_rcp);
+  *scale = biased_exponent;
+
+  const ptx::bf16x2 scale_reciprocal = ptx::exp2f_rcp_2x(biased_exponent);
+  uint32_t out_words[kOutWordsPerBlock];
+  scale_and_convert(reinterpret_cast<const uint32_t(&)[8]>(words[0]), scale_reciprocal,
+                    reinterpret_cast<uint32_t(&)[4]>(out_words[0]));
+  scale_and_convert(reinterpret_cast<const uint32_t(&)[8]>(words[kInWordsPerLane]),
+                    scale_reciprocal,
+                    reinterpret_cast<uint32_t(&)[4]>(out_words[kOutWordsPerLane]));
+
+  ptx::st_global_b32x4(out, reinterpret_cast<const uint32_t(&)[4]>(out_words[0]), output_policy);
+  ptx::st_global_b32x4(out + kOutWordsPerLane,
+                       reinterpret_cast<const uint32_t(&)[4]>(out_words[kOutWordsPerLane]),
+                       output_policy);
+}
+
+#endif  // (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+
+}  // namespace
+
+/*! \brief Quantize a contiguous run of MX blocks, two lanes per block.
+ *
+ * \tparam PARTIAL_L2_CACHING  When false every CTA streams its input, which
+ *                             the ISA expresses as a static load modifier and
+ *                             so costs no policy register.  When true the
+ *                             decision varies per CTA and needs a runtime
+ *                             policy token.  See LaunchConfig.
+ *
+ * \param[in]  input                BF16 input, viewed as 32-bit words.
+ * \param[out] output               FP8E4M3 output, viewed as 32-bit words.
+ * \param[out] scales               One E8M0 byte per MX block.
+ * \param[in]  first_streaming_cta  CTAs at or above this index stream their
+ *                                  input; earlier ones cache normally.  Only
+ *                                  read when PARTIAL_L2_CACHING is true.
+ */
+template <int32_t THREADS_PER_CTA, int32_t BLOCKS_PER_LANE, bool PARTIAL_L2_CACHING>
+__global__ void __launch_bounds__(THREADS_PER_CTA)
+    quantize_contiguous_kernel(const uint32_t *__restrict__ input, uint32_t *__restrict__ output,
+                               e8m0_t *__restrict__ scales, uint32_t first_streaming_cta) {
+#if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+  constexpr int32_t kWarpsPerCta = THREADS_PER_CTA / THREADS_PER_WARP;
+  constexpr int32_t kBlocksPerWarpPass = kBlocksPerWarp * BLOCKS_PER_LANE;
+
+  const int32_t lane = threadIdx.x % THREADS_PER_WARP;
+  const int64_t warp_id =
+      static_cast<int64_t>(blockIdx.x) * kWarpsPerCta + threadIdx.x / THREADS_PER_WARP;
+  const int64_t first_block = warp_id * kBlocksPerWarpPass;
+
+  // Output is marked evict_last so its lines linger long enough to coalesce on
+  // write-back.
+  const uint64_t output_policy = ptx::create_l2_policy_evict_last();
+
+  // Lanes pair up as (even, odd); the even lane of each pair owns the scale.
+  const int32_t block_in_warp = lane / kLanesPerBlock;
+  const bool owns_scale = (lane % kLanesPerBlock) == 0;
+
+  uint32_t in_words[BLOCKS_PER_LANE][kInWordsPerLane];
+  if constexpr (PARTIAL_L2_CACHING) {
+    const uint64_t input_policy =
+        ptx::create_l2_policy_evict_first(blockIdx.x >= first_streaming_cta ? 1.0f : 0.0f);
 #pragma unroll
-    for (int g = 0; g < G; ++g) {
-        const uint32_t* p = xin + (W+g)*128 + 4*lane;
-        uint32_t* d = r + 4*g;
-        if (evf) { KF_LD4F(p, rpol, d[0],d[1],d[2],d[3]); }
-        else     { KF_LD4N(p, d[0],d[1],d[2],d[3]); }
+    for (int32_t u = 0; u < BLOCKS_PER_LANE; ++u) {
+      const int64_t group_base = first_block + static_cast<int64_t>(u) * kBlocksPerWarp;
+      ptx::ld_global_nc_b32x8(in_words[u],
+                              input + group_base * kInWordsPerBlock + lane * kInWordsPerLane,
+                              input_policy);
     }
+  } else {
 #pragma unroll
-    for (int g = 0; g < G; ++g) {
-        const uint32_t* d = r + 4*g;
-        uint32_t a0 = kf_amax2(d[0],d[1]), a1 = kf_amax2(d[2],d[3]);
-        a0 = kf_amax2(a0,a1);
-        a0 = kf_amax2(a0, __shfl_xor_sync(0xFFFFFFFFu, a0, 1));
-        a0 = kf_amax2(a0, __shfl_xor_sync(0xFFFFFFFFu, a0, 2));
-        a0 = kf_amax2(a0, __byte_perm(a0, a0, 0x1032));
-        const float amax = __int_as_float((a0 & 0x7FFFu) << 16);
-        const uint32_t biased = kf_f32_to_e8m0_rp(amax * (1.0f / 448.0f));
-        const uint32_t sb  = 32512u - (biased << 7);
-        const uint32_t spk = __byte_perm(sb, sb, 0x1010);
-        if (leader) sout[(W+g)*8 + (lane>>2)] = (uint8_t)biased;
-        const uint32_t o0 = kf_cvt_pack(kf_bmul2(d[0],spk), kf_bmul2(d[1],spk));
-        const uint32_t o1 = kf_cvt_pack(kf_bmul2(d[2],spk), kf_bmul2(d[3],spk));
-        KF_ST2H(qout + (W+g)*64 + 2*lane, pol, o0, o1);
+    for (int32_t u = 0; u < BLOCKS_PER_LANE; ++u) {
+      const int64_t group_base = first_block + static_cast<int64_t>(u) * kBlocksPerWarp;
+      ptx::ld_global_nc_evict_first_b32x8(
+          in_words[u], input + group_base * kInWordsPerBlock + lane * kInWordsPerLane);
     }
-#endif
+  }
+
+#pragma unroll
+  for (int32_t u = 0; u < BLOCKS_PER_LANE; ++u) {
+    const int64_t group_base = first_block + static_cast<int64_t>(u) * kBlocksPerWarp;
+
+    // Each lane reduces its own half, then swaps with its partner so both
+    // arrive at the block-wide maximum.
+    ptx::bf16x2 half_amax = block_half_amax(in_words[u]);
+    ptx::bf16x2 partner;
+    reinterpret_cast<uint32_t &>(partner) =
+        __shfl_xor_sync(0xFFFFFFFFu, reinterpret_cast<const uint32_t &>(half_amax), /*laneMask=*/1);
+    ptx::bf16x2 block_amax;
+    ptx::abs_max_2x(block_amax, half_amax, partner);
+
+    const e8m0_t biased_exponent = ptx::float_to_e8m0(pair_amax_to_float(block_amax) *
+                                                      Quantized_Limits<fp8e4m3>::max_norm_rcp);
+    if (owns_scale) {
+      scales[group_base + block_in_warp] = biased_exponent;
+    }
+
+    uint32_t out_words[kOutWordsPerLane];
+    scale_and_convert(in_words[u], ptx::exp2f_rcp_2x(biased_exponent), out_words);
+    ptx::st_global_b32x4(output + group_base * kOutWordsPerBlock + lane * kOutWordsPerLane,
+                         out_words, output_policy);
+  }
+#endif  // (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
 }
 
-__global__ __launch_bounds__(128)
-void kf_tail_kernel(const uint32_t* __restrict__ xin, uint32_t* __restrict__ qout,
-                    uint8_t* __restrict__ sout, long long first, long long nblocks) {
-#if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
-    const long long idx = first + (long long)blockIdx.x * 128 + threadIdx.x;
-    if (idx >= nblocks) return;
-    uint32_t r[16];
-    KF_LD8N(xin+idx*16,   r[0],r[1],r[2], r[3], r[4], r[5], r[6], r[7]);
-    KF_LD8N(xin+idx*16+8, r[8],r[9],r[10],r[11],r[12],r[13],r[14],r[15]);
-    kf_proc_block(r, qout+idx*8, sout+idx);
-#endif
+/*! \brief Quantize the MX blocks left over when the block count does not
+ *         divide evenly among the main kernel's CTAs.  One block per thread. */
+__global__ void __launch_bounds__(128)
+    quantize_remainder_kernel(const uint32_t *__restrict__ input, uint32_t *__restrict__ output,
+                              e8m0_t *__restrict__ scales, int64_t first_block,
+                              int64_t num_blocks) {
+#if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+  const int64_t block = first_block + static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (block >= num_blocks) {
+    return;
+  }
+  quantize_one_block(input + block * kInWordsPerBlock, output + block * kOutWordsPerBlock,
+                     scales + block, ptx::create_l2_policy_evict_last());
+#endif  // (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
 }
 
-__global__ __launch_bounds__(128)
-void kf_padded_kernel(const uint32_t* __restrict__ xin, uint32_t* __restrict__ qout,
-                      uint8_t* __restrict__ sout, int bpr, int sstride) {
-#if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
-    const int colb = blockIdx.x * 128 + threadIdx.x;
-    if (colb >= bpr) return;
-    const long long idx = (long long)blockIdx.y * bpr + colb;
-    uint32_t r[16];
-    KF_LD8N(xin+idx*16,   r[0],r[1],r[2], r[3], r[4], r[5], r[6], r[7]);
-    KF_LD8N(xin+idx*16+8, r[8],r[9],r[10],r[11],r[12],r[13],r[14],r[15]);
-    kf_proc_block(r, qout+idx*8, sout+(long long)blockIdx.y*sstride+colb);
-#endif
+/*! \brief Quantize a tensor whose scale rows are padded.
+ *
+ * With scale_stride > K/32 the scale array is no longer a flat image of the
+ * block sequence, so blocks are indexed two-dimensionally.  One block per
+ * thread; grid.y walks the rows.
+ */
+__global__ void __launch_bounds__(128)
+    quantize_strided_kernel(const uint32_t *__restrict__ input, uint32_t *__restrict__ output,
+                            e8m0_t *__restrict__ scales, int32_t blocks_per_row,
+                            int32_t scale_stride) {
+#if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+  const int32_t block_in_row = blockIdx.x * blockDim.x + threadIdx.x;
+  if (block_in_row >= blocks_per_row) {
+    return;
+  }
+  const int64_t block = static_cast<int64_t>(blockIdx.y) * blocks_per_row + block_in_row;
+  quantize_one_block(input + block * kInWordsPerBlock, output + block * kOutWordsPerBlock,
+                     scales + static_cast<int64_t>(blockIdx.y) * scale_stride + block_in_row,
+                     ptx::create_l2_policy_evict_last());
+#endif  // (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
 }
 
-// ---------------------------------------------------------------------------
-// Host dispatch
-// ---------------------------------------------------------------------------
-void launch_mxfp8_kf(const void* x, void* q, void* s,
-                     int M, int K, int sstride,
-                     cudaStream_t stream) {
-    const int bpr = K >> 5;
-    const uint32_t* xp = reinterpret_cast<const uint32_t*>(x);
-    uint32_t*       qp = reinterpret_cast<uint32_t*>(q);
-    uint8_t*        sp = reinterpret_cast<uint8_t*>(s);
+namespace {
 
-    if (sstride != bpr) {
-        dim3 grid((bpr + 127) / 128, M);
-        kf_padded_kernel<<<grid, 128, 0, stream>>>(xp, qp, sp, bpr, sstride);
-        return;
-    }
+//! Threads per CTA for the two block-per-thread helper kernels.
+constexpr int32_t kHelperThreads = 128;
 
-    const long long nblocks = (long long)M * bpr;
-    const long long obytes  = (long long)M * K;
+/*! \brief Launch quantize_contiguous_kernel for a configuration resolved at
+ *         run time, instantiating only the combinations the tier table uses. */
+void launch_contiguous(const LaunchConfig &config, int64_t grid, uint32_t first_streaming_cta,
+                       const uint32_t *input, uint32_t *output, e8m0_t *scales,
+                       cudaStream_t stream) {
+  const dim3 blocks(static_cast<unsigned>(grid));
+  const dim3 threads(static_cast<unsigned>(config.threads_per_cta));
 
-    int nt, gg, ev, lp, qm, cv;
-    if      (obytes <= KF_R0_BYTES) { nt=KF_NT0; gg=KF_GG0; ev=KF_EV0; lp=KF_LP0; qm=KF_QM0; cv=KF_CV0; }
-    else if (obytes <= KF_R1_BYTES) { nt=KF_NT1; gg=KF_GG1; ev=KF_EV1; lp=KF_LP1; qm=KF_QM1; cv=KF_CV1; }
-    else if (obytes <= KF_R2_BYTES) { nt=KF_NT2; gg=KF_GG2; ev=KF_EV2; lp=KF_LP2; qm=KF_QM2; cv=KF_CV2; }
-    else                            { nt=KF_NT3; gg=KF_GG3; ev=KF_EV3; lp=KF_LP3; qm=KF_QM3; cv=KF_CV3; }
+  const bool partial = config.l2_cached_cta_percent != 0;
 
-    const long long per_cta = (long long)nt * gg / (qm ? 4 : 2);
-    const long long grid    = nblocks / per_cta;
-    const uint32_t  late    = (uint32_t)((grid * (100 - lp)) / 100);
+  if (config.threads_per_cta == 256 && config.blocks_per_lane == 1 && !partial) {
+    quantize_contiguous_kernel<256, 1, false>
+        <<<blocks, threads, 0, stream>>>(input, output, scales, first_streaming_cta);
+  } else if (config.threads_per_cta == 256 && config.blocks_per_lane == 2 && !partial) {
+    quantize_contiguous_kernel<256, 2, false>
+        <<<blocks, threads, 0, stream>>>(input, output, scales, first_streaming_cta);
+  } else if (config.threads_per_cta == 128 && config.blocks_per_lane == 2 && partial) {
+    quantize_contiguous_kernel<128, 2, true>
+        <<<blocks, threads, 0, stream>>>(input, output, scales, first_streaming_cta);
+  } else if (config.threads_per_cta == 256 && config.blocks_per_lane == 2 && partial) {
+    quantize_contiguous_kernel<256, 2, true>
+        <<<blocks, threads, 0, stream>>>(input, output, scales, first_streaming_cta);
+  } else {
+    NVTE_ERROR("No quantize_contiguous_kernel instantiation for ", config.threads_per_cta,
+               " threads, ", config.blocks_per_lane, " blocks per lane, partial L2 caching ",
+               partial, ".");
+  }
+}
 
-#define KF_LAUNCH1(FN) \
-    do { \
-        if (cv >= 0) { \
-            static bool _done = false; \
-            if (!_done) { \
-                cudaFuncSetAttribute((const void*)(FN), \
-                    cudaFuncAttributePreferredSharedMemoryCarveout, cv); \
-                _done = true; \
-            } \
-        } \
-        FN<<<grid, nt, 0, stream>>>(xp, qp, sp, late); \
-    } while (0)
+}  // namespace
 
-#define KF_DISPATCH(NT_, G_, QM_, FUSE_) \
-    do { \
-        if (QM_) { \
-            if      (ev == 1) KF_LAUNCH1((kf_quarter_kernel<NT_, G_, 1>)); \
-            else if (ev == 2) KF_LAUNCH1((kf_quarter_kernel<NT_, G_, 2>)); \
-            else              KF_LAUNCH1((kf_quarter_kernel<NT_, G_, 0>)); \
-        } else { \
-            if      (ev == 1) KF_LAUNCH1((kf_half_kernel<NT_, G_, 1, FUSE_>)); \
-            else if (ev == 3) KF_LAUNCH1((kf_half_kernel<NT_, G_, 3, FUSE_>)); \
-            else if (ev == 2) KF_LAUNCH1((kf_half_kernel<NT_, G_, 2, FUSE_>)); \
-            else              KF_LAUNCH1((kf_half_kernel<NT_, G_, 0, FUSE_>)); \
-        } \
-    } while (0)
+void launch_mxfp8_kf(const void *input, void *output, void *scales, int rows, int cols,
+                     int scale_stride, cudaStream_t stream) {
+  NVTE_CHECK(cols % kBlockElems == 0, "Rowwise MXFP8 requires the column count (", cols,
+             ") to be a multiple of the MX block size (", kBlockElems, ").");
 
-    if (grid > 0) {
-        if      (obytes <= KF_R0_BYTES) KF_DISPATCH(KF_NT0, KF_GG0, KF_QM0, false);
-        else if (obytes <= KF_R1_BYTES) KF_DISPATCH(KF_NT1, KF_GG1, KF_QM1, 2);
-        else if (obytes <= KF_R2_BYTES) KF_DISPATCH(KF_NT2, KF_GG2, KF_QM2, 0);
-        else                            KF_DISPATCH(KF_NT3, KF_GG3, KF_QM3, 0);
-    }
-#undef KF_DISPATCH
-#undef KF_LAUNCH1
+  const int32_t blocks_per_row = cols / kBlockElems;
+  const uint32_t *in = reinterpret_cast<const uint32_t *>(input);
+  uint32_t *out = reinterpret_cast<uint32_t *>(output);
+  e8m0_t *scale_out = reinterpret_cast<e8m0_t *>(scales);
 
-    const long long done = grid * per_cta;
-    if (done < nblocks) {
-        const int tgrid = (int)((nblocks - done + 127) / 128);
-        kf_tail_kernel<<<tgrid, 128, 0, stream>>>(xp, qp, sp, done, nblocks);
-    }
+  // A padded scale array breaks the flat block view the fast path relies on.
+  if (scale_stride != blocks_per_row) {
+    const dim3 grid(DIVUP(blocks_per_row, kHelperThreads), rows);
+    quantize_strided_kernel<<<grid, kHelperThreads, 0, stream>>>(in, out, scale_out, blocks_per_row,
+                                                                 scale_stride);
+    NVTE_CHECK_CUDA(cudaGetLastError());
+    return;
+  }
+
+  const int64_t num_blocks = static_cast<int64_t>(rows) * blocks_per_row;
+  const int64_t output_bytes = static_cast<int64_t>(rows) * cols;
+
+  int32_t tier = 0;
+  while (tier < kNumTiers - 1 && output_bytes > kTierMaxBytes[tier]) {
+    ++tier;
+  }
+  const LaunchConfig config = kTierConfigs[tier];
+
+  // Every CTA covers a whole number of MX blocks; the leftovers, if any, go to
+  // the remainder kernel rather than costing the main kernel a bounds check.
+  const int64_t blocks_per_cta =
+      static_cast<int64_t>(config.threads_per_cta) / kLanesPerBlock * config.blocks_per_lane;
+  const int64_t grid = num_blocks / blocks_per_cta;
+
+  if (grid > 0) {
+    const uint32_t first_streaming_cta =
+        static_cast<uint32_t>(grid * config.l2_cached_cta_percent / 100);
+    launch_contiguous(config, grid, first_streaming_cta, in, out, scale_out, stream);
+    NVTE_CHECK_CUDA(cudaGetLastError());
+  }
+
+  const int64_t blocks_done = grid * blocks_per_cta;
+  if (blocks_done < num_blocks) {
+    const int64_t remaining = num_blocks - blocks_done;
+    quantize_remainder_kernel<<<DIVUP(remaining, static_cast<int64_t>(kHelperThreads)),
+                                kHelperThreads, 0, stream>>>(in, out, scale_out, blocks_done,
+                                                             num_blocks);
+    NVTE_CHECK_CUDA(cudaGetLastError());
+  }
 }
 
 }  // namespace kf_rowwise
+}  // namespace quantize_kernel
+}  // namespace mxfp8
+}  // namespace dispatch
 }  // namespace transformer_engine
