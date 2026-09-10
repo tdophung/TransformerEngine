@@ -21,6 +21,7 @@
 #include "../../util/ptx_arch_spec.cuh"
 #include "../../utils.cuh"
 #include "../core/common.cuh"
+#include "regtile/quantize_mxfp8_regtile.cuh"
 #include "specialized/quantize_mxfp8.cuh"
 #include "swizzle.cuh"
 
@@ -713,13 +714,38 @@ void quantize(const Tensor &input, const Tensor *act_input, const Tensor *noop, 
     scaling_type = ScalingType::BIDIMENSIONAL;
   }
 
+  // Register-resident fast path from Kernel Factory campaign
+  // rv390dmap97kd7jaxfef2kjcmw. Measured ~2.43x +/- 2% over the generic TMA
+  // kernel below, geomean across all five fusion modes, on B200 in the KF
+  // harness. Gated to exactly the envelope the campaign validated -- any other
+  // dtype, scaling type, activation, or shape falls through unchanged.
+  const bool use_regtile =
+      regtile::RegtileOpSupported<IS_ACT, IS_DACT, ParamOP, OP>::value &&
+      scaling_type == ScalingType::BIDIMENSIONAL && !with_gemm_swizzled_scales &&
+      input.dtype() == DType::kBFloat16 && output->dtype() == DType::kFloat8E4M3 &&
+      regtile::regtile_shape_supported(rows, cols) && output->amax.dptr == nullptr &&
+      noop->data.dptr == nullptr;
+
   if constexpr (IS_DBIAS) {
     NVTE_CHECK(dbias->data.dtype == input.dtype(), "DBias must have the same type as input.");
     NVTE_CHECK(dbias->data.shape == Shape{cols}, "Wrong shape of DBias.");
     NVTE_CHECK(workspace != nullptr, "Workspace must be a tensor.");
 
     if (workspace->data.dptr == nullptr) {
-      workspace->data.shape = {dbias_rows, dbias_cols};
+      // The regtile path folds a different number of rows per workspace band
+      // than the generic kernel does, and for CAST_DBIAS it needs strictly
+      // more (rows/64 bands against the generic rows/128). Size the query for
+      // whichever path will actually run, or the kernel writes past the end.
+      size_t workspace_rows = dbias_rows;
+      if (use_regtile) {
+        const size_t regtile_rows =
+            static_cast<size_t>(regtile::regtile_dbias_bands<IS_DBIAS, IS_DACT, IS_ACT>(
+                static_cast<int>(rows), static_cast<int>(cols)));
+        if (regtile_rows > workspace_rows) {
+          workspace_rows = regtile_rows;
+        }
+      }
+      workspace->data.shape = {workspace_rows, dbias_cols};
       workspace->data.dtype = DType::kFloat32;
       return;
     }
@@ -756,6 +782,22 @@ void quantize(const Tensor &input, const Tensor *act_input, const Tensor *noop, 
         NVTE_CHECK_CUDA(cudaGetLastError());
       }
     }
+  }
+
+  if (use_regtile) {
+    // Activation-input slot follows the campaign harness's wiring: the
+    // derivative modes read the pre-activation tensor there, every other mode
+    // leaves it aliased to the primary input (where it is unused).
+    const void *act_input_ptr =
+        (IS_DACT && act_input != nullptr) ? act_input->data.dptr : input.data.dptr;
+    void *dbias_out_ptr = (IS_DBIAS && dbias != nullptr) ? dbias->data.dptr : nullptr;
+
+    regtile::launch_regtile<IS_DBIAS, IS_DACT, IS_ACT>(
+        input.data.dptr, act_input_ptr, output->data.dptr, scales_rowwise_ptr,
+        output->columnwise_data.dptr, scales_colwise_ptr, workspace_ptr, dbias_out_ptr,
+        static_cast<int>(rows), static_cast<int>(cols), static_cast<int>(scale_stride_rowwise),
+        static_cast<int>(scale_stride_colwise), stream);
+    return;
   }
 
   TRANSFORMER_ENGINE_TYPE_SWITCH_NON_FP8ONLY(
