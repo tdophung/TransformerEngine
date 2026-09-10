@@ -719,12 +719,22 @@ void quantize(const Tensor &input, const Tensor *act_input, const Tensor *noop, 
   // kernel below, geomean across all five fusion modes, on B200 in the KF
   // harness. Gated to exactly the envelope the campaign validated -- any other
   // dtype, scaling type, activation, or shape falls through unchanged.
-  const bool use_regtile =
+  // Split deliberately. The workspace size is decided on a first call with a
+  // null workspace and consumed on a second call with it allocated; if the
+  // predicate that sizes the workspace could differ between those two calls we
+  // would size for one path and run the other, overrunning the buffer. So the
+  // sizing half depends only on quantities that cannot change between the two
+  // (dtypes, shape, scaling type, activation), and the pointer-valued checks
+  // live in the execution half, which can only ever fall back to the generic
+  // kernel -- never mis-size.
+  const bool regtile_envelope =
       regtile::RegtileOpSupported<IS_ACT, IS_DACT, ParamOP, OP>::value &&
       scaling_type == ScalingType::BIDIMENSIONAL && !with_gemm_swizzled_scales &&
       input.dtype() == DType::kBFloat16 && output->dtype() == DType::kFloat8E4M3 &&
-      regtile::regtile_shape_supported(rows, cols) && output->amax.dptr == nullptr &&
-      noop->data.dptr == nullptr;
+      regtile::regtile_shape_supported(rows, cols);
+
+  const bool use_regtile =
+      regtile_envelope && output->amax.dptr == nullptr && noop->data.dptr == nullptr;
 
   if constexpr (IS_DBIAS) {
     NVTE_CHECK(dbias->data.dtype == input.dtype(), "DBias must have the same type as input.");
@@ -734,10 +744,10 @@ void quantize(const Tensor &input, const Tensor *act_input, const Tensor *noop, 
     if (workspace->data.dptr == nullptr) {
       // The regtile path folds a different number of rows per workspace band
       // than the generic kernel does, and for CAST_DBIAS it needs strictly
-      // more (rows/64 bands against the generic rows/128). Size the query for
-      // whichever path will actually run, or the kernel writes past the end.
+      // more (rows/64 bands against the generic rows/128). Size for whichever
+      // path could run, or the kernel writes past the end.
       size_t workspace_rows = dbias_rows;
-      if (use_regtile) {
+      if (regtile_envelope) {
         const size_t regtile_rows =
             static_cast<size_t>(regtile::regtile_dbias_bands<IS_DBIAS, IS_DACT, IS_ACT>(
                 static_cast<int>(rows), static_cast<int>(cols)));
