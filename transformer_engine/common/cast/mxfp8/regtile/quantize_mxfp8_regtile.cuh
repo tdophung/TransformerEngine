@@ -1301,7 +1301,11 @@ __device__ __forceinline__ void quantize_regtile(
   const int col0 = blockIdx.x * TC;
   const int K4 = K >> 3;  // uint4 (8 bf16 values) per row
 
-  if constexpr (!IS_DBIAS) {
+  // Only the DBIAS-fused instantiations get a dbias_ws scratch buffer: TE's
+  // nvte_quantize (plain cast) and the ACT/DACT-only entry points never
+  // allocate one, so zeroing it unconditionally null-derefs on every call
+  // that isn't fused with dbias.
+  if constexpr (IS_DBIAS) {
     if (blockIdx.y == 0) {
 #pragma unroll
       for (int q = tid; q < TC; q += C::NTHRC)
