@@ -47,6 +47,23 @@ namespace {
 #define STRIDED_WALK 1
 #endif
 
+// CAST_ACT defers the activation-table join: load_lut() issues the async copy
+// and returns without waiting, and the wait is taken later, at h==0 && it==0.
+// Set to 0 to take the blocking join that every other activation path uses.
+#ifndef DEFER_LUT_JOIN
+#define DEFER_LUT_JOIN 1
+#endif
+
+#ifndef ZERO_SHMEM
+#define ZERO_SHMEM 0
+#endif
+
+// CAST_ACT-only paired row-scale store path.  Set to 0 to fall back to the
+// generic per-row store that every other instantiation uses.
+#ifndef PAIRSC_EN
+#define PAIRSC_EN 1
+#endif
+
 #ifndef GELU_FAST
 #define GELU_FAST 1
 #endif
@@ -1313,12 +1330,23 @@ __device__ __forceinline__ void quantize_regtile(
     }
   }
 
+  // DIAGNOSTIC (ZERO_SHMEM): does any of this kernel's shared state get read
+  // before it is written? Shared memory is not cleared between kernels, so a
+  // read-before-write picks up the previous kernel's leftovers -- benign when
+  // those are zero, not benign when they are another instantiation's data.
+#if ZERO_SHMEM
+  for (int i = tid; i < FOLDW; i += C::NTHRC) foldbuf[i] = 0u;
+  for (int i = tid; i < TC / 2; i += C::NTHRC) cscale[i] = 0u;
+  for (int i = tid; i < (int)sizeof(srs); i += C::NTHRC) srs[i] = 0;
+  __syncthreads();
+#endif
+
   // the epilogue mbarrier rides on the table copy's own init/join
   if constexpr (C::HIDEB)
     if (tid == 0) mbar_init(&epbar, C::NTHRC);
   if constexpr (C::NEEDLUT) {
     const unsigned rep = blockIdx.x & (LUT_REP - 1);
-    load_lut<!IS_DACT>(lutmem,
+    load_lut<(DEFER_LUT_JOIN != 0) && !IS_DACT>(lutmem,
                        IS_DACT ? (const void*)d_dgelu_tab[rep]
                                : (const void*)d_gelu_tab[rep],
                        C::LUTB, &lutbar, tid);
@@ -1387,7 +1415,7 @@ __device__ __forceinline__ void quantize_regtile(
             g[t][n] = ip[(size_t)(h * CH + t) * K4 + n];
       }
       // Only CAST_ACT defers the join; the dGeLU paths keep the blocking join.
-      if constexpr (C::NEEDLUT && !IS_DACT) {
+      if constexpr ((DEFER_LUT_JOIN != 0) && C::NEEDLUT && !IS_DACT) {
         if (h == 0 && it == 0) wait_lut(&lutbar);
       }
 if constexpr (!IS_DACT) {
@@ -1664,7 +1692,7 @@ if constexpr (!IS_DACT) {
       colpart();
       mbar_arrive(&epbar);
     }
-    constexpr bool PAIRSC = IS_ACT && !IS_DACT && !IS_DBIAS &&
+    constexpr bool PAIRSC = (PAIRSC_EN != 0) && IS_ACT && !IS_DACT && !IS_DBIAS &&
                             C::NTHRC == 128 && RPT == 8;
     if constexpr (PAIRSC) {
       unsigned char* prw = out_rw + gbase;
@@ -2274,6 +2302,9 @@ void launch_regtile(const void *input, const void *act_input, void *out_rowwise,
 #undef TRANSFORMER_ENGINE_QUANTIZE_MXFP8_REGTILE_CUH_
 #undef DEVI
 #undef STRIDED_WALK
+#undef DEFER_LUT_JOIN
+#undef ZERO_SHMEM
+#undef PAIRSC_EN
 #undef GELU_FAST
 #undef UAF
 #undef GELU_K1

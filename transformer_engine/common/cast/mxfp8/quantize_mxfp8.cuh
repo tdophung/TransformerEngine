@@ -16,6 +16,9 @@
 #include <cuda_runtime.h>
 #include <transformer_engine/transformer_engine.h>
 
+#include <cstdlib>
+#include <string>
+
 #include "../../common.h"
 #include "../../util/math.h"
 #include "../../util/ptx_arch_spec.cuh"
@@ -649,6 +652,39 @@ static __global__ void __launch_bounds__(256)
 
 }  // namespace quantize_kernel
 
+// Which MXFP8 quantize implementation to run, for A/B benchmarking.
+//
+// The three implementations do not all cover the same shapes, so a fair
+// comparison has to pit each against its own counterpart: the specialized
+// cast-only kernels against other specialized kernels, and the generic TMA
+// kernel against the regtile kernel, since those two are what a shape outside
+// the specialized envelope actually falls into.
+//
+// NVTE_MXFP8_QUANTIZE_IMPL=auto|generic|specialized|regtile  (default auto)
+//   auto        - production dispatch: regtile, else specialized, else generic
+//   generic     - always the generic TMA quantize_mxfp8_kernel
+//   specialized - specialized cast-only kernels when they apply, else generic
+//   regtile     - regtile when it applies, else generic (never specialized)
+// A forced implementation that cannot serve the request falls back rather than
+// failing, so a sweep never silently compares a kernel against nothing.
+enum class MXFP8QuantizeImpl { kAuto, kGeneric, kSpecialized, kRegtile };
+
+inline MXFP8QuantizeImpl mxfp8_quantize_impl() {
+  static const MXFP8QuantizeImpl impl = [] {
+    const char *s = std::getenv("NVTE_MXFP8_QUANTIZE_IMPL");
+    if (s == nullptr) return MXFP8QuantizeImpl::kAuto;
+    const std::string v(s);
+    if (v == "generic") return MXFP8QuantizeImpl::kGeneric;
+    if (v == "specialized") return MXFP8QuantizeImpl::kSpecialized;
+    if (v == "regtile") return MXFP8QuantizeImpl::kRegtile;
+    if (v == "auto") return MXFP8QuantizeImpl::kAuto;
+    NVTE_ERROR("Invalid NVTE_MXFP8_QUANTIZE_IMPL '" + v +
+               "' (expected auto, generic, specialized, or regtile)");
+    return MXFP8QuantizeImpl::kAuto;
+  }();
+  return impl;
+}
+
 template <bool IS_DBIAS, bool IS_DACT, bool IS_ACT, typename ParamOP,
           float (*OP)(float, const ParamOP &)>
 void quantize(const Tensor &input, const Tensor *act_input, const Tensor *noop,  // TODO (ksivamani)
@@ -736,8 +772,12 @@ void quantize(const Tensor &input, const Tensor *act_input, const Tensor *noop, 
       !use_2d_quantization && input.dtype() == DType::kBFloat16 &&
       output->dtype() == DType::kFloat8E4M3 && regtile::regtile_shape_supported(rows, cols);
 
-  const bool use_regtile =
-      regtile_envelope && output->amax.dptr == nullptr && noop->data.dptr == nullptr;
+  const MXFP8QuantizeImpl impl = mxfp8_quantize_impl();
+  const bool regtile_allowed =
+      (impl == MXFP8QuantizeImpl::kAuto || impl == MXFP8QuantizeImpl::kRegtile);
+
+  const bool use_regtile = regtile_allowed && regtile_envelope &&
+                           output->amax.dptr == nullptr && noop->data.dptr == nullptr;
 
   if constexpr (IS_DBIAS) {
     NVTE_CHECK(dbias->data.dtype == input.dtype(), "DBias must have the same type as input.");
@@ -847,7 +887,10 @@ void quantize(const Tensor &input, const Tensor *act_input, const Tensor *noop, 
 
               // Specialized cast-only kernels do not consume the device noop flag.
               // Preserve cached outputs by keeping noop-aware calls on the generic path.
-              if (noop_ptr == nullptr &&
+              const bool specialized_allowed =
+                  (impl == MXFP8QuantizeImpl::kAuto || impl == MXFP8QuantizeImpl::kSpecialized);
+
+              if (specialized_allowed && noop_ptr == nullptr &&
                   specialized::hasSpec<IS_DBIAS, IS_DACT, IS_ACT, IType, OType>() &&
                   !use_2d_quantization && scaling_type_has_specialized_support) {
                 switch (scaling_type) {
