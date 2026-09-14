@@ -727,11 +727,14 @@ void quantize(const Tensor &input, const Tensor *act_input, const Tensor *noop, 
   // (dtypes, shape, scaling type, activation), and the pointer-valued checks
   // live in the execution half, which can only ever fall back to the generic
   // kernel -- never mis-size.
+  // The kernel derives one E8M0 scale per 1x32 and 32x1 block; it has no
+  // 2D-block-scaling variant, so a 2D request must not be routed here or it
+  // would silently return 1D-scaled output.
   const bool regtile_envelope =
       regtile::RegtileOpSupported<IS_ACT, IS_DACT, ParamOP, OP>::value &&
       scaling_type == ScalingType::BIDIMENSIONAL && !with_gemm_swizzled_scales &&
-      input.dtype() == DType::kBFloat16 && output->dtype() == DType::kFloat8E4M3 &&
-      regtile::regtile_shape_supported(rows, cols);
+      !use_2d_quantization && input.dtype() == DType::kBFloat16 &&
+      output->dtype() == DType::kFloat8E4M3 && regtile::regtile_shape_supported(rows, cols);
 
   const bool use_regtile =
       regtile_envelope && output->amax.dptr == nullptr && noop->data.dptr == nullptr;
