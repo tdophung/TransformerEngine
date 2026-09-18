@@ -776,8 +776,8 @@ void quantize(const Tensor &input, const Tensor *act_input, const Tensor *noop, 
   const bool regtile_allowed =
       (impl == MXFP8QuantizeImpl::kAuto || impl == MXFP8QuantizeImpl::kRegtile);
 
-  const bool use_regtile = regtile_allowed && regtile_envelope &&
-                           output->amax.dptr == nullptr && noop->data.dptr == nullptr;
+  const bool use_regtile = regtile_allowed && regtile_envelope && output->amax.dptr == nullptr &&
+                           noop->data.dptr == nullptr;
 
   if constexpr (IS_DBIAS) {
     NVTE_CHECK(dbias->data.dtype == input.dtype(), "DBias must have the same type as input.");
