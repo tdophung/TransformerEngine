@@ -50,7 +50,7 @@ namespace {
 
 
 #ifndef GELU_FAST
-#define GELU_FAST 1
+#define GELU_FAST 0
 #endif
 
 // ---------------------------------------------------------------------------
@@ -405,7 +405,7 @@ DEVI u64 act_dgelu2_exact(u64 v) {
 }
 
 #ifndef DGELU_FAST
-#define DGELU_FAST 1
+#define DGELU_FAST 0
 #endif
 DEVI u64 act_dgelu2_w(unsigned avw) {
 #if DGELU_FAST
@@ -789,17 +789,17 @@ struct LutSlot {
 #define CH_DB 1
 #endif
 #ifndef LUTM_A
-#define LUTM_A 2
+#define LUTM_A 0
 #endif
 #ifndef LUTM_D
-#define LUTM_D 3
+#define LUTM_D 0
 #endif
 // CAST_DBIAS_DACT wants a different split from CAST_DACT even though the two
 // share the dgelu body: it carries 8 more live registers for its dbias
 // accumulators.  Its 4-block bound creates enough register headroom for the
 // 5-of-8 table/arithmetic split selected above.
 #ifndef LUTM_DB
-#define LUTM_DB 4
+#define LUTM_DB 0
 #endif
 // ---------------------------------------------------------------------------
 // NARROW: a 128-thread CTA for the CAST_ACT instantiation.  It DROPS resident
