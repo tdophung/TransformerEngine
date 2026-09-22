@@ -1569,6 +1569,133 @@ __device__ __forceinline__ void st_shared_b64(fp4e2m1x2 *__restrict__ dst_smem,
   asm volatile("st.shared.b64 [%0], %1;" : : "r"(dst_smem_ptr), "l"(fp4_pack_x16));
 }
 #endif
+
+// ---------------------------------------------------------------------------
+// Packed FP32x2 arithmetic.
+//
+// One Blackwell `.f32x2` instruction computes both lanes of a `floatx2` with
+// exactly the rounding of the scalar `.rn` form, so packing an FP32 chain costs
+// nothing numerically and halves its instruction count.
+// ---------------------------------------------------------------------------
+
+__device__ __forceinline__ floatx2 make_2x(float lo, float hi) {
+  floatx2 d;
+  asm("mov.b64 %0, {%1, %2};" : "=l"(reinterpret_cast<uint64_t &>(d)) : "f"(lo), "f"(hi));
+  return d;
+}
+
+/*! \brief Both lanes set to the same value. */
+__device__ __forceinline__ floatx2 splat_2x(float c) { return make_2x(c, c); }
+
+#define NVTE_DEFINE_F32X2_BINARY_OP(NAME, OPCODE)                                                  \
+  __device__ __forceinline__ floatx2 NAME(const floatx2 &a, const floatx2 &b) {                    \
+    floatx2 d;                                                                                     \
+    asm(OPCODE " %0, %1, %2;"                                                                      \
+        : "=l"(reinterpret_cast<uint64_t &>(d))                                                    \
+        : "l"(reinterpret_cast<const uint64_t &>(a)), "l"(reinterpret_cast<const uint64_t &>(b))); \
+    return d;                                                                                      \
+  }
+NVTE_DEFINE_F32X2_BINARY_OP(add_2x, "add.rn.f32x2")
+NVTE_DEFINE_F32X2_BINARY_OP(sub_2x, "sub.rn.f32x2")
+NVTE_DEFINE_F32X2_BINARY_OP(mul_2x, "mul.rn.f32x2")
+#undef NVTE_DEFINE_F32X2_BINARY_OP
+
+__device__ __forceinline__ floatx2 fma_2x(const floatx2 &a, const floatx2 &b, const floatx2 &c) {
+  floatx2 d;
+  asm("fma.rn.f32x2 %0, %1, %2, %3;"
+      : "=l"(reinterpret_cast<uint64_t &>(d))
+      : "l"(reinterpret_cast<const uint64_t &>(a)), "l"(reinterpret_cast<const uint64_t &>(b)),
+        "l"(reinterpret_cast<const uint64_t &>(c)));
+  return d;
+}
+
+// ---------------------------------------------------------------------------
+// Packed BF16 min/max and conversions, on the raw 32-bit word.
+//
+// A kernel whose whole datapath is BF16 pairs addresses them as 32-bit words
+// rather than as typed structs, so these take and return `uint32_t`.  See
+// abs_max_2x for the typed magnitude-max.
+// ---------------------------------------------------------------------------
+
+__device__ __forceinline__ uint32_t max_bf16x2(uint32_t a, uint32_t b) {
+  uint32_t d;
+  asm("max.bf16x2 %0, %1, %2;" : "=r"(d) : "r"(a), "r"(b));
+  return d;
+}
+
+__device__ __forceinline__ uint32_t min_bf16x2(uint32_t a, uint32_t b) {
+  uint32_t d;
+  asm("min.bf16x2 %0, %1, %2;" : "=r"(d) : "r"(a), "r"(b));
+  return d;
+}
+
+/*! \brief Round two FP32 values to one packed BF16 pair.
+ *  \note The PTX operand order puts the HIGH half first.
+ */
+__device__ __forceinline__ uint32_t cvt_bf16x2(float hi, float lo) {
+  uint32_t d;
+  asm("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(d) : "f"(hi), "f"(lo));
+  return d;
+}
+
+/*! \brief float_to_e8m0 for two values at once, returned as two packed bytes.
+ *
+ * Round-up-to-UE8M0 with saturation is exactly
+ * clamp(ceil(log2(x)) + 127, 0, 254), so one instruction covers a pair:
+ * \p hi lands in the upper byte and \p lo in the lower one.
+ */
+__device__ __forceinline__ uint32_t float_to_e8m0_2x(float hi, float lo) {
+  uint16_t d;
+  asm("cvt.rp.satfinite.ue8m0x2.f32 %0, %1, %2;" : "=h"(d) : "f"(hi), "f"(lo));
+  return static_cast<uint32_t>(d);
+}
+
+// ---------------------------------------------------------------------------
+// L2 cache-eviction policy.
+//
+// Marking a stream evict_last holds its lines long enough for a write burst to
+// coalesce; the descriptor is produced once and passed to each access.
+// ---------------------------------------------------------------------------
+
+__device__ __forceinline__ uint64_t create_l2_policy_evict_last() {
+  uint64_t p;
+  asm("createpolicy.fractional.L2::evict_last.b64 %0;" : "=l"(p));
+  return p;
+}
+
+__device__ __forceinline__ void st_global_f32(float *dst, float value, uint64_t policy) {
+  asm volatile("st.global.L2::cache_hint.f32 [%0], %1, %2;" ::"l"(dst), "f"(value), "l"(policy)
+               : "memory");
+}
+
+__device__ __forceinline__ void st_global_b64(void *dst, uint64_t value, uint64_t policy) {
+  asm volatile("st.global.L2::cache_hint.b64 [%0], %1, %2;" ::"l"(dst), "l"(value), "l"(policy)
+               : "memory");
+}
+
+/*! \brief Scale two BF16 pairs by one reciprocal scale each and pack the four
+ *         resulting E4M3 bytes into a word.
+ *
+ * Keeping both `.b16` conversion results inside one asm block lets ptxas pair
+ * them straight into `mov.b32 {x,y}` with no zero-extension of the half
+ * registers, which is what the separate cvt + prmt form pays for.  Unlike the
+ * mul_cvt_4x overloads above this takes a separate scale per pair, which is
+ * what a columnwise MX block needs.
+ */
+__device__ __forceinline__ uint32_t mul_cvt_e4m3x4(uint32_t in01, uint32_t in23, uint32_t scale01,
+                                                   uint32_t scale23) {
+  uint32_t d;
+  asm("{\n\t.reg .b32 ta, tb;\n\t.reg .b16 x, y;\n\t"
+      "mul.rn.bf16x2 ta, %1, %3;\n\t"
+      "mul.rn.bf16x2 tb, %2, %4;\n\t"
+      "cvt.rn.satfinite.e4m3x2.bf16x2 x, ta;\n\t"
+      "cvt.rn.satfinite.e4m3x2.bf16x2 y, tb;\n\t"
+      "mov.b32 %0, {x, y};\n\t}"
+      : "=r"(d)
+      : "r"(in01), "r"(in23), "r"(scale01), "r"(scale23));
+  return d;
+}
+
 }  // namespace ptx
 
 namespace {
