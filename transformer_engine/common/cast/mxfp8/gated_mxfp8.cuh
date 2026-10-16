@@ -852,13 +852,15 @@ void quantize_gated(const Tensor &gated_input, const Tensor &grad, Tensor *outpu
               }
 
               // regtile::gated replaces the kernel below for SwiGLU and its gradient from BF16 to
-              // E4M3 in both directions (see regtile::gated::can_use), writing the same bytes.
-              if constexpr (std::is_same_v<IType, bf16> && std::is_same_v<OType, fp8e4m3> &&
+              // E4M3 or E5M2 in both directions (see regtile::gated::can_use), writing the same
+              // bytes.
+              if constexpr (std::is_same_v<IType, bf16> &&
+                            (std::is_same_v<OType, fp8e4m3> || std::is_same_v<OType, fp8e5m2>) &&
                             std::is_same_v<ParamOP, Empty>) {
                 if constexpr (regtile::gated::kIsSwiGLU<ParamOP, ActOP, DActOP>) {
                   if (regtile::gated::can_use(gated_input, grad, *output, IS_BWD)) {
-                    regtile::gated::quantize<IS_BWD, WITH_GEMM_SWIZZLED_SCALES>(gated_input, grad,
-                                                                                output, stream);
+                    regtile::gated::quantize<IS_BWD, OType, WITH_GEMM_SWIZZLED_SCALES>(
+                        gated_input, grad, output, stream);
                     return;
                   }
                 }
