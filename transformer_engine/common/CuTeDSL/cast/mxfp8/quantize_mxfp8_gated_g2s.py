@@ -224,6 +224,7 @@ def quantize_mxfp8_smem_tile_general_partial(
         WITH_ACT=False,
         WITH_DACT=False,
         ACTIVATION=None,
+        ACTIVATION_TABLE="none",
         MAX_NORM_RCP=MAX_NORM_RCP,
         DTYPE=DTYPE,
         FP8_DTYPE=FP8_DTYPE,
