@@ -354,8 +354,10 @@ def _quantize_colwise_mxfp8(
     WITH_DACT: cutlass.Constexpr[bool] = False,
     WITH_DBIAS: cutlass.Constexpr[bool] = False,
     CACHE_ACTIVATION: cutlass.Constexpr[bool] = False,  # cache post-activation values to sX_tile
+    dbias_running: Float32 = 0.0,  # the column's dbias sum over the CTA's earlier stages
 ):
-    """Quantize one SMEM tile colwise to MXFP8 (per-column 32-elt block scales); returns (amax, dbias_partial)."""
+    """Quantize one SMEM tile colwise to MXFP8 (per-column 32-elt block scales); returns (amax, dbias),
+    dbias being dbias_running plus this stage's rows, added in row order."""
     tidx, _, _ = cute.arch.thread_idx()
 
     _, tv_layout = cute.make_layout_tv(
@@ -374,7 +376,8 @@ def _quantize_colwise_mxfp8(
     FUSE_RELU = cutlass.const_expr(ACTIVATION == "relu") and not WITH_DBIAS
     # Keep input in half precision format if possible
     USE_HALF_PRECISION = is_packed16(DTYPE) and (ACTIVATION is None or FUSE_RELU)
-    dbias_partial = Float32(0.0)
+    # One running sum down the column across the stages, as the CUDA kernels add the chunk's rows.
+    dbias_partial = Float32(dbias_running)
 
     if cutlass.const_expr(USE_HALF_PRECISION):
         max_scalar = max_scalar_f16 if DTYPE is cutlass.Float16 else max_scalar_bf16
@@ -522,8 +525,10 @@ def _dbias_reduction_colwise(
     TILE_X: cutlass.Constexpr[int],
     WITH_DACT: cutlass.Constexpr[bool] = False,
     CACHE_ACTIVATION: cutlass.Constexpr[bool] = False,  # cache post-activation values to sX_tile
+    dbias_running: Float32 = 0.0,  # the column's dbias sum over the CTA's earlier stages
 ):
-    """Reduce one SMEM tile along rows (the dbias direction) and possibly cache dact values, with no quantization."""
+    """Reduce one SMEM tile along rows (the dbias direction) and possibly cache dact values, with no quantization.
+    Returns dbias_running plus this stage's rows, added in row order."""
     tidx, _, _ = cute.arch.thread_idx()
 
     # Same TV layout as _quantize_colwise_mxfp8: thread tidx owns column tidx, all TILE_Y rows.
@@ -533,7 +538,7 @@ def _dbias_reduction_colwise(
     )
     sX_thread = cute.composition(sX_tile, tv_layout)[tidx, None]
 
-    dbias_partial = Float32(0.0)
+    dbias_partial = Float32(dbias_running)
     if cutlass.const_expr(WITH_DACT):
         dop = dactivation_op(ACTIVATION, ACTIVATION_TABLE)
         sA_thread = cute.composition(sA_tile, tv_layout)[tidx, None]
@@ -580,11 +585,13 @@ def quantize_mxfp8_smem_tile_general(
     DBIAS_REDUCTION_IN_COLWISE: cutlass.Constexpr[bool],
     COLWISE_DBIAS_REDUCTION_ONLY: cutlass.Constexpr[bool],
     DBIAS_REDUCTION_IN_ROWWISE: cutlass.Constexpr[bool],
+    dbias_running: Float32 = 0.0,
 ):
     """Quantize one SMEM tile in the directions enabled by ROWWISE / COLWISE; returns (amax, dbias).
 
     amax is this thread's amax over the tile (None unless WITH_AMAX). dbias is this thread's
-    column partial sum (None unless DBIAS_REDUCTION_IN_COLWISE or COLWISE_DBIAS_REDUCTION_ONLY);
+    column sum so far, dbias_running plus this tile's rows (None unless DBIAS_REDUCTION_IN_COLWISE
+    or COLWISE_DBIAS_REDUCTION_ONLY);
     with DBIAS_REDUCTION_IN_ROWWISE the partial sums are accumulated into rowwise_dbias_acc instead.
     """
     amax = None
@@ -613,6 +620,7 @@ def quantize_mxfp8_smem_tile_general(
             WITH_DACT=WITH_DACT,
             WITH_DBIAS=DBIAS_REDUCTION_IN_COLWISE,
             CACHE_ACTIVATION=CACHE_ACTIVATION,
+            dbias_running=dbias_running,
         )
         # Either direction's amax already spans every element of the tile, so favor colwise
         # and skip the redundant comparison in the rowwise pass.
@@ -631,6 +639,7 @@ def quantize_mxfp8_smem_tile_general(
             TILE_X=TILE_X,
             WITH_DACT=WITH_DACT,
             CACHE_ACTIVATION=CACHE_ACTIVATION,
+            dbias_running=dbias_running,
         )
     # If we cache the activation in shared memory, we need to ensure that all threads have finished writing to the shared memory
     # from the columnwise pass before any thread reads from it in the rowwise pass.
@@ -1180,11 +1189,10 @@ class MXFP8QuantizeGeneralG2SKernel(MXFP8QuantizeKernelBase):
                 rowwise_dbias_acc[c] = Float32(0.0)
             block_dbias = Float32(0.0)
         # Prepare thread-level register for columnwise dbias reduction.
-        # Each thread will process two (MXFP8_BLOCK_SCALING_SIZE, 1) columns in two stages, and in each stage the thread will reduce the
-        # (after dact applied) column to (1,) and add to this register.
-        # Then this partial sum scalar will be written to the GMEM workspace buffer directly.
-        if cutlass.const_expr(self.DBIAS_REDUCTION_IN_COLWISE or self.COLWISE_DBIAS_REDUCTION_ONLY):
-            block_dbias = Float32(0.0)
+        # Each thread will process two (MXFP8_BLOCK_SCALING_SIZE, 1) columns in two stages; each stage continues
+        # this running sum with its (after dact applied) column, in row order, as the CUDA kernels do.
+        # Then this sum will be written to the GMEM workspace buffer directly.
+        block_dbias = Float32(0.0)
 
         # Consumer: all warps fetch from the pipeline, process its tile, and issue a new load to the tile buffer it just consumed
         for tile_idx in cutlass.range(num_tiles, unroll=1):
@@ -1256,13 +1264,14 @@ class MXFP8QuantizeGeneralG2SKernel(MXFP8QuantizeKernelBase):
                 DBIAS_REDUCTION_IN_COLWISE=self.DBIAS_REDUCTION_IN_COLWISE,
                 COLWISE_DBIAS_REDUCTION_ONLY=self.COLWISE_DBIAS_REDUCTION_ONLY,
                 DBIAS_REDUCTION_IN_ROWWISE=self.DBIAS_REDUCTION_IN_ROWWISE,
+                dbias_running=block_dbias,
             )
             if cutlass.const_expr(cfg.WITH_AMAX):
                 per_thread_amax = cute.arch.fmax(per_thread_amax, amax)
             if cutlass.const_expr(
                 self.DBIAS_REDUCTION_IN_COLWISE or self.COLWISE_DBIAS_REDUCTION_ONLY
             ):
-                block_dbias += dbias
+                block_dbias = dbias
 
             # Make the shared-memory writes visible to the TMA's async proxy before the TMA reads them.
             cute.arch.fence_proxy(

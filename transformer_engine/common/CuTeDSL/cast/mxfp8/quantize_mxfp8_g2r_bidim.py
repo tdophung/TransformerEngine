@@ -459,16 +459,15 @@ def _quantize_colwise(
 
 
 # FP16 and FP32 inputs scale in FP32, as the CUDA register-tiled kernel and the generic kernel do
-# (2^(127-e) is often outside FP16's range): a block's scale is
-# e8m0(max(amax * MAX_NORM_RCP, 0)), so a block of only NaNs gets the scale of 0 like the
-# generic kernel's 0-seeded fmaxf, and each value is multiplied in FP32 by 2^(127-e) and then
-# converted to FP8.
+# (2^(127-e) is often outside FP16's range): a block's scale is e8m0(amax * MAX_NORM_RCP), the
+# amax being NaN-seeded like the generic kernel's so that a block of only NaNs gets the NaN
+# scale, and each value is multiplied in FP32 by 2^(127-e) and then converted to FP8.
 
 
 @cute.jit
 def _scale_from_amax_f32(amax: Float32, MAX_NORM_RCP: cutlass.Constexpr[float]):
     """The E8M0 scale of a block with this amax, and its FP32 reciprocal."""
-    biased = cvt_f32_to_fp8e8m0fnu(cute.arch.fmax(amax * Float32(MAX_NORM_RCP), Float32(0.0)))
+    biased = cvt_f32_to_fp8e8m0fnu(amax * Float32(MAX_NORM_RCP))
     return biased, exp2f_rcp(biased)
 
 
@@ -497,7 +496,7 @@ def _quantize_rowwise_f32_scaled(
     rO_row_u16 = cute.recast_tensor(rO_row, Uint16)
     is_writer_thread = tidx % THREADS_X_PER_MX_BLOCK == 0
     for row_idx in cutlass.range_constexpr(ELEMENTS_Y_PER_THREAD):
-        amax = Float32(0.0)
+        amax = Float32(float("nan"))
         for col in cutlass.range_constexpr(ELEMENTS_X_PER_THREAD):
             amax = cute.arch.fmax(amax, fabs_f32(Float32(rX[col, row_idx])))
         # The block's amax across the lanes that share it.
@@ -570,7 +569,7 @@ def _quantize_colwise_f32_scaled(
 
     rPartial = cute.make_rmem_tensor((ELEMENTS_X_PER_THREAD,), Float32)
     for col in cutlass.range_constexpr(ELEMENTS_X_PER_THREAD):
-        amax = Float32(0.0)
+        amax = Float32(float("nan"))
         for row_idx in cutlass.range_constexpr(ELEMENTS_Y_PER_THREAD):
             amax = cute.arch.fmax(amax, fabs_f32(Float32(rX[col, row_idx])))
         rPartial[col] = amax
@@ -582,7 +581,7 @@ def _quantize_colwise_f32_scaled(
     if tidx < TILE_COLS:
         owner = tidx // ELEMENTS_X_PER_THREAD
         element = tidx % ELEMENTS_X_PER_THREAD
-        amax = Float32(0.0)
+        amax = Float32(float("nan"))
         for warp_row in cutlass.range_constexpr(CTA_THREADS_Y):
             amax = cute.arch.fmax(amax, sPartial[element, warp_row * CTA_THREADS_X + owner])
         biased, reciprocal = _scale_from_amax_f32(amax, MAX_NORM_RCP)
@@ -1032,11 +1031,12 @@ class MXFP8QuantizeBidimensionalG2RKernel(MXFP8QuantizeKernelBase):
         faster than the general kernel. GB200, geometric mean speedup over TE main, general ->
         this kernel: FP16 GeLU 1.46 -> 1.62, SiLU 1.41 -> 1.69, dGeLU 1.56 -> 1.69, dSiLU
         1.28 -> 1.76, dbias_dSiLU 1.48 -> 1.74; FP32 SiLU 1.32 -> 1.54, dGeLU 1.38 -> 1.52,
-        dSiLU 1.10 -> 1.85, dbias_dSiLU 1.18 -> 1.53. dbias_dGeLU (FP16 1.75 -> 1.50, FP32
-        1.47 -> 1.25) and FP32 GeLU (1.20 -> 1.16) keep the general kernel."""
+        dSiLU 1.10 -> 1.85, dbias_dSiLU 1.18 -> 1.53, dbias_dGeLU 1.47 -> 1.25 (CUDA 1.30; the
+        general kernel's FP32 dbias differs from CUDA's in the last bit, this kernel's matches).
+        FP16 dbias_dGeLU (1.75 -> 1.50) and FP32 GeLU (1.20 -> 1.16) keep the general kernel."""
         if not (cfg.WITH_ACT or cfg.WITH_DACT):
             return False
-        if cfg.WITH_DBIAS and cfg.ACTIVATION == "dgelu":
+        if cfg.WITH_DBIAS and cfg.ACTIVATION == "dgelu" and cfg.DTYPE is cutlass.Float16:
             return False
         return not (cfg.DTYPE is cutlass.Float32 and cfg.ACTIVATION == "gelu")
 
