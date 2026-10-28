@@ -6,9 +6,9 @@
 
 // The fused MXFP8 activation quantize must round exactly as if the activation were computed per
 // element, truncated to the input type, and then quantized on its own. This compares the fused
-// kernels (the register-tiled kernel where it applies, the generic kernel elsewhere) bit for bit
-// against that composition: the activation is computed on the GPU, and the result is quantized by
-// the generic cast-only kernel (a noop tensor keeps the call off the specialized cast kernels).
+// kernels (CUDA, or CuTeDSL with NVTE_ENABLE_CUTEDSL_BACKEND=1) bit for bit against that
+// composition: the activation is computed on the GPU, and the result is quantized by the generic
+// cast-only kernel (a noop tensor keeps the call off the specialized cast kernels).
 // dbias is compared against a host sum in the order the kernels accumulate it, and the tensor amax
 // against the largest magnitude of the activation.
 //
@@ -16,6 +16,12 @@
 // function. With NVTE_ACTIVATION_TABLE=1, BF16 inputs follow the table specification (see util/activation_table.cuh): -inf
 // gives -0 in the forward functions, and the derivatives below the table window are the linear
 // Taylor term. Other input types do not use the tables.
+//
+// gated_bidim (cast/mxfp8/specialized/gated_bidim.cuh) takes BF16 SwiGLU and dSwiGLU quantized in
+// both directions in place of the generic gated kernel, and must write its bytes. The generic
+// kernel's output comes from the same request with the column-wise scales one byte past an
+// aligned address, which gated_bidim does not take. Both outputs start filled with a marker byte,
+// so the two kernels must also write the same set of bytes.
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -31,6 +37,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <random>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -209,8 +216,9 @@ void fill_inputs(const Fill fill, Tensor *x, Tensor *grad) {
 }
 
 // dbias in the order the quantize kernel accumulates it: per 64-row tile, then over the tiles.
-// With FP32 input, rowwise-only scaling and a fused dact, each of the tile's 32 threads first
-// adds its two rows (r and r + 32), and the 32 thread sums are then added in order.
+// With rowwise_reduction (CUDA, for FP32 input, rowwise-only scaling and a fused dact), each of the
+// tile's 32 threads first adds its two rows (r and r + 32), and the 32 thread sums are then added
+// in order.
 std::vector<float> reference_dbias(const std::vector<float> &z, const size_t rows,
                                    const size_t cols, const bool rowwise_reduction) {
   constexpr size_t kTileRows = 64;
@@ -390,7 +398,10 @@ void run_case(const Mode mode, const Fill fill, const size_t rows, const size_t 
         << "colwise scales";
   }
   if (is_dbias(mode)) {
-    const bool rowwise_reduction = std::is_same_v<IType, float> && !colwise;
+    // CuTeDSL's general kernel adds FP32 rows in row order too (no rowwise dbias pass).
+    const char *cutedsl = std::getenv("NVTE_ENABLE_CUTEDSL_BACKEND");
+    const bool cutedsl_on = cutedsl != nullptr && std::string(cutedsl) == "1";
+    const bool rowwise_reduction = std::is_same_v<IType, float> && !colwise && !cutedsl_on;
     const std::vector<float> expected = reference_dbias(z, rows, cols, rowwise_reduction);
     dbias.to_cpu();
     const IType *got = dbias.rowwise_cpu_dptr<IType>();
@@ -450,15 +461,15 @@ INSTANTIATE_TEST_SUITE_P(
                        ::testing::Values(DType::kBFloat16, DType::kFloat16, DType::kFloat32),
                        ::testing::Values(0, 1, 2), ::testing::Bool(),
                        ::testing::Values(std::pair<size_t, size_t>{1024, 2048},
-                                         // Enough row tiles that the register-resident kernels
-                                         // walk several per CTA.
+                                         // Enough row tiles that the CuTeDSL register-resident
+                                         // kernel walks several per CTA.
                                          std::pair<size_t, size_t>{4096, 2048},
                                          // A row tail on 256-column tiles: 31 row tiles, the
                                          // last of 16 rows, and an odd number for dbias.
                                          std::pair<size_t, size_t>{976, 2048},
                                          std::pair<size_t, size_t>{544, 2080},
-                                         // At least 2^23 elements (the register-tiled forward
-                                         // without tables), with a row and a column tail.
+                                         // A row tail and a column tail ending inside an MX
+                                         // block.
                                          std::pair<size_t, size_t>{4127, 2064},
                                          // A dbias workspace of 130 rows, past the dbias
                                          // reduction's 128-row pipeline.
@@ -504,3 +515,173 @@ INSTANTIATE_TEST_SUITE_P(TinyGradients, CastMXFP8ActExactTestSuite,
                                             ::testing::Bool(), ::testing::Values(DType::kFloat8E4M3),
                                             ::testing::Values(false)),
                          case_name);
+
+namespace {
+
+enum class GatedFill { Normal, Wide, Specials, AllBF16 };
+
+// Normal: N(0, 3). Wide: each 32x32 block scaled by its own power of two. Specials: a few
+// infinities, NaNs, zeros and extreme values. AllBF16: the activated half (the first cols / 2
+// columns) walks through every BF16 bit pattern.
+void fill_gated(Tensor *t, const size_t rows, const size_t cols, const GatedFill kind,
+                const int seed) {
+  std::mt19937 gen(seed);
+  std::normal_distribution<float> normal(0.0f, 3.0f);
+  const float specials[] = {std::numeric_limits<float>::infinity(),
+                            -std::numeric_limits<float>::infinity(),
+                            std::numeric_limits<float>::quiet_NaN(),
+                            0.0f,
+                            -0.0f,
+                            1e-30f,
+                            -1e30f};
+  bf16 *p = t->rowwise_cpu_dptr<bf16>();
+  for (size_t r = 0; r < rows; ++r) {
+    for (size_t c = 0; c < cols; ++c) {
+      if (kind == GatedFill::AllBF16 && c < cols / 2) {
+        const uint16_t bits = static_cast<uint16_t>(r * (cols / 2) + c);
+        std::memcpy(&p[r * cols + c], &bits, sizeof(bits));
+        continue;
+      }
+      float v = normal(gen);
+      if (kind == GatedFill::Wide) {
+        const size_t block = (r / 32) * 104729 + c / 32 + seed;
+        v = std::ldexp(v, static_cast<int>(block % 20) - 10);
+      } else if (kind == GatedFill::Specials && gen() % 61 == 0) {
+        v = specials[gen() % 7];
+      }
+      p[r * cols + c] = static_cast<bf16>(v);
+    }
+  }
+  t->from_cpu();
+}
+
+void run_gated_case(const bool bwd, const GatedFill kind, const size_t rows, const size_t cols,
+                    const bool swizzled, const DType otype) {
+  Tensor input("input", std::vector<size_t>{rows, 2 * cols}, DType::kBFloat16);
+  Tensor grad("grad", std::vector<size_t>{rows, cols}, DType::kBFloat16);
+  fill_gated(&input, rows, 2 * cols, kind, 1);
+  if (bwd) {
+    fill_gated(&grad, rows, cols, kind == GatedFill::Wide ? kind : GatedFill::Normal, 2);
+  }
+  const std::vector<size_t> out_shape{rows, bwd ? 2 * cols : cols};
+  Tensor out("out", out_shape, otype, true, true, NVTE_MXFP8_1D_SCALING);
+  Tensor ref("ref", out_shape, otype, true, true, NVTE_MXFP8_1D_SCALING);
+  const NVTEShape colwise_scale_shape = ref.columnwise_scale_inv_shape();
+  const size_t colwise_scale_bytes = product(colwise_scale_shape);
+  auto ref_colwise_scales = cuda_alloc<uint8_t>(colwise_scale_bytes + 1);
+  const NVTEBasicTensor odd_scales = {ref_colwise_scales.get() + 1, kNVTEFloat8E8M0,
+                                      colwise_scale_shape};
+  nvte_set_tensor_param_v2(ref.data(), kNVTEColumnwiseScaleInv, &odd_scales, sizeof(odd_scales));
+  for (Tensor *t : {&out, &ref}) {
+    t->set_with_gemm_swizzled_scales(swizzled);
+    for (const auto param :
+         {kNVTERowwiseData, kNVTEColumnwiseData, kNVTERowwiseScaleInv, kNVTEColumnwiseScaleInv}) {
+      NVTEBasicTensor buffer;
+      nvte_get_tensor_param_v2(t->data(), param, &buffer, sizeof(buffer), nullptr);
+      ASSERT_EQ(cudaMemset(buffer.data_ptr, 0xA5, product(buffer.shape)), cudaSuccess);
+    }
+    if (bwd) {
+      nvte_dswiglu(grad.data(), input.data(), t->data(), 0);
+    } else {
+      nvte_swiglu(input.data(), t->data(), 0);
+    }
+  }
+  ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+  ASSERT_EQ(cudaGetLastError(), cudaSuccess);
+
+  out.to_cpu();
+  ref.to_cpu();
+  std::vector<uint8_t> ref_colwise_scales_cpu(colwise_scale_bytes);
+  ASSERT_EQ(cudaMemcpy(ref_colwise_scales_cpu.data(), ref_colwise_scales.get() + 1,
+                       colwise_scale_bytes, cudaMemcpyDeviceToHost),
+            cudaSuccess);
+  // The FP8 data as raw bytes, whichever FP8 type the output holds.
+  const auto rowwise_bytes = [&](Tensor &t) {
+    return otype == DType::kFloat8E5M2
+               ? reinterpret_cast<const uint8_t *>(t.rowwise_cpu_dptr<fp8e5m2>())
+               : reinterpret_cast<const uint8_t *>(t.rowwise_cpu_dptr<fp8e4m3>());
+  };
+  const auto columnwise_bytes = [&](Tensor &t) {
+    return otype == DType::kFloat8E5M2
+               ? reinterpret_cast<const uint8_t *>(t.columnwise_cpu_dptr<fp8e5m2>())
+               : reinterpret_cast<const uint8_t *>(t.columnwise_cpu_dptr<fp8e4m3>());
+  };
+  const size_t n = product(out_shape);
+  EXPECT_EQ(count_byte_mismatches(rowwise_bytes(out), rowwise_bytes(ref), n), 0u) << "rowwise data";
+  EXPECT_EQ(count_byte_mismatches(columnwise_bytes(out), columnwise_bytes(ref), n), 0u)
+      << "colwise data";
+  EXPECT_EQ(count_byte_mismatches(out.rowwise_cpu_scale_inv_ptr<uint8_t>(),
+                                  ref.rowwise_cpu_scale_inv_ptr<uint8_t>(),
+                                  product(out.rowwise_scale_inv_shape())),
+            0u)
+      << "rowwise scales";
+  EXPECT_EQ(count_byte_mismatches(out.columnwise_cpu_scale_inv_ptr<uint8_t>(),
+                                  ref_colwise_scales_cpu.data(), colwise_scale_bytes),
+            0u)
+      << "colwise scales";
+}
+
+using GatedParams = std::tuple<bool /*bwd*/, GatedFill, bool /*swizzled*/,
+                               std::pair<size_t, size_t>, DType /*output*/>;
+
+class CastMXFP8GatedBidimTestSuite : public ::testing::TestWithParam<GatedParams> {};
+
+}  // namespace
+
+TEST_P(CastMXFP8GatedBidimTestSuite, MatchesGenericKernel) {
+  cudaDeviceProp prop;
+  ASSERT_EQ(cudaGetDeviceProperties(&prop, 0), cudaSuccess);
+  if (prop.major < 10) {
+    GTEST_SKIP() << "This MXFP8 quantize kernel requires compute capability 10.0 or newer";
+  }
+  const auto [bwd, kind, swizzled, dims, otype] = GetParam();
+  run_gated_case(bwd, kind, dims.first, dims.second, swizzled, otype);
+}
+
+namespace {
+
+std::string gated_case_name(const testing::TestParamInfo<GatedParams> &info) {
+  const auto [bwd, kind, swizzled, dims, otype] = info.param;
+  const char *fills[] = {"Normal", "Wide", "Specials", "AllBF16"};
+  return std::string(bwd ? "DSwiGLU" : "SwiGLU") + "X" + fills[static_cast<int>(kind)] + "X" +
+         (swizzled ? "Swizzled" : "Compact") + "X" + std::to_string(dims.first) + "X" +
+         std::to_string(dims.second) + (otype == DType::kFloat8E5M2 ? "XE5M2" : "XE4M3");
+}
+
+}  // namespace
+
+INSTANTIATE_TEST_SUITE_P(
+    OperatorTest, CastMXFP8GatedBidimTestSuite,
+    ::testing::Combine(::testing::Bool(),
+                       ::testing::Values(GatedFill::Normal, GatedFill::Wide, GatedFill::Specials),
+                       ::testing::Bool(),
+                       ::testing::Values(std::pair<size_t, size_t>{1024, 2048},
+                                         // Two row bands per CTA.
+                                         std::pair<size_t, size_t>{4160, 2048},
+                                         std::pair<size_t, size_t>{128, 256},
+                                         // Row and column tails (K % 32 == 0); two row bands
+                                         // per CTA.
+                                         std::pair<size_t, size_t>{993, 7200},
+                                         std::pair<size_t, size_t>{1, 32},
+                                         std::pair<size_t, size_t>{33, 288},
+                                         std::pair<size_t, size_t>{100, 2080}),
+                       ::testing::Values(DType::kFloat8E4M3, DType::kFloat8E5M2)),
+    gated_case_name);
+
+// Every BF16 value in the activated half: 64 rows x 1024 columns.
+INSTANTIATE_TEST_SUITE_P(
+    AllBF16, CastMXFP8GatedBidimTestSuite,
+    ::testing::Combine(::testing::Bool(), ::testing::Values(GatedFill::AllBF16), ::testing::Bool(),
+                       ::testing::Values(std::pair<size_t, size_t>{64, 1024}),
+                       ::testing::Values(DType::kFloat8E4M3, DType::kFloat8E5M2)),
+    gated_case_name);
+
+// 65537 row bands, more than grid.y holds with one band per CTA: gated_bidim leaves the request
+// to the generic kernel.
+INSTANTIATE_TEST_SUITE_P(
+    LargeM, CastMXFP8GatedBidimTestSuite,
+    ::testing::Combine(::testing::Values(false), ::testing::Values(GatedFill::Normal),
+                       ::testing::Values(false),
+                       ::testing::Values(std::pair<size_t, size_t>{65537 * 32, 32}),
+                       ::testing::Values(DType::kFloat8E4M3)),
+    gated_case_name);
