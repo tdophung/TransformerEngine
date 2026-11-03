@@ -634,6 +634,12 @@ TEST_P(CastMXFP8GatedBidimTestSuite, MatchesGenericKernel) {
   if (prop.major < 10) {
     GTEST_SKIP() << "This MXFP8 quantize kernel requires compute capability 10.0 or newer";
   }
+  // The CuTeDSL backend takes these requests in place of the CUDA kernels compared here;
+  // L1_cppunittest_cutedsl_off runs this suite with it off.
+  const char *cutedsl = std::getenv("NVTE_ENABLE_CUTEDSL_BACKEND");
+  if (cutedsl != nullptr && std::string(cutedsl) == "1") {
+    GTEST_SKIP() << "Compares two CUDA kernels, and the CuTeDSL backend is on";
+  }
   const auto [bwd, kind, swizzled, dims, otype] = GetParam();
   run_gated_case(bwd, kind, dims.first, dims.second, swizzled, otype);
 }
