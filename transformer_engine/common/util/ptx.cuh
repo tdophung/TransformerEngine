@@ -836,6 +836,17 @@ __device__ __forceinline__ bf16x2 exp2f_rcp_2x(e8m0_t biased_exp) {
   return result;
 }
 
+/*! \brief exp2f_rcp<bf16> for two biased exponents at once, one in the low byte of each
+ *         16-bit half of \p biased_exps, returned as a BF16 pair.
+ *
+ *  Exponent 254 gives the subnormal 2^-127, as exp2f_rcp_2x does. Exponent 255 is not handled.
+ */
+__device__ __forceinline__ bf16x2 exp2f_rcp_2x_per_lane(const uint32_t biased_exps) {
+  const uint32_t bits =
+      ((0x00FE00FEu - biased_exps) << 7) | (__vcmpeq2(biased_exps, 0x00FE00FEu) & 0x00400040u);
+  return reinterpret_cast<const bf16x2 &>(bits);
+}
+
 // Scale two BF16 pairs by independent scales and pack the four results into a
 // single FP8E4M3 word.  The mul_cvt_4x overload below shares one scale across
 // all four elements, which is what a rowwise MX block wants; a colwise block
