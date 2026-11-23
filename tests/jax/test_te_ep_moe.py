@@ -110,14 +110,20 @@ if not _MP_ACTIVE:
         allow_module_level=True,
     )
 
-from transformer_engine_jax import get_device_compute_capability
+from transformer_engine_jax import get_cublasLt_version, get_device_compute_capability
 
-# Grouped GEMM in the MoE custom_vjp requires Blackwell (sm_100+). The
-# TE EP NCCL primitives themselves need SM>=90, but the FFN body uses
-# grouped_gemm, so the file as a whole gates on sm_100+.
-if get_device_compute_capability(0) < 100:
+# The TE EP NCCL primitives need SM>=90. Grouped GEMM in the MoE custom_vjp
+# supports BF16 on SM90+ (cuBLAS 13.4+ on Hopper) and MXFP8 on SM100+, so the
+# file as a whole gates on sm_90+ and the MXFP8 cases skip where MXFP8 is
+# unsupported.
+if get_device_compute_capability(0) < 90:
     pytest.skip(
-        "MoE TE EP tests require Blackwell (sm_100+) for grouped GEMM",
+        "MoE TE EP tests require Hopper (sm_90+) or newer",
+        allow_module_level=True,
+    )
+if get_device_compute_capability(0) < 100 and get_cublasLt_version() < 130400:
+    pytest.skip(
+        "MoE TE EP tests on Hopper require cuBLAS 13.4+ for grouped GEMM",
         allow_module_level=True,
     )
 
@@ -138,7 +144,10 @@ from transformer_engine.jax.ep import (
     ep_finalize,
 )
 from transformer_engine.common.recipe import Format, MXFP8BlockScaling
+from transformer_engine.jax.quantize import ScalingMode, is_scaling_mode_supported
 from transformer_engine.jax.sharding import MeshResource, global_shard_guard
+
+is_mxfp8_supported, mxfp8_reason = is_scaling_mode_supported(ScalingMode.MXFP8_1D_SCALING)
 
 # -----------------------------------------------------------------------------
 # Mesh / shape config
@@ -346,7 +355,14 @@ def _pure_jax_moe_reference(
     x_2d = x.reshape(T, H)
 
     gate_kernel_cast = gate_kernel.astype(x.dtype)
-    logits = (x_2d @ gate_kernel_cast).astype(jnp.float32)  # [T, E]
+    # Round the logits to x.dtype as TE's gate GEMM does. XLA may otherwise keep
+    # them in fp32 (xla_allow_excess_precision), which can flip near-tied experts.
+    info = jnp.finfo(x.dtype)
+    logits = jax.lax.reduce_precision(
+        (x_2d @ gate_kernel_cast).astype(jnp.float32),
+        exponent_bits=info.nexp,
+        mantissa_bits=info.nmant,
+    )  # [T, E]
 
     if hash_input_ids is not None:
         if score_function != "sqrtsoftplus" or hash_tid2eid is None:
@@ -658,13 +674,11 @@ _QUANTIZATION_CASES = [
     pytest.param("bf16", id="bf16"),
 ]
 
-if (
-    get_device_compute_capability(0) >= 100
-    and os.environ.get("NVTE_JAX_ENFORCE_V2_GROUPED_GEMM", "0") != "1"
-):
+if is_mxfp8_supported and os.environ.get("NVTE_JAX_ENFORCE_V2_GROUPED_GEMM", "0") != "1":
     _QUANTIZATION_CASES.append(pytest.param("mxfp8", id="mxfp8"))
 
 
+@pytest.mark.skipif(not is_mxfp8_supported, reason=mxfp8_reason)
 @pytest.mark.parametrize("native_weight_layout", [False, True])
 @pytest.mark.parametrize("fsdp_dimension", ["k", "gated", "expert"])
 def test_quantized_weight_gather_matches_full_precision_gather(
@@ -781,6 +795,7 @@ def test_standalone_dispatch_combine_default_layout(mesh):
         )
 
 
+@pytest.mark.skipif(not is_mxfp8_supported, reason=mxfp8_reason)
 @pytest.mark.parametrize("quant_before_fsdp_ag", [False, True])
 def test_mesh_resource_api_forward_and_backward(mesh, quant_before_fsdp_ag, make_block):
     """Explicit and global resources give identical forward and backward results."""
@@ -1280,6 +1295,7 @@ def test_ep_checkpoint_names(mesh, monkeypatch, make_block):
         assert np.all(np.isfinite(_to_global_numpy(_unwrap(grads["params"][name]), mesh)))
 
 
+@pytest.mark.skipif(not is_mxfp8_supported, reason=mxfp8_reason)
 def test_explicitly_disabled_fusion_with_native_weights(
     mesh, monkeypatch, make_block, use_cudnn_fusion
 ):
@@ -1325,6 +1341,7 @@ def test_explicitly_disabled_fusion_with_native_weights(
         )
 
 
+@pytest.mark.skipif(not is_mxfp8_supported, reason=mxfp8_reason)
 class TestTeEpMoeCudnnCutedslFusion:
     """End-to-end MXFP8 coverage for cuDNN's grouped GLU JAX APIs."""
 
